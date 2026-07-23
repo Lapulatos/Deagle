@@ -170,6 +170,52 @@ if "unreach-call.prp" in property_path:
             candidate_text,
         )
     )
+    candidate_joined_effect_shape = bool(
+        candidate_creates >= 2
+        and candidate_joins == candidate_creates
+        and (
+            "_Atomic" in candidate_text
+            or "__VERIFIER_atomic_begin" in candidate_text
+        )
+        and re.search(
+            r"assume_abort_if_not\s*\([^;]*(?:!=|==|<=|>=)[^;]*\)"
+            r"\s*;\s*reach_error\s*\(\s*\)",
+            candidate_text,
+            re.S,
+        )
+    )
+    if candidate_joined_effect_shape:
+        try:
+            import importlib.util
+            import json
+
+            effect_checker_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "joined_effect_checker.py",
+            )
+            effect_spec = importlib.util.spec_from_file_location(
+                "joined_effect_checker", effect_checker_path
+            )
+            effect_checker = importlib.util.module_from_spec(effect_spec)
+            effect_spec.loader.exec_module(effect_checker)
+            effect_certificate = effect_checker.check(candidate_text)
+        except Exception as exception:
+            print(
+                "Joined-region effect gate failed closed: %s" % exception,
+                file=sys.stderr,
+            )
+            effect_certificate = {"result": "UNKNOWN"}
+        if effect_certificate["result"] == "SAFE":
+            print(
+                "JOINED_EFFECT_CERTIFICATE "
+                + json.dumps(
+                    effect_certificate,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            print("VERIFICATION SUCCESSFUL")
+            sys.exit(0)
     if (
         candidate_creates >= 3
         and candidate_joins >= 3
