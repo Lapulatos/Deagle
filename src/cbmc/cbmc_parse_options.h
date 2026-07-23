@@ -38,7 +38,7 @@ class optionst;
   "(interference-predicate-profile)" \
   "(interference-predicate-fixedpoint)" \
   "(interference-predicate-recursive-worker-fixedpoint)" \
-  "(native-jces)" \
+  "(native-jces)(native-prefix-affine-envelope)" \
   OPT_BMC \
   "(preprocess)(slice-by-trace):" \
   OPT_FUNCTIONS \

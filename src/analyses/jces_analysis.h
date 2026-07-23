@@ -17,4 +17,10 @@ bool jces_transform(
   goto_modelt &goto_model,
   message_handlert &message_handler);
 
+/// Prove prefix-closed upper bounds for bounded monotone affine atomic workers
+/// and remove their spawn calls when every property obligation is discharged.
+bool prefix_affine_envelope_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 #endif // CPROVER_ANALYSES_JCES_ANALYSIS_H
