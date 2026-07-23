@@ -380,6 +380,18 @@ void postprocess_equation(
       memory_model->use_deagle = true;
       equation.use_deagle_closure = true;
     }
+    if(options.get_bool_option("native-indexed-dispatch"))
+    {
+      memory_model->use_deagle = true;
+      equation.use_deagle_closure = true;
+      equation.use_native_indexed_dispatch = true;
+    }
+    if(options.get_bool_option("native-adaptive-indexed-dispatch"))
+    {
+      memory_model->use_deagle = true;
+      equation.use_deagle_closure = true;
+      equation.use_native_adaptive_indexed_dispatch = true;
+    }
     if(options.get_bool_option("deagle-icd"))
     {
       memory_model->use_deagle = true;
@@ -479,6 +491,11 @@ std::chrono::duration<double> prepare_property_decider(
   {
     auto& deagle_closure_solver = *(deagle_closure_solvert*)(&(property_decider.get_solver()->prop()));
     auto& decision_procedure = *(prop_conv_solvert*)(&(property_decider.get_decision_procedure()));
+
+    if(equation.use_native_indexed_dispatch)
+      deagle_closure_solver.enable_native_indexed_dispatch();
+    else if(equation.use_native_adaptive_indexed_dispatch)
+      deagle_closure_solver.enable_native_adaptive_indexed_dispatch();
 
     std::cout << "Set Deagle closure solver's graph\n";
 

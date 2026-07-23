@@ -415,6 +415,8 @@ public:
   bool use_cat = false;
   cat_modulet cat;
   bool use_deagle_closure = false;
+  bool use_native_indexed_dispatch = false;
+  bool use_native_adaptive_indexed_dispatch = false;
   bool use_deagle_icd = false;
   bool use_deagle_segment = false;
   // __SZH_ADD_END__

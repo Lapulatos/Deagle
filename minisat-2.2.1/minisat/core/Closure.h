@@ -29,6 +29,8 @@ public:
 private:
     std::map<Lit, decide_entryt> lit_to_edge;
     std::multimap<Lit, int> guard_lit_to_node;
+    bool native_indexed_dispatch_enabled = false;
+    std::vector<unsigned char> native_theory_subscriptions;
 
     std::vector<std::string> id_to_address;
 
@@ -94,6 +96,10 @@ private:
 
 public:
     closure();
+    void enable_native_indexed_dispatch();
+    void prepare_native_indexed_dispatch();
+    bool has_native_theory_subscription(Lit literal) const;
+    std::size_t native_indexed_dispatch_bytes() const;
     void init(ClosureSolver* _solver);
 
     int get_node(std::string name); //get node, if the node does not exist, create it

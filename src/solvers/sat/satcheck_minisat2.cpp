@@ -403,6 +403,16 @@ bool satcheck_minisat_simplifiert::is_eliminated(literalt a) const
   return solver->isEliminated(a.var_no());
 }
 
+void deagle_closure_solvert::enable_native_indexed_dispatch()
+{
+  solver->enable_native_indexed_dispatch();
+}
+
+void deagle_closure_solvert::enable_native_adaptive_indexed_dispatch()
+{
+  solver->enable_native_adaptive_indexed_dispatch();
+}
+
 void deagle_closure_solvert::save_raw_graph(oc_edge_tablet& _oc_edge_table, oc_guard_mapt& _oc_guard_map, oc_location_mapt& _oc_location_map, std::map<std::string, int>& _oc_result_order)
 {
   solver->save_raw_graph(_oc_edge_table, _oc_guard_map, _oc_location_map, _oc_result_order);

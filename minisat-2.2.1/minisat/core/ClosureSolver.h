@@ -33,6 +33,13 @@ class ClosureSolver : public Solver
 
     int conflict_cycle = 0;
     int theory_propagation = 0;
+    bool native_indexed_dispatch = false;
+    bool native_adaptive_indexed_dispatch = false;
+    bool native_adaptive_index_ready = false;
+    uint64_t native_adaptive_dispatch_threshold = 2000000;
+    uint64_t native_adaptive_original_literals = 0;
+    uint64_t native_adaptive_indexed_literals = 0;
+    uint64_t native_adaptive_activation_propagations = 0;
 
     int attempt_adding_co = 0;
     int added_co_clauses = 0;
@@ -46,6 +53,8 @@ protected:
 public:
     ClosureSolver();
     void init();
+    void enable_native_indexed_dispatch();
+    void enable_native_adaptive_indexed_dispatch();
     void save_raw_graph(oc_edge_tablet& _oc_edge_table, oc_guard_mapt& _oc_guard_map, oc_location_mapt& _oc_location_map, std::map<std::string, int>& _oc_result_order);
     void set_graph();
 

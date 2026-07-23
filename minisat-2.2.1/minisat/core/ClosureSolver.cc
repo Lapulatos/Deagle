@@ -31,6 +31,18 @@ void ClosureSolver::init()
     set_graph();
 }
 
+void ClosureSolver::enable_native_indexed_dispatch()
+{
+    native_indexed_dispatch = true;
+    graph.enable_native_indexed_dispatch();
+}
+
+void ClosureSolver::enable_native_adaptive_indexed_dispatch()
+{
+    native_indexed_dispatch = true;
+    native_adaptive_indexed_dispatch = true;
+}
+
 void ClosureSolver::save_raw_graph(oc_edge_tablet& _oc_edge_table, oc_guard_mapt& _oc_guard_map, oc_location_mapt& _oc_location_map, std::map<std::string, int>& _oc_result_order)
 {
     oc_edge_table = _oc_edge_table;
@@ -385,6 +397,17 @@ lbool ClosureSolver::solve_()
 
     std::cout << "ClosureSolver finishes with " << conflicts << " conflicts, " << decisions << " decisions, and " << propagations << " propagations. " << theory_propagation << " theory propagations and " << conflict_cycle << " cycles included.\n";
     std::cout << "Attempts to add co clauses: " << attempt_adding_co << ". Added co clauses: " << added_co_clauses << ". Total co pairs: " << graph.co_pairs.size() << ".\n";
+    if(native_adaptive_indexed_dispatch)
+        std::cout << "NATIVE_ADAPTIVE_DISPATCH threshold="
+                  << native_adaptive_dispatch_threshold
+                  << " activation_propagations="
+                  << native_adaptive_activation_propagations
+                  << " original_literals="
+                  << native_adaptive_original_literals
+                  << " indexed_literals="
+                  << native_adaptive_indexed_literals
+                  << " index_bytes=" << graph.native_indexed_dispatch_bytes()
+                  << ".\n";
 
     cancelUntil(0);
     return status;
@@ -401,6 +424,21 @@ CRef ClosureSolver::propagate()
 
     std::vector<closure_edget> edges_to_add;
     std::vector<int> guards_to_light;
+    bool use_native_indexed_dispatch =
+      native_indexed_dispatch &&
+      (!native_adaptive_indexed_dispatch ||
+       propagations >= native_adaptive_dispatch_threshold);
+    if(
+      native_adaptive_indexed_dispatch && use_native_indexed_dispatch &&
+      !native_adaptive_index_ready)
+    {
+        graph.prepare_native_indexed_dispatch();
+        native_adaptive_index_ready = true;
+    }
+    if(
+      native_adaptive_indexed_dispatch && use_native_indexed_dispatch &&
+      native_adaptive_activation_propagations == 0)
+        native_adaptive_activation_propagations = propagations;
 
     while (qhead < trail.size()){
         Lit            p   = trail[qhead++];     // 'p' is enqueued fact to propagate.
@@ -409,23 +447,28 @@ CRef ClosureSolver::propagate()
         num_props++;
 
         //our method
-        auto decide_entry = graph.get_decide_entry(p);
-        if(decide_entry.first.first != -1)
+        if(
+          !use_native_indexed_dispatch ||
+          graph.has_native_theory_subscription(p))
         {
-            if(OC_VERBOSITY >= 1)
-                std::cout << var(p) << "(" << sign(p) << ") is related to an edge (" << toInt(assigns[var(p)]) << ")\n";
+            auto decide_entry = graph.get_decide_entry(p);
+            if(decide_entry.first.first != -1)
+            {
+                if(OC_VERBOSITY >= 1)
+                    std::cout << var(p) << "(" << sign(p) << ") is related to an edge (" << toInt(assigns[var(p)]) << ")\n";
 
-            literal_vector reason(1, p);
-            edges_to_add.push_back(closure_edget(decide_entry.first.first, decide_entry.first.second, decide_entry.second,reason));
-        }
+                literal_vector reason(1, p);
+                edges_to_add.push_back(closure_edget(decide_entry.first.first, decide_entry.first.second, decide_entry.second,reason));
+            }
 
-        auto guard_nodes = graph.check_guard_literal(p);
-        for(auto guard_node: guard_nodes)
-        {
-            if(OC_VERBOSITY >= 1)
-                std::cout << var(p) << "(" << sign(p) << ") is related to a guard of " << guard_node << "\n";
+            auto guard_nodes = graph.check_guard_literal(p);
+            for(auto guard_node: guard_nodes)
+            {
+                if(OC_VERBOSITY >= 1)
+                    std::cout << var(p) << "(" << sign(p) << ") is related to a guard of " << guard_node << "\n";
 
-            guards_to_light.push_back(guard_node);
+                guards_to_light.push_back(guard_node);
+            }
         }
         //out method ends
 
@@ -537,6 +580,13 @@ CRef ClosureSolver::propagate()
     //our method ends
 
     propagations += num_props;
+    if(native_adaptive_indexed_dispatch)
+    {
+        if(use_native_indexed_dispatch)
+            native_adaptive_indexed_literals += num_props;
+        else
+            native_adaptive_original_literals += num_props;
+    }
     simpDB_props -= num_props;
 
     if(one_more_time)

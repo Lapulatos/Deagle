@@ -599,6 +599,12 @@ static void parse_smt2_options(const cmdlinet &cmdline, optionst &options)
   if(cmdline.isset("deagle-segment"))
     options.set_option("deagle-segment", true);
 
+  if(cmdline.isset("native-indexed-dispatch"))
+    options.set_option("native-indexed-dispatch", true);
+
+  if(cmdline.isset("native-adaptive-indexed-dispatch"))
+    options.set_option("native-adaptive-indexed-dispatch", true);
+
   if(cmdline.isset("datarace"))
     options.set_option("datarace", true);
 

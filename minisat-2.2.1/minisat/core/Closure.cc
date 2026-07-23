@@ -177,6 +177,12 @@ int closure::get_node(std::string name)
 
 void closure::init_reasonable_edge(int u, int v, edge_kindt kind, Lit l)
 {
+    if(native_indexed_dispatch_enabled)
+    {
+        if(l.x >= int(native_theory_subscriptions.size()))
+            native_theory_subscriptions.resize(l.x + 1, 0);
+        native_theory_subscriptions[l.x] = 1;
+    }
     lit_to_edge[l] = std::make_pair(std::make_pair(u, v), kind);
     inactive_edge_t inactive_edge = std::make_pair(std::make_pair(u, v), l);
 
@@ -221,9 +227,54 @@ bool closure::add_guard_literal(Lit guard_literal, int u)
         return light_guard(u);
     else
     {
+        if(native_indexed_dispatch_enabled)
+        {
+            if(guard_literal.x >= int(native_theory_subscriptions.size()))
+                native_theory_subscriptions.resize(guard_literal.x + 1, 0);
+            native_theory_subscriptions[guard_literal.x] = 1;
+        }
         guard_lit_to_node.insert(std::make_pair(guard_literal, u));
         return false;
     }
+}
+
+void closure::enable_native_indexed_dispatch()
+{
+    native_indexed_dispatch_enabled = true;
+}
+
+void closure::prepare_native_indexed_dispatch()
+{
+    native_indexed_dispatch_enabled = true;
+    native_theory_subscriptions.clear();
+
+    for(const auto &entry : lit_to_edge)
+    {
+        const Lit literal = entry.first;
+        if(literal.x >= int(native_theory_subscriptions.size()))
+            native_theory_subscriptions.resize(literal.x + 1, 0);
+        native_theory_subscriptions[literal.x] = 1;
+    }
+
+    for(const auto &entry : guard_lit_to_node)
+    {
+        const Lit literal = entry.first;
+        if(literal.x >= int(native_theory_subscriptions.size()))
+            native_theory_subscriptions.resize(literal.x + 1, 0);
+        native_theory_subscriptions[literal.x] = 1;
+    }
+}
+
+bool closure::has_native_theory_subscription(Lit literal) const
+{
+    return literal.x >= 0 &&
+           literal.x < int(native_theory_subscriptions.size()) &&
+           native_theory_subscriptions[literal.x] != 0;
+}
+
+std::size_t closure::native_indexed_dispatch_bytes() const
+{
+    return native_theory_subscriptions.size();
 }
 
 std::vector<int> closure::check_guard_literal(Lit guard_literal)
