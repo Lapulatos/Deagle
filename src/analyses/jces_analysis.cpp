@@ -57,6 +57,9 @@ struct affine_worker_summaryt
   irep_idt induction;
   irep_idt target;
   irep_idt source;
+  mp_integer self_coefficient;
+  mp_integer source_coefficient;
+  mp_integer offset;
   mp_integer count;
 };
 
@@ -777,6 +780,68 @@ bool constant_bound(const exprt &expr, mp_integer &bound)
   return constant_eval(expr, {}, bound) && bound >= 0 && bound <= 256;
 }
 
+bool collect_nonnegative_affine_terms(
+  const exprt &src,
+  const exprt &target,
+  const namespacet &ns,
+  affine_worker_summaryt &summary)
+{
+  const exprt &expr = without_cast(src);
+  if(expr.id() == ID_plus)
+  {
+    for(const auto &operand : expr.operands())
+    {
+      if(!collect_nonnegative_affine_terms(
+           operand, target, ns, summary))
+        return false;
+    }
+    return true;
+  }
+  if(expr.id() == ID_constant)
+  {
+    mp_integer value;
+    if(to_integer(to_constant_expr(expr), value) || value < 0)
+      return false;
+    summary.offset += value;
+    return true;
+  }
+  if(expr.id() != ID_symbol)
+    return false;
+  if(expr == target)
+  {
+    ++summary.self_coefficient;
+    return summary.self_coefficient <= 1;
+  }
+
+  const symbolt *source_symbol = nullptr;
+  if(!is_shared_scalar(expr, ns, source_symbol))
+    return false;
+  const auto identifier = to_symbol_expr(expr).get_identifier();
+  if(!summary.source.empty() && summary.source != identifier)
+    return false;
+  summary.source = identifier;
+  ++summary.source_coefficient;
+  return summary.source_coefficient <= 1;
+}
+
+bool parse_nonnegative_affine_update(
+  const exprt &lhs,
+  const exprt &rhs,
+  const namespacet &ns,
+  affine_worker_summaryt &summary)
+{
+  summary.self_coefficient = 0;
+  summary.source_coefficient = 0;
+  summary.offset = 0;
+  summary.source = irep_idt();
+  if(!collect_nonnegative_affine_terms(rhs, lhs, ns, summary))
+    return false;
+  return
+    summary.source_coefficient == 1 &&
+    !summary.source.empty() &&
+    summary.offset <= 256;
+}
+
 bool parse_affine_worker(
   const irep_idt &worker,
   const goto_modelt &model,
@@ -858,10 +923,23 @@ bool parse_affine_worker(
       --atomic_depth;
       continue;
     }
-    if(instruction->is_assert() || instruction->is_function_call())
+    if(instruction->is_assert())
     {
       reason = "prefix_worker_control";
       return false;
+    }
+    if(instruction->is_function_call())
+    {
+      irep_idt callee;
+      if(
+        !direct_call_identifier(*instruction, callee) ||
+        callee != "pthread_exit" ||
+        positions[&*instruction] <= positions[&*backedge])
+      {
+        reason = "prefix_worker_control";
+        return false;
+      }
+      continue;
     }
     if(!instruction->is_assign())
       continue;
@@ -903,22 +981,13 @@ bool parse_affine_worker(
     if(!is_shared_scalar(lhs, ns, lhs_symbol))
       continue;
     if(
-      atomic_depth == 0 || rhs.id() != ID_plus ||
-      rhs.operands().size() != 2 ||
-      without_cast(rhs.op0()) != lhs)
+      atomic_depth == 0 ||
+      !parse_nonnegative_affine_update(lhs, rhs, ns, summary))
     {
       reason = "prefix_non_affine_write";
       return false;
     }
-    const exprt &source = without_cast(rhs.op1());
-    const symbolt *source_symbol = nullptr;
-    if(!is_shared_scalar(source, ns, source_symbol))
-    {
-      reason = "prefix_affine_source";
-      return false;
-    }
     summary.target = lhs_id;
-    summary.source = to_symbol_expr(source).get_identifier();
     ++affine_updates;
     affine_position = positions[&*instruction];
   }
@@ -926,7 +995,11 @@ bool parse_affine_worker(
   if(
     !induction_initialized || induction_updates != 1 ||
     affine_updates != 1 || atomic_depth != 0 ||
-    summary.target == summary.source)
+    summary.target == summary.source ||
+    increment_position <= positions[&*loop_head] ||
+    increment_position >= positions[&*backedge] ||
+    affine_position <= positions[&*loop_head] ||
+    affine_position >= positions[&*backedge])
   {
     reason = "prefix_worker_shape";
     return false;
@@ -951,6 +1024,7 @@ bool parse_affine_worker(
 
 bool validate_exclusive_writes_and_property(
   const goto_modelt &model,
+  const namespacet &ns,
   const affine_worker_summaryt (&workers)[2],
   std::string &reason)
 {
@@ -997,29 +1071,37 @@ bool validate_exclusive_writes_and_property(
   }
   for(const auto &worker : workers)
   {
-    // Static initialization, the explicit main initialization, and the one
-    // syntactic worker update are the only writes to a summarized object.
+    // Static initialization, an optional exact main initialization, and the
+    // one syntactic worker update are the only writes to a summarized object.
     const auto &target_writes = writes[worker.target];
+    const auto main_write = target_writes.find("main");
     if(
-      target_writes.size() != 3 ||
+      target_writes.size() != (main_write == target_writes.end() ? 2 : 3) ||
       target_writes.find("__CPROVER_initialize") == target_writes.end() ||
       target_writes.at("__CPROVER_initialize") != 1 ||
-      target_writes.find("main") == target_writes.end() ||
-      target_writes.at("main") != 1 ||
+      (main_write != target_writes.end() && main_write->second != 1) ||
       target_writes.find(worker.worker) == target_writes.end() ||
       target_writes.at(worker.worker) != 1)
     {
       reason = "prefix_extra_shared_writer";
       return false;
     }
-    // Each file-scope induction variable is statically initialized once, then
-    // has exactly its worker initialization and unit increment.
+    // A file-scope induction variable has one static initialization. A local
+    // induction variable does not. Both have exactly their worker
+    // initialization and unit increment.
     const auto &induction_writes = writes[worker.induction];
+    const symbolt &induction_symbol = ns.lookup(worker.induction);
+    const auto static_write =
+      induction_writes.find("__CPROVER_initialize");
+    const bool induction_shape =
+      induction_symbol.is_static_lifetime
+        ? induction_writes.size() == 2 &&
+            static_write != induction_writes.end() &&
+            static_write->second == 1
+        : induction_writes.size() == 1 &&
+            static_write == induction_writes.end();
     if(
-      induction_writes.size() != 2 ||
-      induction_writes.find("__CPROVER_initialize") ==
-        induction_writes.end() ||
-      induction_writes.at("__CPROVER_initialize") != 1 ||
+      !induction_shape ||
       induction_writes.find(worker.worker) == induction_writes.end() ||
       induction_writes.at(worker.worker) != 2)
     {
@@ -1184,6 +1266,24 @@ void pareto_prune(std::vector<affine_statet> &states)
   states.swap(retained);
 }
 
+affine_statet apply_affine_worker(
+  const affine_worker_summaryt &worker,
+  const affine_statet &state,
+  const irep_idt &first)
+{
+  if(worker.target == first)
+  {
+    return {
+      worker.self_coefficient * state.first +
+        worker.source_coefficient * state.second + worker.offset,
+      state.second};
+  }
+  return {
+    state.first,
+    worker.self_coefficient * state.second +
+      worker.source_coefficient * state.first + worker.offset};
+}
+
 bool assertion_bound(
   const goto_modelt &model,
   const irep_idt &first,
@@ -1339,6 +1439,256 @@ bool assertion_bound(
   bound_function = bound_call->second;
   return true;
 }
+
+bool zero_constant(const exprt &src)
+{
+  const exprt &expr = without_cast(src);
+  if(expr.id() != ID_constant)
+    return false;
+  mp_integer value;
+  return !to_integer(to_constant_expr(expr), value) && value == 0;
+}
+
+bool truthy_symbol(const exprt &src, irep_idt &identifier)
+{
+  const exprt &expr = without_cast(src);
+  if(expr.id() != ID_notequal || expr.operands().size() != 2)
+    return false;
+  return
+    (direct_symbol(expr.op0(), identifier) &&
+     zero_constant(expr.op1())) ||
+    (direct_symbol(expr.op1(), identifier) &&
+     zero_constant(expr.op0()));
+}
+
+bool static_initial_value(
+  const goto_modelt &model,
+  const irep_idt &identifier,
+  mp_integer &value)
+{
+  const auto symbol = model.symbol_table.symbols.find(identifier);
+  return
+    symbol != model.symbol_table.symbols.end() &&
+    symbol->second.is_static_lifetime &&
+    constant_eval(symbol->second.value, {}, value);
+}
+
+bool inline_error_bound(
+  const goto_modelt &model,
+  const irep_idt &first,
+  const irep_idt &second,
+  mp_integer &property_bound,
+  std::map<irep_idt, mp_integer> &initial_values,
+  std::string &reason)
+{
+  const auto main = model.goto_functions.function_map.find("main");
+  if(
+    main == model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+  {
+    reason = "prefix_missing_main";
+    return false;
+  }
+  const auto &program = main->second.body;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : program.instructions)
+    positions.emplace(&instruction, position++);
+
+  std::map<irep_idt, exprt> assignments;
+  std::map<irep_idt, std::size_t> assignment_counts;
+  std::map<irep_idt, std::size_t> assignment_positions;
+  std::size_t creates = 0;
+  auto error_call = program.instructions.end();
+  bool before_create = true;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_assign())
+    {
+      const exprt &lhs = without_cast(instruction->assign_lhs());
+      if(lhs.id() == ID_symbol)
+      {
+        const auto identifier =
+          to_symbol_expr(lhs).get_identifier();
+        assignments[identifier] = instruction->assign_rhs();
+        ++assignment_counts[identifier];
+        assignment_positions[identifier] = positions.at(&*instruction);
+        if(
+          before_create &&
+          (identifier == first || identifier == second))
+        {
+          mp_integer value;
+          if(constant_eval(instruction->assign_rhs(), {}, value))
+            initial_values[identifier] = value;
+        }
+        else if(
+          !before_create &&
+          (identifier == first || identifier == second))
+        {
+          reason = "prefix_late_initialization";
+          return false;
+        }
+      }
+      continue;
+    }
+    irep_idt callee;
+    if(!direct_call_identifier(*instruction, callee))
+      continue;
+    if(callee == "pthread_create")
+    {
+      ++creates;
+      before_create = false;
+      continue;
+    }
+    if(callee == "pthread_join")
+    {
+      reason = "prefix_has_join";
+      return false;
+    }
+    if(callee == "reach_error")
+    {
+      if(error_call != program.instructions.end())
+      {
+        reason = "prefix_error_count";
+        return false;
+      }
+      error_call = instruction;
+      continue;
+    }
+    if(callee != "abort")
+    {
+      reason = "prefix_inline_call";
+      return false;
+    }
+  }
+  if(creates != 2 || error_call == program.instructions.end())
+  {
+    reason = "prefix_inline_main_shape";
+    return false;
+  }
+
+  for(const auto &identifier : {first, second})
+  {
+    if(initial_values.find(identifier) != initial_values.end())
+      continue;
+    mp_integer value;
+    if(!static_initial_value(model, identifier, value))
+    {
+      reason = "prefix_static_initialization";
+      return false;
+    }
+    initial_values[identifier] = value;
+  }
+
+  if(error_call == program.instructions.begin())
+  {
+    reason = "prefix_inline_guard";
+    return false;
+  }
+  const auto guard = std::prev(error_call);
+  const auto abort_call = std::next(error_call);
+  irep_idt abort_identifier;
+  if(
+    abort_call == program.instructions.end() ||
+    !guard->is_goto() || guard->targets.size() != 1 ||
+    !direct_call_identifier(*abort_call, abort_identifier) ||
+    abort_identifier != "abort" ||
+    positions.at(&*guard->get_target()) <= positions.at(&*abort_call))
+  {
+    reason = "prefix_inline_guard";
+    return false;
+  }
+  for(const auto &instruction : program.instructions)
+  {
+    if(
+      &instruction != &*guard && instruction.is_goto() &&
+      instruction.targets.size() == 1 &&
+      instruction.get_target() == error_call)
+    {
+      reason = "prefix_error_incoming";
+      return false;
+    }
+  }
+
+  const exprt &condition = without_cast(guard->condition());
+  if(
+    condition.id() != ID_not ||
+    condition.operands().size() != 1)
+  {
+    reason = "prefix_inline_condition";
+    return false;
+  }
+  const exprt &bad = without_cast(condition.op0());
+  if(bad.id() != ID_or || bad.operands().size() != 2)
+  {
+    reason = "prefix_inline_bad_shape";
+    return false;
+  }
+
+  std::set<irep_idt> compared_objects;
+  bool bound_initialized = false;
+  for(const auto &operand : bad.operands())
+  {
+    irep_idt condition_symbol;
+    if(!truthy_symbol(operand, condition_symbol))
+    {
+      reason = "prefix_inline_truth";
+      return false;
+    }
+    const auto assignment = assignments.find(condition_symbol);
+    if(
+      assignment == assignments.end() ||
+      assignment_counts[condition_symbol] != 1 ||
+      assignment_positions[condition_symbol] >= positions.at(&*guard))
+    {
+      reason = "prefix_inline_definition";
+      return false;
+    }
+    bool control_supported = false;
+    const auto assignment_control = control_signature(
+      program,
+      positions,
+      assignment_positions[condition_symbol],
+      control_supported);
+    if(!control_supported || !assignment_control.empty())
+    {
+      reason = "prefix_inline_definition_control";
+      return false;
+    }
+    const exprt &comparison = without_cast(assignment->second);
+    irep_idt object;
+    mp_integer bound;
+    if(
+      comparison.id() != ID_gt ||
+      comparison.operands().size() != 2 ||
+      !direct_symbol(comparison.op0(), object) ||
+      (object != first && object != second) ||
+      !constant_eval(comparison.op1(), {}, bound) ||
+      bound < 0)
+    {
+      reason = "prefix_inline_comparison";
+      return false;
+    }
+    if(!bound_initialized)
+    {
+      property_bound = bound;
+      bound_initialized = true;
+    }
+    else if(property_bound != bound)
+    {
+      reason = "prefix_inline_bounds";
+      return false;
+    }
+    compared_objects.insert(object);
+  }
+  if(compared_objects.size() != 2)
+  {
+    reason = "prefix_inline_coverage";
+    return false;
+  }
+  return true;
+}
 } // namespace
 
 bool prefix_affine_envelope_transform(
@@ -1386,7 +1736,8 @@ bool prefix_affine_envelope_transform(
     std::cout << "NATIVE_PREFIX_AFFINE applied=0 reason=" << reason << '\n';
     return false;
   }
-  if(!validate_exclusive_writes_and_property(goto_model, workers, reason))
+  if(!validate_exclusive_writes_and_property(
+       goto_model, ns, workers, reason))
   {
     std::cout << "NATIVE_PREFIX_AFFINE applied=0 reason=" << reason << '\n';
     return false;
@@ -1396,24 +1747,45 @@ bool prefix_affine_envelope_transform(
   const irep_idt second = workers[0].source;
   irep_idt bound_function;
   std::map<irep_idt, mp_integer> initial_values;
-  if(!assertion_bound(
-       goto_model,
-       first,
-       second,
-       bound_function,
-       initial_values,
-       reason))
-  {
-    std::cout << "NATIVE_PREFIX_AFFINE applied=0 reason=" << reason << '\n';
-    return false;
-  }
-
   mp_integer property_bound;
-  if(!evaluate_bound_function(
-       bound_function, goto_model, property_bound, reason))
+  if(
+    assertion_bound(
+      goto_model,
+      first,
+      second,
+      bound_function,
+      initial_values,
+      reason))
   {
-    std::cout << "NATIVE_PREFIX_AFFINE applied=0 reason=" << reason << '\n';
-    return false;
+    if(!evaluate_bound_function(
+         bound_function, goto_model, property_bound, reason))
+    {
+      std::cout
+        << "NATIVE_PREFIX_AFFINE applied=0 reason=" << reason << '\n';
+      return false;
+    }
+  }
+  else
+  {
+    if(reason != "prefix_main_shape")
+    {
+      std::cout
+        << "NATIVE_PREFIX_AFFINE applied=0 reason=" << reason << '\n';
+      return false;
+    }
+    initial_values.clear();
+    if(!inline_error_bound(
+         goto_model,
+         first,
+         second,
+         property_bound,
+         initial_values,
+         reason))
+    {
+      std::cout
+        << "NATIVE_PREFIX_AFFINE applied=0 reason=" << reason << '\n';
+      return false;
+    }
   }
 
   const auto count_first =
@@ -1451,15 +1823,13 @@ bool prefix_affine_envelope_transform(
       {
         for(const auto &predecessor : frontier[i - 1][j])
           states.push_back(
-            {predecessor.first + predecessor.second,
-             predecessor.second});
+            apply_affine_worker(workers[0], predecessor, first));
       }
       if(j != 0)
       {
         for(const auto &predecessor : frontier[i][j - 1])
           states.push_back(
-            {predecessor.first,
-             predecessor.first + predecessor.second});
+            apply_affine_worker(workers[1], predecessor, first));
       }
       pareto_prune(states);
       retained_states += states.size();
