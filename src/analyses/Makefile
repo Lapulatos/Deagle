@@ -20,6 +20,8 @@ SRC = ai.cpp \
       invariant_propagation.cpp \
       invariant_set.cpp \
       invariant_set_domain.cpp \
+      interference_predicate_cube.cpp \
+      interference_predicate_analysis.cpp \
       is_threaded.cpp \
       local_bitvector_analysis.cpp \
       local_cfg.cpp \

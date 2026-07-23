@@ -34,6 +34,10 @@ class optionst;
 // clang-format off
 #define CBMC_OPTIONS \
   "(deagle-closure)(deagle-icd)(deagle-segment)(native-adaptive-indexed-dispatch)(native-indexed-dispatch)(datarace)(goblint)(locksmith)(deadlock)" \
+  "(interference-predicate-self-test)" \
+  "(interference-predicate-profile)" \
+  "(interference-predicate-fixedpoint)" \
+  "(interference-predicate-recursive-worker-fixedpoint)" \
   OPT_BMC \
   "(preprocess)(slice-by-trace):" \
   OPT_FUNCTIONS \

@@ -4,8 +4,17 @@ import sys
 import os
 import re
 import time
+import atexit
+import shlex
+import shutil
+import subprocess
+import tempfile
 
 limit_solverbound = 300
+deagle_exe_path = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "deagle_exe"
+)
+deagle_exe = shlex.quote(deagle_exe_path)
 
 def ensure_successful_unwind():
     with open("deagle_tmp_output", "r") as output:
@@ -16,8 +25,23 @@ def ensure_successful_unwind():
     return False
 
 def check_result_normality(lines):
+    if not lines:
+        return False
     last_line = lines[-1]
     return "VERIFICATION SUCCESSFUL" in last_line or "VERIFICATION FAILED" in last_line
+
+def inspect_result(path):
+    """Classify a tool result without printing a provisional verdict."""
+    with open(path, "r") as output:
+        lines = output.readlines()
+    if not check_result_normality(lines):
+        return "ERROR"
+    result = "SUCCESS"
+    for line in lines:
+        obj = re.match(r"\[(.*)\](.*): (.*)", line)
+        if obj and obj.group(3) == "FAILURE":
+            result = "FAILURE"
+    return result
 
 def get_result(remove = True):
     result = "SUCCESS"
@@ -26,6 +50,27 @@ def get_result(remove = True):
         if not check_result_normality(lines):
             return "ERROR"
         for line in lines:
+            if (
+                line.startswith("NATIVE_OBSERVABLE_DELTA_PROFILE ")
+                or line.startswith("NATIVE_DISPATCH_PROFILE ")
+                or line.startswith("NATIVE_ADAPTIVE_DISPATCH ")
+                or line.startswith("NATIVE_PACKED_DELTA_SHADOW ")
+                or line.startswith("NATIVE_RF_FIRST_BRANCHING ")
+                or line.startswith("COUNTERFACTUAL_UIP_PROFILE ")
+                or line.startswith("COUNTERFACTUAL_UIP_DOMAIN ")
+                or line.startswith("COUNTERFACTUAL_UIP_DOMAIN_SOURCE ")
+                or line.startswith("RF_PROPAGATION_UIP_PARTICIPATION ")
+                or line.startswith("RF_PROPAGATION_EXACT_DOMAIN_SOURCE ")
+                or line.startswith("RF_PROPAGATION_EXACT_DOMAIN_UIP ")
+                or line.startswith("RF_PROPAGATION_CDCL_PATH_SOURCE ")
+                or line.startswith("RF_PROPAGATION_CDCL_PATH_UIP ")
+                or line.startswith("RF_MULTITARGET_WITNESS_SHADOW ")
+                or line.startswith("RF_MULTITARGET_WITNESS_ONLINE ")
+                or line.startswith("Deagle nondet bulk init: ")
+                or line.startswith("ClosureSolver finishes with ")
+                or re.match(r"^\d+ variables, \d+ clauses", line)
+            ):
+                print(line, end="")
             obj = re.match(r"\[(.*)\](.*): (.*)", line) # is a result line
             if not obj:
                 continue
@@ -39,7 +84,7 @@ def get_result(remove = True):
     return result
 
 def get_loop_info(program_path, flags):
-    cmd = "./deagle_exe %s %s --unwind-suggest > deagle_tmp_unwind_suggest 2>&1" % (program_path, flags)
+    cmd = "%s %s %s --unwind-suggest > deagle_tmp_unwind_suggest 2>&1" % (deagle_exe, program_path, flags)
     print(cmd)
     os.system(cmd)
 
@@ -96,7 +141,55 @@ if len(sys.argv) < 3:
 
 property_path = sys.argv[1]
 program_path = sys.argv[2]
-flags = "--refined-pointer-analysis --graphml-witness error-witness.graphml "
+run_directory = tempfile.mkdtemp(prefix="deagle-")
+atexit.register(shutil.rmtree, run_directory, ignore_errors=True)
+os.chdir(run_directory)
+base_flags = "--refined-pointer-analysis --graphml-witness error-witness.graphml "
+force_experiment_direct = "--deagle-experiment-direct" in sys.argv[3:]
+shallow_counterexample_prepass = (
+    "--deagle-shallow-counterexample-prepass" in sys.argv[3:]
+)
+recursive_worker_prepass = (
+    "--deagle-recursive-worker-prepass" in sys.argv[3:]
+)
+multi_template_worker_prepass = (
+    "--deagle-multi-template-worker-prepass" in sys.argv[3:]
+)
+extra_args = [
+    shlex.quote(arg) for arg in sys.argv[3:]
+    if arg not in (
+        "--deagle-experiment-direct",
+        "--deagle-shallow-counterexample-prepass",
+        "--deagle-recursive-worker-prepass",
+        "--deagle-multi-template-worker-prepass",
+    )
+]
+flags = base_flags + " ".join(extra_args) + " "
+probe_args = [
+    arg for arg in extra_args
+    if arg not in (
+        "--native-observable-delta-profile",
+        "--native-dispatch-profile",
+        "--native-indexed-dispatch",
+        "--native-adaptive-indexed-dispatch",
+        "--native-packed-delta-shadow",
+        "--native-packed-delta",
+        "--native-rf-first-branching",
+        "--native-guarded-rf-first-branching",
+        "--native-ranked-rf-first-branching",
+        "--native-closure-row-skip",
+        "--native-linear-reason-merge",
+        "--counterfactual-uip-profile",
+        "--atomic-region-rf-transitive",
+        "--counterfactual-uip-domain-profile",
+        "--rf-propagation-uip-participation-profile",
+        "--rf-propagation-exact-domain-uip-profile",
+        "--rf-propagation-cdcl-path-uip-profile",
+        "--rf-multitarget-witness-shadow",
+        "--rf-multitarget-witness",
+    )
+]
+probe_flags = base_flags + " ".join(probe_args) + " "
 
 if "unreach-call.prp" in property_path:
     flags += ""
@@ -110,12 +203,118 @@ else:
     print("Unknown property: %s" % property_path)
     sys.exit(0)
 
-loops_name, loops_limit, is_onlystatic = get_loop_info(program_path, flags)
+cached_loop_info = None
+if multi_template_worker_prepass and "unreach-call.prp" in property_path:
+    multi_template_filter = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "multi_create_loop_filter.awk",
+    )
+    multi_template_result = subprocess.run(
+        ["awk", "-f", multi_template_filter, program_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if multi_template_result.returncode == 0:
+        cached_loop_info = get_loop_info(program_path, probe_flags)
+        _, multi_template_limits, _ = cached_loop_info
+        unwind_budget = 1
+        finite_small_budget = bool(multi_template_limits)
+        for limit in multi_template_limits:
+            if limit <= 0:
+                finite_small_budget = False
+                break
+            unwind_budget *= limit
+            if unwind_budget > 64:
+                finite_small_budget = False
+                break
+        if not finite_small_budget:
+            multi_template_output = "deagle_tmp_multi_template_worker"
+            multi_template_args = (
+                [deagle_exe_path, program_path]
+                + shlex.split(flags)
+                + ["--interference-predicate-fixedpoint"]
+            )
+            try:
+                with open(multi_template_output, "w") as output:
+                    multi_template_proof = subprocess.run(
+                        multi_template_args,
+                        stdout=output,
+                        stderr=subprocess.STDOUT,
+                        timeout=2,
+                        check=False,
+                    )
+            except subprocess.TimeoutExpired:
+                multi_template_proof = None
+            if (
+                multi_template_proof is not None
+                and multi_template_proof.returncode == 0
+            ):
+                with open(multi_template_output, "r") as output:
+                    multi_template_lines = output.readlines()
+                if any(
+                    line.startswith(
+                        "INTERFERENCE_PREDICATE_FIXEDPOINT result=SAFE"
+                    )
+                    for line in multi_template_lines
+                ):
+                    print("".join(multi_template_lines), end="")
+                    print("VERIFICATION SUCCESSFUL")
+                    sys.exit(0)
+
+if recursive_worker_prepass and "unreach-call.prp" in property_path:
+    lexical_filter = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "loop_create_filter.awk",
+    )
+    lexical_result = subprocess.run(
+        ["awk", "-f", lexical_filter, program_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if lexical_result.returncode == 0:
+        recursive_output = "deagle_tmp_recursive_worker"
+        recursive_args = (
+            [deagle_exe_path, program_path]
+            + shlex.split(flags)
+            + ["--interference-predicate-recursive-worker-fixedpoint"]
+        )
+        try:
+            with open(recursive_output, "w") as output:
+                recursive_result = subprocess.run(
+                    recursive_args,
+                    stdout=output,
+                    stderr=subprocess.STDOUT,
+                    timeout=2,
+                    check=False,
+                )
+        except subprocess.TimeoutExpired:
+            recursive_result = None
+        if recursive_result is not None and recursive_result.returncode == 0:
+            with open(recursive_output, "r") as output:
+                recursive_lines = output.readlines()
+            if any(
+                line.startswith(
+                    "INTERFERENCE_PREDICATE_FIXEDPOINT result=SAFE"
+                )
+                for line in recursive_lines
+            ):
+                print("".join(recursive_lines), end="")
+                print("VERIFICATION SUCCESSFUL")
+                sys.exit(0)
+
+if cached_loop_info is None:
+    loops_name, loops_limit, is_onlystatic = get_loop_info(
+        program_path, probe_flags
+    )
+else:
+    loops_name, loops_limit, is_onlystatic = cached_loop_info
 
 if not loops_name:
     # No loops, run deagle_exe without any loop specification!
     print("No loops!")
-    cmd = "./deagle_exe %s %s > deagle_tmp_output 2>&1" % (program_path, flags)
+    cmd = "%s %s %s > deagle_tmp_output 2>&1" % (deagle_exe, program_path, flags)
     print(cmd)
     os.system(cmd)
     result = get_result()
@@ -123,13 +322,49 @@ elif is_onlystatic:
     # All loops are static
     print("All loops can be statically determined!")
     unwindset = generate_unwindset(loops_name, loops_limit)
-    cmd = "./deagle_exe %s %s --unwindset %s > deagle_tmp_output 2>&1" % (program_path, flags, unwindset)
+    cmd = "%s %s %s --unwindset %s > deagle_tmp_output 2>&1" % (deagle_exe, program_path, flags, unwindset)
     print(cmd)
     os.system(cmd)
     result = get_result()
+elif force_experiment_direct:
+    if shallow_counterexample_prepass:
+        print("Trying a counterexample-only shallow prepass (bound 3, 2 s)!")
+        prepass_args = (
+            [deagle_exe_path, program_path]
+            + shlex.split(flags)
+            + ["--unwind", "3"]
+        )
+        try:
+            with open("deagle_tmp_output", "w") as prepass_output:
+                subprocess.run(
+                    prepass_args,
+                    stdout=prepass_output,
+                    stderr=subprocess.STDOUT,
+                    timeout=2,
+                    check=False,
+                )
+        except subprocess.TimeoutExpired:
+            print("Shallow prepass timed out; falling back to original Deagle.")
+
+        prepass_result = inspect_result("deagle_tmp_output")
+        if prepass_result == "FAILURE":
+            print("Shallow prepass found a property violation.")
+            result = get_result()
+        else:
+            print("Shallow prepass found no accepted violation; falling back.")
+            os.remove("deagle_tmp_output")
+
+    if shallow_counterexample_prepass and 'result' in locals():
+        pass
+    else:
+        print("Experiment mode: bypass the wall-clock probe and run directly!")
+        cmd = "%s %s %s > deagle_tmp_output 2>&1" % (deagle_exe, program_path, flags)
+        print(cmd)
+        os.system(cmd)
+        result = get_result()
 else:
     # Try whether this verification task is solvable without giving unwind limit
-    try_cmd = "timeout 5 ./deagle_exe %s %s > deagle_tmp_output 2>&1" % (program_path, flags)
+    try_cmd = "timeout 5 %s %s %s > deagle_tmp_output 2>&1" % (deagle_exe, program_path, probe_flags)
     print(try_cmd)
     os.system(try_cmd)
     try_result = get_result(False)
@@ -140,7 +375,7 @@ else:
     elif ensure_successful_unwind():
         # Not solved, but fully unwinded in 5 seconds
         print("Not solved within the single try, but at least unwinding is successful!")
-        cmd = "./deagle_exe %s %s > deagle_tmp_output 2>&1" % (program_path, flags)
+        cmd = "%s %s %s > deagle_tmp_output 2>&1" % (deagle_exe, program_path, flags)
         print(cmd)
         os.system(cmd)
         result = get_result()
@@ -152,7 +387,7 @@ else:
         undetermine_limit = 3
         loops_limit_it = [loop_limit if loop_limit else undetermine_limit for loop_limit in loops_limit]
         unwindset = generate_unwindset(loops_name, loops_limit_it)
-        cmd = "./deagle_exe %s %s --unwindset %s > deagle_tmp_output 2>&1" % (program_path, flags, unwindset)
+        cmd = "%s %s %s --unwindset %s > deagle_tmp_output 2>&1" % (deagle_exe, program_path, flags, unwindset)
         
         print("\nUnwindset: %s" % unwindset)
         print(cmd)

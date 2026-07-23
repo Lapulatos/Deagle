@@ -36,6 +36,8 @@ Author: Daniel Kroening, kroening@kroening.com
 
 #include <cpp/cprover_library.h>
 
+#include <analyses/interference_predicate_analysis.h>
+#include <analyses/interference_predicate_cube.h>
 #include <goto-checker/all_properties_verifier.h>
 #include <goto-checker/all_properties_verifier_with_fault_localization.h>
 #include <goto-checker/all_properties_verifier_with_trace_storage.h>
@@ -531,6 +533,35 @@ int cbmc_parse_optionst::doit()
 
   if(get_goto_program_ret!=-1)
     return get_goto_program_ret;
+
+  if(cmdline.isset("interference-predicate-self-test"))
+  {
+    const namespacet ns(goto_model.symbol_table);
+    const bool passed =
+      interference_predicate_cube_self_test(ns, ui_message_handler);
+    std::cout << "INTERFERENCE_PREDICATE_SELF_TEST "
+              << (passed ? "PASS" : "FAIL") << '\n';
+    return passed ? CPROVER_EXIT_SUCCESS : CPROVER_EXIT_INTERNAL_ERROR;
+  }
+
+  if(cmdline.isset("interference-predicate-profile"))
+  {
+    interference_predicate_profile(goto_model, ui_message_handler);
+    return CPROVER_EXIT_SUCCESS;
+  }
+
+  if(cmdline.isset("interference-predicate-fixedpoint"))
+  {
+    interference_predicate_fixedpoint(goto_model, ui_message_handler);
+    return CPROVER_EXIT_SUCCESS;
+  }
+
+  if(cmdline.isset("interference-predicate-recursive-worker-fixedpoint"))
+  {
+    interference_predicate_fixedpoint(
+      goto_model, ui_message_handler, true);
+    return CPROVER_EXIT_SUCCESS;
+  }
 
   if(cmdline.isset("show-claims") || // will go away
      cmdline.isset("show-properties")) // use this one
