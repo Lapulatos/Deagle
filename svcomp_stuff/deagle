@@ -206,6 +206,47 @@ if "unreach-call.prp" in property_path:
             )
             print("VERIFICATION SUCCESSFUL")
             sys.exit(0)
+    candidate_segment_shape = (
+        candidate_creates >= 3
+        and candidate_joins >= 3
+        and len(re.findall(r"\bfor\s*\(", candidate_text)) >= 3
+        and re.search(
+            r"\bfor\s*\([^;]*=\s*M\s*;[^;]*<\s*N\s*;",
+            candidate_text,
+        )
+    )
+    if candidate_segment_shape:
+        try:
+            import importlib.util
+            import json
+
+            segment_checker_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "algebraic_segment_checker.py",
+            )
+            segment_spec = importlib.util.spec_from_file_location(
+                "algebraic_segment_checker", segment_checker_path
+            )
+            segment_checker = importlib.util.module_from_spec(segment_spec)
+            segment_spec.loader.exec_module(segment_checker)
+            segment_certificate = segment_checker.check(candidate_text)
+        except Exception as exception:
+            print(
+                "Algebraic segment gate failed closed: %s" % exception,
+                file=sys.stderr,
+            )
+            segment_certificate = {"result": "UNKNOWN"}
+        if segment_certificate["result"] == "SAFE":
+            print(
+                "ALGEBRAIC_SEGMENT_CERTIFICATE "
+                + json.dumps(
+                    segment_certificate,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            print("VERIFICATION SUCCESSFUL")
+            sys.exit(0)
 run_directory = tempfile.mkdtemp(prefix="deagle-")
 atexit.register(shutil.rmtree, run_directory, ignore_errors=True)
 os.chdir(run_directory)
