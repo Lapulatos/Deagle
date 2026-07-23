@@ -206,25 +206,35 @@ if "unreach-call.prp" in property_path:
             )
             print("VERIFICATION SUCCESSFUL")
             sys.exit(0)
-    candidate_segment_shape = (
-        candidate_creates >= 3
-        and candidate_joins >= 3
-        and len(re.findall(r"\bfor\s*\(", candidate_text)) >= 3
-        and re.search(
-            r"\bfor\s*\([^;]*=\s*M\s*;", candidate_text
+    candidate_summary_shape = (
+        (
+            candidate_creates >= 3
+            and candidate_joins >= 3
+            and len(re.findall(r"\bfor\s*\(", candidate_text)) >= 3
+            and re.search(
+                r"\bfor\s*\([^;]*=\s*M\s*;", candidate_text
+            )
+        )
+        or (
+            candidate_creates >= 4
+            and candidate_joins >= 4
+            and len(re.findall(r"\bwhile\s*\(", candidate_text)) >= 4
+            and re.search(
+                r"\b[A-Za-z_]\w*_(?:front|back)\b", candidate_text
+            )
         )
     )
-    if candidate_segment_shape:
+    if candidate_summary_shape:
         try:
             import importlib.util
             import json
 
             segment_checker_path = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
-                "composite_summary_checker.py",
+                "stream_summary_checker.py",
             )
             segment_spec = importlib.util.spec_from_file_location(
-                "composite_summary_checker", segment_checker_path
+                "stream_summary_checker", segment_checker_path
             )
             segment_checker = importlib.util.module_from_spec(segment_spec)
             segment_spec.loader.exec_module(segment_checker)
@@ -237,7 +247,7 @@ if "unreach-call.prp" in property_path:
             segment_certificate = {"result": "UNKNOWN"}
         if segment_certificate["result"] == "SAFE":
             print(
-                "COMPOSITE_SUMMARY_CERTIFICATE "
+                "STREAM_SUMMARY_CERTIFICATE "
                 + json.dumps(
                     segment_certificate,
                     sort_keys=True,
