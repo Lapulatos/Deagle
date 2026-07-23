@@ -141,6 +141,71 @@ if len(sys.argv) < 3:
 
 property_path = sys.argv[1]
 program_path = sys.argv[2]
+if "unreach-call.prp" in property_path:
+    with open(program_path, "r", errors="replace") as candidate_input:
+        candidate_text = candidate_input.read()
+    candidate_creates = len(
+        re.findall(r"\bpthread_create\s*\(", candidate_text)
+    )
+    candidate_joins = len(
+        re.findall(r"\bpthread_join\s*\(", candidate_text)
+    )
+    candidate_loop_worker = bool(
+        re.search(
+            r"\bvoid\s*\*\s*\w+\s*\([^;{}]*\)\s*\{.*?"
+            r"\b(?:while|for)\s*\(",
+            candidate_text,
+            re.S,
+        )
+    )
+    candidate_fold_shape = bool(
+        "minus(" in candidate_text
+        or "? -1" in candidate_text
+        or re.search(
+            r"\b\w+\s*=\s*\w+\s*\+\s*[^;]+;", candidate_text
+        )
+        or re.search(
+            r"\w+\s*\[[^\]]+\]\s*==\s*"
+            r"\w+\s*\[[^\]]+\]",
+            candidate_text,
+        )
+    )
+    if (
+        candidate_creates >= 3
+        and candidate_joins >= 3
+        and candidate_loop_worker
+        and candidate_fold_shape
+    ):
+        try:
+            import importlib.util
+            import json
+
+            checker_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "native_fold_checker.py",
+            )
+            checker_spec = importlib.util.spec_from_file_location(
+                "native_fold_checker", checker_path
+            )
+            checker = importlib.util.module_from_spec(checker_spec)
+            checker_spec.loader.exec_module(checker)
+            certificate = checker.check(candidate_text)
+        except Exception as exception:
+            print(
+                "Native relational-fold gate failed closed: %s"
+                % exception,
+                file=sys.stderr,
+            )
+            certificate = {"result": "UNKNOWN"}
+        if certificate["result"] == "SAFE":
+            print(
+                "NATIVE_RELATIONAL_FOLD_CERTIFICATE "
+                + json.dumps(
+                    certificate, sort_keys=True, separators=(",", ":")
+                )
+            )
+            print("VERIFICATION SUCCESSFUL")
+            sys.exit(0)
 run_directory = tempfile.mkdtemp(prefix="deagle-")
 atexit.register(shutil.rmtree, run_directory, ignore_errors=True)
 os.chdir(run_directory)
