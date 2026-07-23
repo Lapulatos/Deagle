@@ -211,8 +211,7 @@ if "unreach-call.prp" in property_path:
         and candidate_joins >= 3
         and len(re.findall(r"\bfor\s*\(", candidate_text)) >= 3
         and re.search(
-            r"\bfor\s*\([^;]*=\s*M\s*;[^;]*<\s*N\s*;",
-            candidate_text,
+            r"\bfor\s*\([^;]*=\s*M\s*;", candidate_text
         )
     )
     if candidate_segment_shape:
@@ -222,10 +221,10 @@ if "unreach-call.prp" in property_path:
 
             segment_checker_path = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
-                "algebraic_segment_checker.py",
+                "composite_summary_checker.py",
             )
             segment_spec = importlib.util.spec_from_file_location(
-                "algebraic_segment_checker", segment_checker_path
+                "composite_summary_checker", segment_checker_path
             )
             segment_checker = importlib.util.module_from_spec(segment_spec)
             segment_spec.loader.exec_module(segment_checker)
@@ -238,7 +237,7 @@ if "unreach-call.prp" in property_path:
             segment_certificate = {"result": "UNKNOWN"}
         if segment_certificate["result"] == "SAFE":
             print(
-                "ALGEBRAIC_SEGMENT_CERTIFICATE "
+                "COMPOSITE_SUMMARY_CERTIFICATE "
                 + json.dumps(
                     segment_certificate,
                     sort_keys=True,
