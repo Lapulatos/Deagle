@@ -41,6 +41,7 @@ Author: Daniel Kroening, kroening@kroening.com
 #include <analyses/cas_stability_analysis.h>
 #include <analyses/predicate_stability_analysis.h>
 #include <analyses/jces_analysis.h>
+#include <analyses/commuting_sequentialization.h>
 #include <goto-checker/all_properties_verifier.h>
 #include <goto-checker/all_properties_verifier_with_fault_localization.h>
 #include <goto-checker/all_properties_verifier_with_trace_storage.h>
@@ -556,6 +557,8 @@ int cbmc_parse_optionst::doit()
       !ticket_rank_serializability_transform(
         goto_model, ui_message_handler) &&
       !transition_word_equivalence_transform(
+        goto_model, ui_message_handler) &&
+      !join_scoped_commuting_sequentialization_transform(
         goto_model, ui_message_handler))
       jces_transform(goto_model, ui_message_handler);
   }

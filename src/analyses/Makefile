@@ -6,6 +6,7 @@ SRC = ai.cpp \
       call_stack_history.cpp \
       cas_stability_analysis.cpp \
       constant_propagator.cpp \
+      commuting_sequentialization.cpp \
       custom_bitvector_analysis.cpp \
       dependence_graph.cpp \
       dirty.cpp \
