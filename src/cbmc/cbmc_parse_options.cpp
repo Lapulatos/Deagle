@@ -42,6 +42,7 @@ Author: Daniel Kroening, kroening@kroening.com
 #include <analyses/predicate_stability_analysis.h>
 #include <analyses/jces_analysis.h>
 #include <analyses/commuting_sequentialization.h>
+#include <analyses/extremum_cone_analysis.h>
 #include <analyses/lock_ego_abstraction.h>
 #include <goto-checker/all_properties_verifier.h>
 #include <goto-checker/all_properties_verifier_with_fault_localization.h>
@@ -556,6 +557,11 @@ int cbmc_parse_optionst::doit()
     cmdline.isset("native-jces") &&
     !cmdline.isset("unwind-suggest"))
   {
+    if(extremum_cone_proof(goto_model, ui_message_handler))
+    {
+      std::cout << "VERIFICATION SUCCESSFUL\n";
+      return CPROVER_EXIT_SUCCESS;
+    }
     if(
       !predicate_stable_linearization_transform(
         goto_model, ui_message_handler) &&
