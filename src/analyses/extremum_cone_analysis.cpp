@@ -2899,6 +2899,7 @@ bool fresh_array_allocator(
   std::size_t backedges = 0;
   std::size_t element_writes = 0;
   std::size_t nondet_values = 0;
+  std::size_t lower_bounds = 0;
   std::size_t upper_bounds = 0;
   for(auto instruction = program.instructions.begin();
       instruction != program.instructions.end(); ++instruction)
@@ -2924,6 +2925,12 @@ bool fresh_array_allocator(
         is_assume(callee) &&
         instruction->call_arguments().size() == 1)
       {
+        if(
+          relation_zero(
+            instruction->call_arguments().front(),
+            size_parameter,
+            ID_ge))
+          ++lower_bounds;
         if(
           allocation_upper_bound(
             instruction->call_arguments().front(), size_parameter))
@@ -3051,7 +3058,8 @@ bool fresh_array_allocator(
   if(
     malloc_calls != 1 || pointer_assignments != 1 || returns != 1 ||
     zero_initializations != 1 || increments != 1 || backedges != 1 ||
-    element_writes != 1 || nondet_values != 1 || upper_bounds != 1)
+    element_writes != 1 || nondet_values != 1 || lower_bounds != 1 ||
+    upper_bounds != 1)
   {
     reason = "hom_allocator_shape";
     return false;
@@ -3137,6 +3145,1732 @@ bool hom_global_writes(
     return false;
   (void)ns;
   (void)life;
+  return true;
+}
+
+struct linear_fold_propertyt
+{
+  irep_idt left_summary;
+  irep_idt right_summary;
+  irep_idt result_summary;
+  irep_idt operation;
+  irep_idt temporary;
+  const goto_programt::instructiont *operation_call;
+  const goto_programt::instructiont *assumption;
+  const goto_programt::instructiont *error;
+
+  linear_fold_propertyt()
+    : operation_call(nullptr), assumption(nullptr), error(nullptr)
+  {
+  }
+};
+
+bool unequal_symbols(
+  const exprt &src,
+  irep_idt &left,
+  irep_idt &right)
+{
+  const exprt &relation = strip(src);
+  return
+    relation.id() == ID_notequal && relation.operands().size() == 2 &&
+    symbol_id(relation.op0(), left) &&
+    symbol_id(relation.op1(), right) && left != right;
+}
+
+bool find_linear_fold_property(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const lifecyclet &life,
+  linear_fold_propertyt &property,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::map<irep_idt, const goto_programt::instructiont *> value_calls;
+  std::size_t matches = 0;
+  std::size_t errors = 0;
+
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(call_id(instruction, callee) && is_reach_error(callee))
+      {
+        ++errors;
+        if(entry.first != ID_main)
+        {
+          reason = "linear_fold_error_function";
+          return false;
+        }
+        property.error = &instruction;
+      }
+    }
+  }
+
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.last_join == nullptr ||
+      instruction.location_number <= life.last_join->location_number)
+      continue;
+    irep_idt callee;
+    if(!call_id(instruction, callee))
+      continue;
+    if(
+      !instruction.call_lhs().is_nil() &&
+      instruction.call_arguments().size() == 2)
+    {
+      irep_idt temporary;
+      if(symbol_id(instruction.call_lhs(), temporary))
+        value_calls[temporary] = &instruction;
+      continue;
+    }
+    if(!is_assume(callee) || instruction.call_arguments().size() != 1)
+      continue;
+
+    irep_idt first;
+    irep_idt second;
+    if(
+      !unequal_symbols(
+        instruction.call_arguments().front(), first, second))
+      continue;
+    irep_idt result;
+    irep_idt temporary;
+    const goto_programt::instructiont *producer = nullptr;
+    if(value_calls.count(first) != 0)
+    {
+      temporary = first;
+      result = second;
+      producer = value_calls.at(first);
+    }
+    else if(value_calls.count(second) != 0)
+    {
+      temporary = second;
+      result = first;
+      producer = value_calls.at(second);
+    }
+    else
+      continue;
+
+    irep_idt operation;
+    irep_idt left;
+    irep_idt right;
+    if(
+      producer == nullptr || !call_id(*producer, operation) ||
+      producer->call_arguments().size() != 2 ||
+      !symbol_id(producer->call_arguments()[0], left) ||
+      !symbol_id(producer->call_arguments()[1], right) ||
+      !shared_signed(left, ns) || !shared_signed(right, ns) ||
+      !shared_signed(result, ns) || left == right || left == result ||
+      right == result)
+      continue;
+
+    ++matches;
+    property.left_summary = left;
+    property.right_summary = right;
+    property.result_summary = result;
+    property.operation = operation;
+    property.temporary = temporary;
+    property.operation_call = producer;
+    property.assumption = &instruction;
+  }
+
+  if(
+    matches != 1 || errors != 1 || property.error == nullptr ||
+    property.operation_call == nullptr || property.assumption == nullptr ||
+    property.operation_call->location_number >=
+      property.assumption->location_number ||
+    property.assumption->location_number >= property.error->location_number)
+  {
+    reason =
+      matches == 0 ? "linear_fold_property" :
+                     "linear_fold_property_ambiguous";
+    return false;
+  }
+  return true;
+}
+
+bool zero_based_hom_loop(
+  const goto_programt &program,
+  hom_loopt &result,
+  std::string &reason)
+{
+  natural_loopst loops;
+  loops(program);
+  if(loops.loop_map.size() != 1)
+  {
+    reason = "linear_fold_loop_count";
+    return false;
+  }
+  result.head = loops.loop_map.begin()->first;
+  const auto &loop = loops.loop_map.begin()->second;
+  exprt bound;
+  if(
+    !parse_loop_exit(*result.head, result.induction, bound) ||
+    !symbol_id(bound, result.bound))
+  {
+    reason = "linear_fold_loop_guard";
+    return false;
+  }
+
+  std::size_t initializations = 0;
+  std::size_t increments = 0;
+  std::size_t backedges = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(loop.contains(instruction))
+      result.members.insert(&*instruction);
+    if(instruction->is_assign())
+    {
+      irep_idt lhs;
+      if(
+        symbol_id(instruction->assign_lhs(), lhs) &&
+        lhs == result.induction)
+      {
+        if(
+          instruction->location_number < result.head->location_number &&
+          value_is(instruction->assign_rhs(), 0))
+          ++initializations;
+        else if(
+          loop.contains(instruction) &&
+          unit_increment(*instruction, result.induction))
+          ++increments;
+        else
+        {
+          reason = "linear_fold_induction_write";
+          return false;
+        }
+      }
+    }
+    if(
+      instruction->is_goto() && loop.contains(instruction) &&
+      instruction != result.head &&
+      instruction->condition().is_true() &&
+      instruction->targets.size() == 1 &&
+      instruction->get_target() == result.head)
+      ++backedges;
+  }
+  if(initializations != 1 || increments != 1 || backedges != 1)
+  {
+    reason = "linear_fold_loop_skeleton";
+    return false;
+  }
+  return true;
+}
+
+struct linear_fold_workert
+{
+  irep_idt summary;
+  irep_idt source_base;
+  irep_idt result_base;
+  irep_idt bound;
+  std::set<const goto_programt::instructiont *> writes;
+};
+
+bool linear_single_fold_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  const linear_fold_propertyt &property,
+  linear_fold_workert &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  hom_loopt loop;
+  if(!zero_based_hom_loop(program, loop, reason))
+    return false;
+  const symbolt *induction_symbol = lookup(loop.induction, ns);
+  if(induction_symbol == nullptr)
+  {
+    reason = "linear_fold_induction_symbol";
+    return false;
+  }
+  const exprt induction =
+    symbol_exprt(loop.induction, induction_symbol->type);
+
+  std::size_t calls = 0;
+  std::size_t gotos = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_atomic_begin() || instruction->is_atomic_end())
+    {
+      reason = "linear_fold_atomic";
+      return false;
+    }
+    if(instruction->is_goto() && loop.members.count(&*instruction) != 0)
+      ++gotos;
+    irep_idt callee;
+    if(call_id(*instruction, callee))
+    {
+      irep_idt summary;
+      irep_idt first;
+      irep_idt base;
+      if(
+        callee != property.operation ||
+        instruction->call_lhs().is_nil() ||
+        instruction->call_arguments().size() != 2 ||
+        !symbol_id(instruction->call_lhs(), summary) ||
+        !symbol_id(instruction->call_arguments()[0], first) ||
+        first != summary ||
+        (summary != property.left_summary &&
+         summary != property.right_summary) ||
+        !base_pointer(instruction->call_arguments()[1], base) ||
+        !array_at(instruction->call_arguments()[1], base, induction))
+      {
+        reason = "linear_fold_worker_call";
+        return false;
+      }
+      result.summary = summary;
+      result.source_base = base;
+      result.writes.insert(&*instruction);
+      ++calls;
+      continue;
+    }
+    if(instruction->is_assign())
+    {
+      irep_idt lhs;
+      if(shared_symbol_lhs(*instruction, ns, lhs))
+      {
+        reason = "linear_fold_worker_shared_write";
+        return false;
+      }
+      irep_idt base;
+      if(base_pointer(instruction->assign_lhs(), base))
+      {
+        reason = "linear_fold_worker_array_write";
+        return false;
+      }
+    }
+    else if(
+      instruction->is_assert() || instruction->is_assume() ||
+      instruction->is_start_thread() || instruction->is_end_thread() ||
+      instruction->is_throw() || instruction->is_catch())
+    {
+      reason = "linear_fold_worker_effect";
+      return false;
+    }
+  }
+  if(calls != 1 || gotos != 2)
+  {
+    reason = "linear_fold_worker_shape";
+    return false;
+  }
+  result.bound = loop.bound;
+  return true;
+}
+
+bool linear_result_fold_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  const linear_fold_propertyt &property,
+  const linear_fold_workert &left,
+  const linear_fold_workert &right,
+  linear_fold_workert &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  hom_loopt loop;
+  if(!zero_based_hom_loop(program, loop, reason))
+    return false;
+  if(loop.bound != left.bound || loop.bound != right.bound)
+  {
+    reason = "linear_fold_result_bound";
+    return false;
+  }
+  const symbolt *induction_symbol = lookup(loop.induction, ns);
+  if(induction_symbol == nullptr)
+  {
+    reason = "linear_fold_result_induction_symbol";
+    return false;
+  }
+  const exprt induction =
+    symbol_exprt(loop.induction, induction_symbol->type);
+
+  goto_programt::const_targett element_call =
+    program.instructions.end();
+  goto_programt::const_targett array_write =
+    program.instructions.end();
+  goto_programt::const_targett summary_call =
+    program.instructions.end();
+  irep_idt element_temporary;
+  std::size_t gotos = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_atomic_begin() || instruction->is_atomic_end())
+    {
+      reason = "linear_fold_result_atomic";
+      return false;
+    }
+    if(instruction->is_goto() && loop.members.count(&*instruction) != 0)
+      ++gotos;
+    irep_idt callee;
+    if(call_id(*instruction, callee))
+    {
+      if(
+        callee != property.operation ||
+        instruction->call_lhs().is_nil() ||
+        instruction->call_arguments().size() != 2)
+      {
+        reason = "linear_fold_result_call";
+        return false;
+      }
+      irep_idt lhs;
+      if(!symbol_id(instruction->call_lhs(), lhs))
+      {
+        reason = "linear_fold_result_lhs";
+        return false;
+      }
+      irep_idt first;
+      if(
+        lhs == property.result_summary &&
+        symbol_id(instruction->call_arguments()[0], first) &&
+        first == property.result_summary &&
+        !result.result_base.empty() &&
+        array_at(
+          instruction->call_arguments()[1],
+          result.result_base,
+          induction))
+      {
+        if(summary_call != program.instructions.end())
+        {
+          reason = "linear_fold_result_summary_count";
+          return false;
+        }
+        summary_call = instruction;
+        result.summary = lhs;
+        result.writes.insert(&*instruction);
+      }
+      else if(
+        (array_at(
+           instruction->call_arguments()[0],
+           left.source_base,
+           induction) &&
+         array_at(
+           instruction->call_arguments()[1],
+           right.source_base,
+           induction)) ||
+        (array_at(
+           instruction->call_arguments()[0],
+           right.source_base,
+           induction) &&
+         array_at(
+           instruction->call_arguments()[1],
+           left.source_base,
+           induction)))
+      {
+        if(element_call != program.instructions.end())
+        {
+          reason = "linear_fold_result_element_count";
+          return false;
+        }
+        element_call = instruction;
+        element_temporary = lhs;
+      }
+      else
+      {
+        reason = "linear_fold_result_arguments";
+        return false;
+      }
+      continue;
+    }
+    if(instruction->is_assign())
+    {
+      irep_idt base;
+      irep_idt index;
+      if(
+        array_symbol_index(
+          instruction->assign_lhs(), base, index))
+      {
+        irep_idt value;
+        if(
+          index != loop.induction ||
+          !symbol_id(instruction->assign_rhs(), value) ||
+          value != element_temporary ||
+          element_call == program.instructions.end() ||
+          array_write != program.instructions.end())
+        {
+          reason = "linear_fold_result_array_write";
+          return false;
+        }
+        result.result_base = base;
+        array_write = instruction;
+        result.writes.insert(&*instruction);
+      }
+      else
+      {
+        irep_idt lhs;
+        if(shared_symbol_lhs(*instruction, ns, lhs))
+        {
+          reason = "linear_fold_result_shared_write";
+          return false;
+        }
+        if(base_pointer(instruction->assign_lhs(), base))
+        {
+          reason = "linear_fold_result_pointer_write";
+          return false;
+        }
+      }
+    }
+    else if(
+      instruction->is_assert() || instruction->is_assume() ||
+      instruction->is_start_thread() || instruction->is_end_thread() ||
+      instruction->is_throw() || instruction->is_catch())
+    {
+      reason = "linear_fold_result_effect";
+      return false;
+    }
+  }
+  if(
+    gotos != 2 || element_call == program.instructions.end() ||
+    array_write == program.instructions.end() ||
+    summary_call == program.instructions.end() ||
+    element_call->location_number >= array_write->location_number ||
+    array_write->location_number >= summary_call->location_number ||
+    result.result_base == left.source_base ||
+    result.result_base == right.source_base)
+  {
+    reason = "linear_fold_result_shape";
+    return false;
+  }
+  result.bound = loop.bound;
+  return true;
+}
+
+bool zero_initialized_symbols(
+  const goto_modelt &model,
+  const std::set<irep_idt> &symbols,
+  std::set<const goto_programt::instructiont *> &writes,
+  std::string &reason)
+{
+  std::set<irep_idt> initialized;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(!is_start_function(entry.first))
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(!instruction.is_assign())
+        continue;
+      irep_idt lhs;
+      if(
+        symbol_id(instruction.assign_lhs(), lhs) &&
+        symbols.count(lhs) != 0 &&
+        value_is(instruction.assign_rhs(), 0))
+      {
+        if(!initialized.insert(lhs).second)
+        {
+          reason = "linear_fold_duplicate_zero_init";
+          return false;
+        }
+        writes.insert(&instruction);
+      }
+    }
+  }
+  if(initialized != symbols)
+  {
+    reason = "linear_fold_zero_init";
+    return false;
+  }
+  return true;
+}
+
+struct linear_fold_maint
+{
+  irep_idt bound;
+  irep_idt allocator;
+  std::set<const goto_programt::instructiont *> writes;
+};
+
+bool linear_fold_main(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const linear_fold_propertyt &property,
+  const linear_fold_workert &left,
+  const linear_fold_workert &right,
+  const linear_fold_workert &result,
+  linear_fold_maint &state,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  if(left.bound != right.bound || left.bound != result.bound)
+  {
+    reason = "linear_fold_common_bound";
+    return false;
+  }
+  state.bound = left.bound;
+  std::set<irep_idt> expected_bases = {
+    left.source_base, right.source_base, result.result_base};
+  std::set<irep_idt> allocated_bases;
+  std::size_t bound_initializers = 0;
+
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr &&
+      instruction.location_number >= life.first_create->location_number)
+      break;
+    if(instruction.is_assign())
+    {
+      irep_idt lhs;
+      if(
+        symbol_id(instruction.assign_lhs(), lhs) &&
+        lhs == state.bound)
+      {
+        ++bound_initializers;
+        state.writes.insert(&instruction);
+      }
+    }
+    irep_idt callee;
+    if(!call_id(instruction, callee))
+      continue;
+    irep_idt lhs;
+    irep_idt argument;
+    if(
+      !instruction.call_lhs().is_nil() &&
+      symbol_id(instruction.call_lhs(), lhs) &&
+      expected_bases.count(lhs) != 0)
+    {
+      if(
+        instruction.call_arguments().size() != 1 ||
+        !symbol_id(instruction.call_arguments().front(), argument) ||
+        argument != state.bound)
+      {
+        reason = "linear_fold_allocation_bound";
+        return false;
+      }
+      if(state.allocator.empty())
+        state.allocator = callee;
+      else if(state.allocator != callee)
+      {
+        reason = "linear_fold_allocator_mismatch";
+        return false;
+      }
+      if(!allocated_bases.insert(lhs).second)
+      {
+        reason = "linear_fold_allocation_count";
+        return false;
+      }
+      state.writes.insert(&instruction);
+    }
+  }
+  if(
+    bound_initializers != 1 || allocated_bases != expected_bases ||
+    state.allocator.empty())
+  {
+    reason = "linear_fold_main_initialization";
+    return false;
+  }
+
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr && life.last_join != nullptr &&
+      instruction.location_number >= life.first_create->location_number &&
+      instruction.location_number <= life.last_join->location_number)
+    {
+      if(
+        instruction.is_assign() || instruction.is_goto() ||
+        instruction.is_assert() || instruction.is_assume() ||
+        instruction.is_atomic_begin() || instruction.is_atomic_end())
+      {
+        reason = "linear_fold_main_concurrent_effect";
+        return false;
+      }
+      irep_idt callee;
+      if(
+        call_id(instruction, callee) &&
+        !is_create(callee) && !is_join(callee))
+      {
+        reason = "linear_fold_main_concurrent_call";
+        return false;
+      }
+    }
+    if(
+      life.last_join != nullptr &&
+      instruction.location_number > life.last_join->location_number)
+    {
+      if(
+        instruction.is_assign() || instruction.is_goto() ||
+        instruction.is_assert() || instruction.is_assume() ||
+        instruction.is_atomic_begin() || instruction.is_atomic_end())
+      {
+        reason = "linear_fold_main_postjoin_control";
+        return false;
+      }
+      irep_idt callee;
+      if(
+        call_id(instruction, callee) &&
+        &instruction != property.operation_call &&
+        &instruction != property.assumption &&
+        &instruction != property.error)
+      {
+        reason = "linear_fold_main_postjoin_call";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool linear_fold_global_writes(
+  const goto_modelt &model,
+  const linear_fold_propertyt &property,
+  const linear_fold_workert &left,
+  const linear_fold_workert &right,
+  const linear_fold_workert &result,
+  const linear_fold_maint &main_state,
+  std::string &reason)
+{
+  const std::set<irep_idt> summaries = {
+    property.left_summary,
+    property.right_summary,
+    property.result_summary};
+  const std::set<irep_idt> protected_symbols = {
+    property.left_summary,
+    property.right_summary,
+    property.result_summary,
+    left.source_base,
+    right.source_base,
+    result.result_base,
+    main_state.bound};
+  std::set<const goto_programt::instructiont *> allowed =
+    left.writes;
+  allowed.insert(right.writes.begin(), right.writes.end());
+  allowed.insert(result.writes.begin(), result.writes.end());
+  allowed.insert(main_state.writes.begin(), main_state.writes.end());
+  if(!zero_initialized_symbols(model, summaries, allowed, reason))
+    return false;
+
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      const exprt *lhs = nullptr;
+      if(instruction.is_assign())
+        lhs = &instruction.assign_lhs();
+      else if(
+        instruction.is_function_call() &&
+        !instruction.call_lhs().is_nil())
+        lhs = &instruction.call_lhs();
+      if(lhs == nullptr)
+        continue;
+      irep_idt direct;
+      irep_idt base;
+      const bool protected_write =
+        (symbol_id(*lhs, direct) &&
+         protected_symbols.count(direct) != 0) ||
+        (base_pointer(*lhs, base) &&
+         (base == left.source_base || base == right.source_base ||
+          base == result.result_base));
+      if(!protected_write)
+        continue;
+      if(
+        is_start_function(entry.first) && instruction.is_assign() &&
+        value_is(instruction.assign_rhs(), 0))
+        continue;
+      if(allowed.count(&instruction) == 0)
+      {
+        reason = "linear_fold_external_writer";
+        return false;
+      }
+    }
+  }
+
+  if(
+    !anchor_alias_free(model, left.source_base, reason) ||
+    !anchor_alias_free(model, right.source_base, reason) ||
+    !anchor_alias_free(model, result.result_base, reason) ||
+    !no_addresses(model, protected_symbols, reason))
+    return false;
+  return true;
+}
+
+bool linear_fold_proof_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &reason)
+{
+  lifecyclet life;
+  if(!lifecycle(model, life, reason) || life.workers.size() != 3)
+  {
+    if(reason.empty())
+      reason = "linear_fold_lifecycle";
+    return false;
+  }
+  linear_fold_propertyt property;
+  if(!find_linear_fold_property(model, ns, life, property, reason))
+    return false;
+  if(!signed_addition_helper(model, ns, property.operation, reason))
+    return false;
+
+  for(const auto &left_worker : life.workers)
+  {
+    linear_fold_workert left;
+    std::string left_reason;
+    if(
+      !linear_single_fold_worker(
+        model, ns, left_worker, property, left, left_reason) ||
+      left.summary != property.left_summary)
+      continue;
+    for(const auto &right_worker : life.workers)
+    {
+      if(right_worker == left_worker)
+        continue;
+      linear_fold_workert right;
+      std::string right_reason;
+      if(
+        !linear_single_fold_worker(
+          model, ns, right_worker, property, right, right_reason) ||
+        right.summary != property.right_summary ||
+        right.bound != left.bound ||
+        right.source_base == left.source_base)
+        continue;
+      irep_idt result_worker;
+      for(const auto &worker : life.workers)
+      {
+        if(worker != left_worker && worker != right_worker)
+          result_worker = worker;
+      }
+      linear_fold_workert result;
+      std::string result_reason;
+      if(
+        result_worker.empty() ||
+        !linear_result_fold_worker(
+          model,
+          ns,
+          result_worker,
+          property,
+          left,
+          right,
+          result,
+          result_reason))
+        continue;
+
+      linear_fold_maint main_state;
+      if(
+        !linear_fold_main(
+          model,
+          life,
+          property,
+          left,
+          right,
+          result,
+          main_state,
+          reason) ||
+        !fresh_array_allocator(
+          model, ns, main_state.allocator, reason) ||
+        !linear_fold_global_writes(
+          model,
+          property,
+          left,
+          right,
+          result,
+          main_state,
+          reason))
+        return false;
+
+      std::cout << "NATIVE_LINEAR_ANNIHILATOR applied=1 rule=fold"
+                << " left=" << property.left_summary
+                << " right=" << property.right_summary
+                << " result=" << property.result_summary << '\n';
+      return true;
+    }
+  }
+  reason = "linear_fold_worker_partition";
+  return false;
+}
+
+bool shared_unsigned32(
+  const irep_idt &identifier,
+  const namespacet &ns)
+{
+  const symbolt *symbol = lookup(identifier, ns);
+  return
+    symbol != nullptr && symbol->is_static_lifetime && !symbol->is_type &&
+    symbol->type.id() == ID_unsignedbv &&
+    to_unsignedbv_type(symbol->type).get_width() == 32;
+}
+
+bool shared_resource32(
+  const irep_idt &identifier,
+  const namespacet &ns)
+{
+  const symbolt *symbol = lookup(identifier, ns);
+  if(
+    symbol == nullptr || !symbol->is_static_lifetime || symbol->is_type)
+    return false;
+  if(symbol->type.id() == ID_unsignedbv)
+    return to_unsignedbv_type(symbol->type).get_width() == 32;
+  if(symbol->type.id() == ID_signedbv)
+    return to_signedbv_type(symbol->type).get_width() == 32;
+  return false;
+}
+
+struct resource_propertyt
+{
+  irep_idt left;
+  irep_idt right;
+  const goto_programt::instructiont *assumption;
+  const goto_programt::instructiont *error;
+
+  resource_propertyt() : assumption(nullptr), error(nullptr)
+  {
+  }
+};
+
+bool find_resource_property(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const lifecyclet &life,
+  resource_propertyt &property,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::size_t matches = 0;
+  std::size_t errors = 0;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(call_id(instruction, callee) && is_reach_error(callee))
+      {
+        ++errors;
+        if(entry.first != ID_main)
+        {
+          reason = "resource_error_function";
+          return false;
+        }
+        property.error = &instruction;
+      }
+    }
+  }
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.last_join == nullptr ||
+      instruction.location_number <= life.last_join->location_number)
+      continue;
+    irep_idt callee;
+    if(
+      !call_id(instruction, callee) || !is_assume(callee) ||
+      instruction.call_arguments().size() != 1)
+      continue;
+    irep_idt left;
+    irep_idt right;
+    if(
+      !unequal_symbols(
+        instruction.call_arguments().front(), left, right) ||
+      !shared_unsigned32(left, ns) || !shared_unsigned32(right, ns))
+      continue;
+    ++matches;
+    property.left = left;
+    property.right = right;
+    property.assumption = &instruction;
+  }
+  if(
+    matches != 1 || errors != 1 || property.assumption == nullptr ||
+    property.error == nullptr ||
+    property.assumption->location_number >= property.error->location_number)
+  {
+    reason =
+      matches == 0 ? "resource_property" :
+                     "resource_property_ambiguous";
+    return false;
+  }
+  return true;
+}
+
+void flatten_plus_terms(
+  const exprt &src,
+  std::vector<exprt> &terms)
+{
+  const exprt &expr = strip(src);
+  if(expr.id() == ID_plus)
+  {
+    for(const auto &operand : expr.operands())
+      flatten_plus_terms(operand, terms);
+  }
+  else
+    terms.push_back(expr);
+}
+
+bool multiplier_term(
+  const exprt &src,
+  irep_idt &multiplier,
+  mp_integer &coefficient)
+{
+  const exprt &term = strip(src);
+  irep_idt symbol;
+  if(symbol_id(term, symbol))
+  {
+    multiplier = symbol;
+    coefficient = 1;
+    return true;
+  }
+  if(term.id() != ID_mult || term.operands().size() != 2)
+    return false;
+  for(unsigned order = 0; order < 2; ++order)
+  {
+    mp_integer value;
+    if(
+      integer_constant(term.operands()[order], value) &&
+      value > 0 &&
+      symbol_id(term.operands()[1 - order], symbol))
+    {
+      multiplier = symbol;
+      coefficient = value;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool accumulator_increment(
+  const exprt &src,
+  const irep_idt &accumulator,
+  irep_idt &multiplier,
+  mp_integer &delta)
+{
+  std::vector<exprt> terms;
+  flatten_plus_terms(src, terms);
+  std::size_t accumulator_terms = 0;
+  irep_idt common_multiplier;
+  mp_integer coefficient = 0;
+  for(const auto &term : terms)
+  {
+    irep_idt symbol;
+    if(symbol_id(term, symbol) && symbol == accumulator)
+    {
+      ++accumulator_terms;
+      continue;
+    }
+    irep_idt candidate;
+    mp_integer contribution;
+    if(!multiplier_term(term, candidate, contribution))
+      return false;
+    if(common_multiplier.empty())
+      common_multiplier = candidate;
+    else if(common_multiplier != candidate)
+      return false;
+    coefficient += contribution;
+  }
+  if(
+    accumulator_terms != 1 || common_multiplier.empty() ||
+    coefficient <= 0 || coefficient > 16)
+    return false;
+  multiplier = common_multiplier;
+  delta = coefficient;
+  return true;
+}
+
+bool resource_decrement(
+  const exprt &src,
+  const irep_idt &resource,
+  mp_integer &delta)
+{
+  const exprt &rhs = strip(src);
+  irep_idt left;
+  mp_integer amount;
+  if(
+    rhs.id() != ID_minus || rhs.operands().size() != 2 ||
+    !symbol_id(rhs.op0(), left) || left != resource ||
+    !integer_constant(rhs.op1(), amount) ||
+    amount <= 0 || amount > 16)
+    return false;
+  delta = amount;
+  return true;
+}
+
+bool resource_skip_guard(
+  const exprt &src,
+  const irep_idt &resource,
+  const mp_integer &delta)
+{
+  const exprt &outer = strip(src);
+  if(outer.id() != ID_not || outer.operands().size() != 1)
+    return false;
+  const exprt &relation = strip(outer.op0());
+  irep_idt left;
+  mp_integer bound;
+  return
+    relation.id() == ID_gt && relation.operands().size() == 2 &&
+    symbol_id(relation.op0(), left) && left == resource &&
+    integer_constant(relation.op1(), bound) && bound == delta - 1;
+}
+
+bool resource_positive(
+  const exprt &src,
+  const irep_idt &resource)
+{
+  const exprt &relation = strip(src);
+  irep_idt left;
+  return
+    relation.id() == ID_gt && relation.operands().size() == 2 &&
+    symbol_id(relation.op0(), left) && left == resource &&
+    value_is(relation.op1(), 0);
+}
+
+struct resource_workert
+{
+  irep_idt accumulator;
+  irep_idt resource;
+  irep_idt multiplier;
+  mp_integer delta;
+  bool unit_completion;
+  std::set<const goto_programt::instructiont *> writes;
+
+  resource_workert() : delta(0), unit_completion(false)
+  {
+  }
+};
+
+bool affine_resource_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  resource_workert &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  natural_loopst loops;
+  loops(program);
+  if(loops.loop_map.size() != 1)
+  {
+    reason = "resource_loop_count";
+    return false;
+  }
+  const auto loop_head = loops.loop_map.begin()->first;
+  const auto &loop = loops.loop_map.begin()->second;
+
+  goto_programt::const_targett accumulator_write =
+    program.instructions.end();
+  goto_programt::const_targett resource_write =
+    program.instructions.end();
+  unsigned atomic_epoch = 0;
+  unsigned accumulator_epoch = 0;
+  unsigned resource_epoch = 0;
+  int atomic_depth = 0;
+  std::size_t atomic_begins = 0;
+  std::size_t atomic_ends = 0;
+  std::size_t gotos = 0;
+  std::size_t backedges = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_atomic_begin())
+    {
+      ++atomic_depth;
+      ++atomic_begins;
+      ++atomic_epoch;
+      if(atomic_depth != 1)
+      {
+        reason = "resource_atomic_nesting";
+        return false;
+      }
+      continue;
+    }
+    if(instruction->is_atomic_end())
+    {
+      --atomic_depth;
+      ++atomic_ends;
+      if(atomic_depth != 0)
+      {
+        reason = "resource_atomic_balance";
+        return false;
+      }
+      continue;
+    }
+    irep_idt callee;
+    if(call_id(*instruction, callee))
+    {
+      reason = "resource_worker_call";
+      return false;
+    }
+    if(instruction->is_goto() && loop.contains(instruction))
+    {
+      ++gotos;
+      if(
+        instruction != loop_head &&
+        instruction->condition().is_true() &&
+        instruction->targets.size() == 1 &&
+        instruction->get_target() == loop_head)
+        ++backedges;
+    }
+    if(!instruction->is_assign())
+      continue;
+    irep_idt lhs;
+    if(!shared_symbol_lhs(*instruction, ns, lhs))
+    {
+      irep_idt base;
+      if(base_pointer(instruction->assign_lhs(), base))
+      {
+        reason = "resource_worker_pointer_write";
+        return false;
+      }
+      continue;
+    }
+    if(atomic_depth != 1)
+    {
+      reason = "resource_nonatomic_write";
+      return false;
+    }
+
+    irep_idt multiplier;
+    mp_integer increment;
+    if(
+      accumulator_increment(
+        instruction->assign_rhs(), lhs, multiplier, increment))
+    {
+      if(accumulator_write != program.instructions.end())
+      {
+        reason = "resource_accumulator_count";
+        return false;
+      }
+      result.accumulator = lhs;
+      result.multiplier = multiplier;
+      if(result.delta != 0 && result.delta != increment)
+      {
+        reason = "resource_delta_mismatch";
+        return false;
+      }
+      result.delta = increment;
+      accumulator_write = instruction;
+      accumulator_epoch = atomic_epoch;
+      result.writes.insert(&*instruction);
+      continue;
+    }
+
+    mp_integer decrement;
+    if(resource_decrement(instruction->assign_rhs(), lhs, decrement))
+    {
+      if(resource_write != program.instructions.end())
+      {
+        reason = "resource_resource_count";
+        return false;
+      }
+      result.resource = lhs;
+      resource_write = instruction;
+      resource_epoch = atomic_epoch;
+      result.writes.insert(&*instruction);
+      if(result.delta != 0 && result.delta != decrement)
+      {
+        reason = "resource_delta_mismatch";
+        return false;
+      }
+      result.delta = decrement;
+      continue;
+    }
+    reason = "resource_unrecognized_shared_write";
+    return false;
+  }
+  if(
+    atomic_depth != 0 || atomic_begins != atomic_ends ||
+    (atomic_begins != 1 && atomic_begins != 3) ||
+    accumulator_write == program.instructions.end() ||
+    resource_write == program.instructions.end() ||
+    accumulator_epoch == 0 || accumulator_epoch != resource_epoch ||
+    accumulator_write->location_number >= resource_write->location_number ||
+    result.accumulator == result.resource ||
+    !shared_unsigned32(result.accumulator, ns) ||
+    !shared_unsigned32(result.multiplier, ns) ||
+    !shared_resource32(result.resource, ns) ||
+    gotos < 2 || gotos > 3 || backedges != 1)
+  {
+    reason = "resource_worker_shape";
+    return false;
+  }
+
+  const symbolt *resource_symbol = lookup(result.resource, ns);
+  if(resource_symbol == nullptr)
+  {
+    reason = "resource_symbol";
+    return false;
+  }
+  std::size_t transition_guards = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(
+      instruction->is_goto() && !instruction->condition().is_true() &&
+      instruction->targets.size() == 1 &&
+      instruction->location_number < accumulator_write->location_number &&
+      instruction->get_target()->location_number >
+        resource_write->location_number &&
+      resource_skip_guard(
+        instruction->condition(), result.resource, result.delta))
+      ++transition_guards;
+  }
+  if(transition_guards != 1)
+  {
+    reason = "resource_transition_guard";
+    return false;
+  }
+
+  if(result.delta == 1)
+  {
+    if(resource_skip_guard(loop_head->condition(), result.resource, 1))
+      result.unit_completion = true;
+    else
+    {
+      irep_idt condition;
+      if(
+        loop_head->condition().id() != ID_nil &&
+        loop_head->condition().operands().size() >= 1)
+      {
+        const exprt &outer = strip(loop_head->condition());
+        if(outer.id() == ID_not && outer.operands().size() == 1)
+        {
+          const exprt &truth = strip(outer.op0());
+          if(
+            truth.id() == ID_notequal &&
+            truth.operands().size() == 2)
+          {
+            if(
+              symbol_id(truth.op0(), condition) &&
+              value_is(truth.op1(), 0))
+            {
+            }
+            else if(
+              symbol_id(truth.op1(), condition) &&
+              value_is(truth.op0(), 0))
+            {
+            }
+            else
+              condition.clear();
+          }
+        }
+      }
+      if(!condition.empty())
+      {
+        int depth = 0;
+        std::size_t condition_writes = 0;
+        std::size_t positive_writes = 0;
+        for(const auto &instruction : program.instructions)
+        {
+          if(instruction.is_atomic_begin())
+            ++depth;
+          else if(instruction.is_atomic_end())
+            --depth;
+          else if(instruction.is_assign())
+          {
+            irep_idt lhs;
+            if(
+              symbol_id(instruction.assign_lhs(), lhs) &&
+              lhs == condition)
+            {
+              ++condition_writes;
+              if(
+                depth == 1 &&
+                resource_positive(
+                  instruction.assign_rhs(), result.resource))
+                ++positive_writes;
+            }
+          }
+        }
+        result.unit_completion =
+          condition_writes == 2 && positive_writes == 2;
+      }
+    }
+    if(!result.unit_completion)
+    {
+      reason = "resource_unit_completion";
+      return false;
+    }
+  }
+  return true;
+}
+
+void add_equality_terms(
+  const exprt &src,
+  std::map<irep_idt, std::set<irep_idt>> &edges)
+{
+  std::vector<exprt> terms;
+  flatten_and(src, terms);
+  for(const auto &term_src : terms)
+  {
+    const exprt &term = strip(term_src);
+    irep_idt left;
+    irep_idt right;
+    if(
+      term.id() == ID_equal && term.operands().size() == 2 &&
+      symbol_id(term.op0(), left) && symbol_id(term.op1(), right))
+    {
+      edges[left].insert(right);
+      edges[right].insert(left);
+    }
+  }
+}
+
+bool equality_reachable(
+  const std::map<irep_idt, std::set<irep_idt>> &edges,
+  const irep_idt &left,
+  const irep_idt &right)
+{
+  if(left == right)
+    return true;
+  std::set<irep_idt> reached = {left};
+  std::vector<irep_idt> work = {left};
+  for(std::size_t index = 0; index < work.size(); ++index)
+  {
+    const auto found = edges.find(work[index]);
+    if(found == edges.end())
+      continue;
+    for(const auto &next : found->second)
+    {
+      if(next == right)
+        return true;
+      if(reached.insert(next).second)
+        work.push_back(next);
+    }
+  }
+  return false;
+}
+
+bool resource_initial_relations(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const resource_propertyt &property,
+  const resource_workert &left,
+  const resource_workert &right,
+  std::set<const goto_programt::instructiont *> &allowed,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  const std::set<irep_idt> protected_symbols = {
+    left.accumulator,
+    right.accumulator,
+    left.resource,
+    right.resource,
+    left.multiplier};
+  std::map<irep_idt, std::set<irep_idt>> edges;
+  std::set<irep_idt> zero;
+  std::map<irep_idt, const goto_programt::instructiont *> main_writes;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(!is_start_function(entry.first))
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(!instruction.is_assign())
+        continue;
+      irep_idt lhs;
+      if(
+        symbol_id(instruction.assign_lhs(), lhs) &&
+        protected_symbols.count(lhs) != 0 &&
+        value_is(instruction.assign_rhs(), 0))
+      {
+        zero.insert(lhs);
+        allowed.insert(&instruction);
+      }
+    }
+  }
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr &&
+      instruction.location_number >= life.first_create->location_number)
+      break;
+    if(instruction.is_assign())
+    {
+      irep_idt lhs;
+      if(
+        symbol_id(instruction.assign_lhs(), lhs) &&
+        protected_symbols.count(lhs) != 0)
+      {
+        if(!main_writes.emplace(lhs, &instruction).second)
+        {
+          reason = "resource_multiple_initial_writes";
+          return false;
+        }
+        allowed.insert(&instruction);
+      }
+    }
+  }
+  for(const auto &write : main_writes)
+  {
+    const auto &instruction = *write.second;
+    zero.erase(write.first);
+    if(value_is(instruction.assign_rhs(), 0))
+      zero.insert(write.first);
+    irep_idt rhs;
+    if(symbol_id(instruction.assign_rhs(), rhs))
+    {
+      const auto rhs_write = main_writes.find(rhs);
+      if(
+        rhs_write != main_writes.end() &&
+        rhs_write->second->location_number >=
+          instruction.location_number)
+      {
+        reason = "resource_initial_write_order";
+        return false;
+      }
+      edges[write.first].insert(rhs);
+      edges[rhs].insert(write.first);
+    }
+  }
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr &&
+      instruction.location_number >= life.first_create->location_number)
+      break;
+    irep_idt callee;
+    if(
+      call_id(instruction, callee) && is_assume(callee) &&
+      instruction.call_arguments().size() == 1)
+    {
+      for(const auto &write : main_writes)
+      {
+        if(
+          write.second->location_number >=
+          instruction.location_number)
+        {
+          reason = "resource_initial_assume_order";
+          return false;
+        }
+      }
+      add_equality_terms(instruction.call_arguments().front(), edges);
+    }
+  }
+  for(const auto &symbol : zero)
+  {
+    edges[irep_idt("__linear_zero")].insert(symbol);
+    edges[symbol].insert(irep_idt("__linear_zero"));
+  }
+  if(
+    !equality_reachable(
+      edges, left.accumulator, right.accumulator) ||
+    !equality_reachable(edges, left.resource, right.resource))
+  {
+    reason = "resource_initial_relation";
+    return false;
+  }
+  (void)property;
+  return true;
+}
+
+bool resource_global_obligations(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const resource_propertyt &property,
+  const std::vector<resource_workert> &workers,
+  const resource_workert &left,
+  const resource_workert &right,
+  std::string &reason)
+{
+  std::set<const goto_programt::instructiont *> allowed;
+  for(const auto &worker : workers)
+    allowed.insert(worker.writes.begin(), worker.writes.end());
+  if(
+    !resource_initial_relations(
+      model, life, property, left, right, allowed, reason))
+    return false;
+  const std::set<irep_idt> protected_symbols = {
+    left.accumulator,
+    right.accumulator,
+    left.resource,
+    right.resource,
+    left.multiplier};
+
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      const exprt *lhs = nullptr;
+      if(instruction.is_assign())
+        lhs = &instruction.assign_lhs();
+      else if(
+        instruction.is_function_call() &&
+        !instruction.call_lhs().is_nil())
+        lhs = &instruction.call_lhs();
+      if(lhs == nullptr)
+        continue;
+      irep_idt symbol;
+      if(
+        !symbol_id(*lhs, symbol) ||
+        protected_symbols.count(symbol) == 0)
+        continue;
+      if(
+        is_start_function(entry.first) && instruction.is_assign() &&
+        value_is(instruction.assign_rhs(), 0))
+        continue;
+      if(allowed.count(&instruction) == 0)
+      {
+        reason = "resource_external_writer";
+        return false;
+      }
+    }
+  }
+  if(!no_addresses(model, protected_symbols, reason))
+    return false;
+
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr && life.last_join != nullptr &&
+      instruction.location_number >= life.first_create->location_number &&
+      instruction.location_number <= life.last_join->location_number)
+    {
+      if(
+        instruction.is_assign() || instruction.is_goto() ||
+        instruction.is_assert() || instruction.is_assume() ||
+        instruction.is_atomic_begin() || instruction.is_atomic_end())
+      {
+        reason = "resource_main_concurrent_effect";
+        return false;
+      }
+      irep_idt callee;
+      if(
+        call_id(instruction, callee) &&
+        !is_create(callee) && !is_join(callee))
+      {
+        reason = "resource_main_concurrent_call";
+        return false;
+      }
+    }
+    if(
+      life.last_join != nullptr &&
+      instruction.location_number > life.last_join->location_number)
+    {
+      if(
+        instruction.is_assign() || instruction.is_goto() ||
+        instruction.is_assert() || instruction.is_assume() ||
+        instruction.is_atomic_begin() || instruction.is_atomic_end())
+      {
+        reason = "resource_main_postjoin_control";
+        return false;
+      }
+      irep_idt callee;
+      if(
+        call_id(instruction, callee) &&
+        &instruction != property.assumption &&
+        &instruction != property.error)
+      {
+        reason = "resource_main_postjoin_call";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool affine_resource_proof_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &reason)
+{
+  lifecyclet life;
+  if(
+    !lifecycle(model, life, reason) ||
+    (life.workers.size() != 3 && life.workers.size() != 4))
+  {
+    if(reason.empty())
+      reason = "resource_lifecycle";
+    return false;
+  }
+  resource_propertyt property;
+  if(!find_resource_property(model, ns, life, property, reason))
+    return false;
+
+  std::vector<resource_workert> workers;
+  for(const auto &worker_id : life.workers)
+  {
+    resource_workert worker;
+    if(
+      !affine_resource_worker(
+        model, ns, worker_id, worker, reason))
+    {
+      reason = "resource_worker " + id2string(worker_id) + " " + reason;
+      return false;
+    }
+    workers.push_back(worker);
+  }
+  std::map<irep_idt, std::vector<std::size_t>> groups;
+  for(std::size_t index = 0; index < workers.size(); ++index)
+    groups[workers[index].resource].push_back(index);
+  if(groups.size() != 2)
+  {
+    reason = "resource_group_count";
+    return false;
+  }
+
+  std::vector<resource_workert> summaries;
+  for(const auto &group : groups)
+  {
+    resource_workert summary = workers[group.second.front()];
+    bool unit = false;
+    for(const auto index : group.second)
+    {
+      if(
+        workers[index].accumulator != summary.accumulator ||
+        workers[index].multiplier != summary.multiplier)
+      {
+        reason = "resource_group_signature";
+        return false;
+      }
+      unit = unit || workers[index].unit_completion;
+    }
+    if(!unit)
+    {
+      reason = "resource_group_unit";
+      return false;
+    }
+    summaries.push_back(summary);
+  }
+  if(
+    summaries[0].multiplier != summaries[1].multiplier ||
+    summaries[0].accumulator == summaries[1].accumulator)
+  {
+    reason = "resource_cross_group_signature";
+    return false;
+  }
+  const symbolt *first_resource = lookup(summaries[0].resource, ns);
+  const symbolt *second_resource = lookup(summaries[1].resource, ns);
+  if(
+    first_resource == nullptr || second_resource == nullptr ||
+    first_resource->type != second_resource->type)
+  {
+    reason = "resource_cross_group_type";
+    return false;
+  }
+
+  const resource_workert *left = nullptr;
+  const resource_workert *right = nullptr;
+  for(const auto &summary : summaries)
+  {
+    if(summary.accumulator == property.left)
+      left = &summary;
+    if(summary.accumulator == property.right)
+      right = &summary;
+  }
+  if(left == nullptr || right == nullptr)
+  {
+    reason = "resource_property_groups";
+    return false;
+  }
+  if(
+    !resource_global_obligations(
+      model, life, property, workers, *left, *right, reason))
+    return false;
+
+  std::cout << "NATIVE_LINEAR_ANNIHILATOR applied=1 rule=resource"
+            << " left=" << property.left
+            << " right=" << property.right
+            << " multiplier=" << left->multiplier << '\n';
   return true;
 }
 
@@ -3258,6 +4992,16 @@ bool extremum_cone_proof(
   (void)message_handler;
   const namespacet ns(goto_model.symbol_table);
   std::string reason;
+  if(linear_fold_proof_impl(goto_model, ns, reason))
+    return true;
+  std::cout << "NATIVE_LINEAR_ANNIHILATOR applied=0 reason="
+            << reason << '\n';
+  reason.clear();
+  if(affine_resource_proof_impl(goto_model, ns, reason))
+    return true;
+  std::cout << "NATIVE_LINEAR_ANNIHILATOR applied=0 reason="
+            << reason << '\n';
+  reason.clear();
   if(extremum_homomorphism_proof_impl(goto_model, ns, reason))
     return true;
   std::cout << "NATIVE_EXTREMUM_HOMOMORPHISM applied=0 reason="
