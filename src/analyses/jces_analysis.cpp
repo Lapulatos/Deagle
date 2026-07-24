@@ -63,7 +63,12 @@ struct affine_worker_summaryt
   mp_integer count;
 };
 
-using affine_statet = std::pair<mp_integer, mp_integer>;
+struct affine_statet
+{
+  mp_integer first;
+  mp_integer second;
+  std::string schedule;
+};
 
 const exprt &without_cast(const exprt &expr)
 {
@@ -1251,16 +1256,23 @@ void pareto_prune(std::vector<affine_statet> &states)
       if(
         other.first >= candidate.first &&
         other.second >= candidate.second &&
-        other != candidate)
+        (other.first != candidate.first ||
+         other.second != candidate.second))
       {
         dominated = true;
         break;
       }
     }
-    if(
-      !dominated &&
-      std::find(retained.begin(), retained.end(), candidate) ==
-        retained.end())
+    const bool duplicate = std::any_of(
+      retained.begin(),
+      retained.end(),
+      [&](const affine_statet &other)
+      {
+        return
+          other.first == candidate.first &&
+          other.second == candidate.second;
+      });
+    if(!dominated && !duplicate)
       retained.push_back(candidate);
   }
   states.swap(retained);
@@ -1269,19 +1281,30 @@ void pareto_prune(std::vector<affine_statet> &states)
 affine_statet apply_affine_worker(
   const affine_worker_summaryt &worker,
   const affine_statet &state,
-  const irep_idt &first)
+  const irep_idt &first,
+  const char schedule_step,
+  const bool record_schedule)
 {
+  affine_statet result;
   if(worker.target == first)
   {
-    return {
+    result = {
       worker.self_coefficient * state.first +
         worker.source_coefficient * state.second + worker.offset,
-      state.second};
+      state.second,
+      state.schedule};
   }
-  return {
-    state.first,
-    worker.self_coefficient * state.second +
-      worker.source_coefficient * state.first + worker.offset};
+  else
+  {
+    result = {
+      state.first,
+      worker.self_coefficient * state.second +
+        worker.source_coefficient * state.first + worker.offset,
+      state.schedule};
+  }
+  if(record_schedule)
+    result.schedule.push_back(schedule_step);
+  return result;
 }
 
 bool assertion_bound(
@@ -1474,14 +1497,16 @@ bool static_initial_value(
 }
 
 bool inline_error_bound(
-  const goto_modelt &model,
+  goto_modelt &model,
   const irep_idt &first,
   const irep_idt &second,
   mp_integer &property_bound,
   std::map<irep_idt, mp_integer> &initial_values,
+  bool &inclusive_bad,
+  goto_programt::targett &failure_guard,
   std::string &reason)
 {
-  const auto main = model.goto_functions.function_map.find("main");
+  auto main = model.goto_functions.function_map.find("main");
   if(
     main == model.goto_functions.function_map.end() ||
     !main->second.body_available())
@@ -1489,7 +1514,7 @@ bool inline_error_bound(
     reason = "prefix_missing_main";
     return false;
   }
-  const auto &program = main->second.body;
+  auto &program = main->second.body;
   std::map<const goto_programt::instructiont *, std::size_t> positions;
   std::size_t position = 0;
   for(const auto &instruction : program.instructions)
@@ -1610,6 +1635,17 @@ bool inline_error_bound(
       return false;
     }
   }
+  bool guard_control_supported = false;
+  const auto guard_control = control_signature(
+    program,
+    positions,
+    positions.at(&*guard),
+    guard_control_supported);
+  if(!guard_control_supported || !guard_control.empty())
+  {
+    reason = "prefix_inline_guard_control";
+    return false;
+  }
 
   const exprt &condition = without_cast(guard->condition());
   if(
@@ -1628,6 +1664,7 @@ bool inline_error_bound(
 
   std::set<irep_idt> compared_objects;
   bool bound_initialized = false;
+  bool relation_initialized = false;
   for(const auto &operand : bad.operands())
   {
     irep_idt condition_symbol;
@@ -1659,8 +1696,9 @@ bool inline_error_bound(
     const exprt &comparison = without_cast(assignment->second);
     irep_idt object;
     mp_integer bound;
+    const bool comparison_inclusive = comparison.id() == ID_ge;
     if(
-      comparison.id() != ID_gt ||
+      (comparison.id() != ID_gt && !comparison_inclusive) ||
       comparison.operands().size() != 2 ||
       !direct_symbol(comparison.op0(), object) ||
       (object != first && object != second) ||
@@ -1668,6 +1706,16 @@ bool inline_error_bound(
       bound < 0)
     {
       reason = "prefix_inline_comparison";
+      return false;
+    }
+    if(!relation_initialized)
+    {
+      inclusive_bad = comparison_inclusive;
+      relation_initialized = true;
+    }
+    else if(inclusive_bad != comparison_inclusive)
+    {
+      reason = "prefix_inline_relations";
       return false;
     }
     if(!bound_initialized)
@@ -1687,6 +1735,7 @@ bool inline_error_bound(
     reason = "prefix_inline_coverage";
     return false;
   }
+  failure_guard = guard;
   return true;
 }
 } // namespace
@@ -1748,6 +1797,9 @@ bool prefix_affine_envelope_transform(
   irep_idt bound_function;
   std::map<irep_idt, mp_integer> initial_values;
   mp_integer property_bound;
+  bool inline_property = false;
+  bool inclusive_bad = false;
+  goto_programt::targett failure_guard;
   if(
     assertion_bound(
       goto_model,
@@ -1774,12 +1826,15 @@ bool prefix_affine_envelope_transform(
       return false;
     }
     initial_values.clear();
+    inline_property = true;
     if(!inline_error_bound(
          goto_model,
          first,
          second,
          property_bound,
          initial_values,
+         inclusive_bad,
+         failure_guard,
          reason))
     {
       std::cout
@@ -1796,7 +1851,7 @@ bool prefix_affine_envelope_transform(
     count_first + 1,
     std::vector<std::vector<affine_statet>>(count_second + 1));
   frontier[0][0].push_back(
-    {initial_values.at(first), initial_values.at(second)});
+    {initial_values.at(first), initial_values.at(second), std::string()});
   const symbolt &first_symbol = ns.lookup(first);
   const symbolt &second_symbol = ns.lookup(second);
   if(
@@ -1812,6 +1867,17 @@ bool prefix_affine_envelope_transform(
     std::max(initial_values.at(first), initial_values.at(second));
   std::size_t retained_states = 1;
   std::size_t maximum_width = 1;
+  const bool initial_violation =
+    inclusive_bad
+      ? initial_values.at(first) >= property_bound ||
+          initial_values.at(second) >= property_bound
+      : initial_values.at(first) > property_bound ||
+          initial_values.at(second) > property_bound;
+  bool counterexample_found = inline_property && initial_violation;
+  affine_statet counterexample_state{
+    initial_values.at(first),
+    initial_values.at(second),
+    std::string()};
   for(std::size_t i = 0; i <= count_first; ++i)
   {
     for(std::size_t j = 0; j <= count_second; ++j)
@@ -1823,13 +1889,15 @@ bool prefix_affine_envelope_transform(
       {
         for(const auto &predecessor : frontier[i - 1][j])
           states.push_back(
-            apply_affine_worker(workers[0], predecessor, first));
+            apply_affine_worker(
+              workers[0], predecessor, first, '0', inline_property));
       }
       if(j != 0)
       {
         for(const auto &predecessor : frontier[i][j - 1])
           states.push_back(
-            apply_affine_worker(workers[1], predecessor, first));
+            apply_affine_worker(
+              workers[1], predecessor, first, '1', inline_property));
       }
       pareto_prune(states);
       retained_states += states.size();
@@ -1843,6 +1911,17 @@ bool prefix_affine_envelope_transform(
       for(const auto &state : states)
       {
         maximum = std::max(maximum, std::max(state.first, state.second));
+        const bool violates =
+          inclusive_bad
+            ? state.first >= property_bound ||
+                state.second >= property_bound
+            : state.first > property_bound ||
+                state.second > property_bound;
+        if(inline_property && !counterexample_found && violates)
+        {
+          counterexample_found = true;
+          counterexample_state = state;
+        }
         if(
           state.first < 0 || state.second < 0 ||
           !signed_value_fits(state.first, first_symbol.type) ||
@@ -1854,6 +1933,23 @@ bool prefix_affine_envelope_transform(
         }
       }
     }
+  }
+  if(counterexample_found)
+  {
+    for(auto &create : create_records)
+      create.instruction->turn_into_skip();
+    failure_guard->turn_into_skip();
+    goto_model.goto_functions.update();
+    std::cout
+      << "NATIVE_PREFIX_AFFINE applied=1 result=UNSAFE workers=2 states="
+      << retained_states << " max_width=" << maximum_width
+      << " witness_first=" << counterexample_state.first
+      << " witness_second=" << counterexample_state.second
+      << " bound=" << property_bound
+      << " inclusive=" << inclusive_bad
+      << " schedule=" << counterexample_state.schedule << '\n';
+    (void)message_handler;
+    return true;
   }
   if(maximum > property_bound)
   {
