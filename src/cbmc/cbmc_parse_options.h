@@ -38,6 +38,7 @@ class optionst;
   "(interference-predicate-profile)" \
   "(interference-predicate-fixedpoint)" \
   "(interference-predicate-recursive-worker-fixedpoint)" \
+  "(native-lock-ego-abstraction)" \
   "(native-jces)(native-prefix-affine-envelope)" \
   OPT_BMC \
   "(preprocess)(slice-by-trace):" \

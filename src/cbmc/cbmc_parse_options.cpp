@@ -42,6 +42,7 @@ Author: Daniel Kroening, kroening@kroening.com
 #include <analyses/predicate_stability_analysis.h>
 #include <analyses/jces_analysis.h>
 #include <analyses/commuting_sequentialization.h>
+#include <analyses/lock_ego_abstraction.h>
 #include <goto-checker/all_properties_verifier.h>
 #include <goto-checker/all_properties_verifier_with_fault_localization.h>
 #include <goto-checker/all_properties_verifier_with_trace_storage.h>
@@ -540,6 +541,12 @@ int cbmc_parse_optionst::doit()
 
   if(cmdline.isset("native-prefix-affine-envelope"))
     prefix_affine_envelope_transform(goto_model, ui_message_handler);
+
+  if(
+    cmdline.isset("native-lock-ego-abstraction") &&
+    !lock_boundary_ego_thread_abstraction_transform(
+      goto_model, ui_message_handler))
+    return CPROVER_EXIT_SUCCESS;
 
   if(
     cmdline.isset("native-jces") &&

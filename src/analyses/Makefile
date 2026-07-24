@@ -7,6 +7,7 @@ SRC = ai.cpp \
       cas_stability_analysis.cpp \
       constant_propagator.cpp \
       commuting_sequentialization.cpp \
+      lock_ego_abstraction.cpp \
       custom_bitvector_analysis.cpp \
       dependence_graph.cpp \
       dirty.cpp \

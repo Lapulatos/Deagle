@@ -325,6 +325,9 @@ recursive_worker_prepass = (
 multi_template_worker_prepass = (
     "--deagle-multi-template-worker-prepass" in sys.argv[3:]
 )
+lock_ego_prepass = (
+    "--deagle-lock-ego-prepass" in sys.argv[3:]
+)
 extra_args = [
     shlex.quote(arg) for arg in sys.argv[3:]
     if arg not in (
@@ -332,6 +335,7 @@ extra_args = [
         "--deagle-shallow-counterexample-prepass",
         "--deagle-recursive-worker-prepass",
         "--deagle-multi-template-worker-prepass",
+        "--deagle-lock-ego-prepass",
     )
 ]
 flags = base_flags + " ".join(extra_args) + " "
@@ -472,6 +476,54 @@ if recursive_worker_prepass and "unreach-call.prp" in property_path:
                 for line in recursive_lines
             ):
                 print("".join(recursive_lines), end="")
+                print("VERIFICATION SUCCESSFUL")
+                sys.exit(0)
+
+if lock_ego_prepass and "unreach-call.prp" in property_path:
+    lexical_filter = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "loop_create_filter.awk",
+    )
+    lexical_result = subprocess.run(
+        ["awk", "-f", lexical_filter, program_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if lexical_result.returncode == 0:
+        ego_output = "deagle_tmp_lock_ego"
+        ego_args = (
+            [deagle_exe_path, program_path]
+            + shlex.split(flags)
+            + ["--native-lock-ego-abstraction"]
+        )
+        try:
+            with open(ego_output, "w") as output:
+                ego_result = subprocess.run(
+                    ego_args,
+                    stdout=output,
+                    stderr=subprocess.STDOUT,
+                    timeout=5,
+                    check=False,
+                )
+        except subprocess.TimeoutExpired:
+            ego_result = None
+        if ego_result is not None and ego_result.returncode == 0:
+            with open(ego_output, "r") as output:
+                ego_lines = output.readlines()
+            if (
+                any(
+                    line.startswith(
+                        "NATIVE_LOCK_EGO_ABSTRACTION applied=1"
+                    )
+                    for line in ego_lines
+                )
+                and any(
+                    "VERIFICATION SUCCESSFUL" in line
+                    for line in ego_lines
+                )
+            ):
+                print("".join(ego_lines), end="")
                 print("VERIFICATION SUCCESSFUL")
                 sys.exit(0)
 
