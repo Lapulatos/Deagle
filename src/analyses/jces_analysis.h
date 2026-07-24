@@ -23,4 +23,11 @@ bool prefix_affine_envelope_transform(
   goto_modelt &goto_model,
   message_handlert &message_handler);
 
+/// Collapse worker body interleavings that are already excluded by an atomic
+/// ticket-allocation / completion-gate protocol. Unsupported programs are
+/// unchanged and return false.
+bool ticket_rank_serializability_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 #endif // CPROVER_ANALYSES_JCES_ANALYSIS_H

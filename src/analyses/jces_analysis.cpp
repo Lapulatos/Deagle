@@ -70,6 +70,16 @@ struct affine_statet
   std::string schedule;
 };
 
+struct ticket_regiont
+{
+  irep_idt worker;
+  irep_idt ticket;
+  irep_idt completed;
+  irep_idt rank;
+  goto_programt::targett body_begin;
+  goto_programt::targett completion;
+};
+
 const exprt &without_cast(const exprt &expr)
 {
   return skip_typecast(expr);
@@ -159,6 +169,23 @@ bool contains_address_of_symbol(
   for(const auto &operand : expr.operands())
   {
     if(contains_address_of_symbol(operand, identifiers))
+      return true;
+  }
+  return false;
+}
+
+bool contains_symbol(
+  const exprt &expr,
+  const std::set<irep_idt> &identifiers)
+{
+  if(
+    expr.id() == ID_symbol &&
+    identifiers.find(to_symbol_expr(expr).get_identifier()) !=
+      identifiers.end())
+    return true;
+  for(const auto &operand : expr.operands())
+  {
+    if(contains_symbol(operand, identifiers))
       return true;
   }
   return false;
@@ -1496,6 +1523,375 @@ bool static_initial_value(
     constant_eval(symbol->second.value, {}, value);
 }
 
+void collect_zero_equalities(
+  const exprt &src,
+  std::map<irep_idt, std::set<irep_idt>> &equalities,
+  std::set<irep_idt> &zero_symbols)
+{
+  const exprt &expr = without_cast(src);
+  if(expr.id() == ID_and)
+  {
+    for(const auto &operand : expr.operands())
+      collect_zero_equalities(
+        operand, equalities, zero_symbols);
+    return;
+  }
+  if(expr.id() != ID_equal || expr.operands().size() != 2)
+    return;
+  irep_idt lhs;
+  irep_idt rhs;
+  const bool lhs_symbol = direct_symbol(expr.op0(), lhs);
+  const bool rhs_symbol = direct_symbol(expr.op1(), rhs);
+  if(lhs_symbol && rhs_symbol)
+  {
+    equalities[lhs].insert(rhs);
+    equalities[rhs].insert(lhs);
+  }
+  else if(lhs_symbol && zero_constant(expr.op1()))
+    zero_symbols.insert(lhs);
+  else if(rhs_symbol && zero_constant(expr.op0()))
+    zero_symbols.insert(rhs);
+}
+
+bool proves_zero_equalities(
+  const exprt &condition,
+  const std::set<irep_idt> &required)
+{
+  std::map<irep_idt, std::set<irep_idt>> equalities;
+  std::set<irep_idt> zero_symbols;
+  collect_zero_equalities(
+    condition, equalities, zero_symbols);
+
+  std::set<irep_idt> reached = zero_symbols;
+  std::vector<irep_idt> worklist(
+    zero_symbols.begin(), zero_symbols.end());
+  while(!worklist.empty())
+  {
+    const irep_idt current = worklist.back();
+    worklist.pop_back();
+    const auto neighbours = equalities.find(current);
+    if(neighbours == equalities.end())
+      continue;
+    for(const auto &neighbour : neighbours->second)
+    {
+      if(reached.insert(neighbour).second)
+        worklist.push_back(neighbour);
+    }
+  }
+  for(const auto &identifier : required)
+  {
+    if(reached.find(identifier) == reached.end())
+      return false;
+  }
+  return true;
+}
+
+bool summarize_ticket_worker(
+  const create_recordt &create,
+  goto_modelt &model,
+  const namespacet &ns,
+  ticket_regiont &region,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(create.worker);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "ticket_missing_worker";
+    return false;
+  }
+
+  auto &program = function->second.body;
+  std::vector<goto_programt::targett> relevant;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    positions.emplace(&*instruction, position++);
+    if(
+      instruction->is_decl() || instruction->is_dead() ||
+      instruction->is_skip() || instruction->is_location() ||
+      instruction->is_set_return_value() ||
+      instruction->is_end_function())
+      continue;
+    relevant.push_back(instruction);
+  }
+  if(relevant.size() < 6)
+  {
+    reason = "ticket_worker_shape";
+    return false;
+  }
+
+  const auto ticket_read = relevant[0];
+  const auto ticket_increment = relevant[1];
+  const auto rank_copy = relevant[2];
+  const auto gate = relevant[3];
+  const auto completion = relevant.back();
+
+  irep_idt temporary;
+  irep_idt ticket;
+  if(
+    !ticket_read->is_assign() ||
+    !direct_symbol(ticket_read->assign_lhs(), temporary) ||
+    !direct_symbol(ticket_read->assign_rhs(), ticket))
+  {
+    reason = "ticket_read";
+    return false;
+  }
+  const symbolt *temporary_symbol = nullptr;
+  const symbolt *ticket_symbol = nullptr;
+  if(
+    ns.lookup(temporary, temporary_symbol) ||
+    temporary_symbol->is_static_lifetime ||
+    ns.lookup(ticket, ticket_symbol) ||
+    !ticket_symbol->is_static_lifetime ||
+    !is_atomic_symbol(*ticket_symbol))
+  {
+    reason = "ticket_read_types";
+    return false;
+  }
+
+  irep_idt incremented;
+  if(
+    !parse_unit_increment(*ticket_increment, incremented) ||
+    incremented != ticket ||
+    ticket_read->source_location() !=
+      ticket_increment->source_location())
+  {
+    reason = "ticket_increment";
+    return false;
+  }
+
+  irep_idt rank;
+  irep_idt copied;
+  if(
+    !rank_copy->is_assign() ||
+    !direct_symbol(rank_copy->assign_lhs(), rank) ||
+    !direct_symbol(rank_copy->assign_rhs(), copied) ||
+    copied != temporary)
+  {
+    reason = "ticket_rank_copy";
+    return false;
+  }
+  const symbolt *rank_symbol = nullptr;
+  if(ns.lookup(rank, rank_symbol) || rank_symbol->is_type)
+  {
+    reason = "ticket_rank_type";
+    return false;
+  }
+
+  irep_idt gate_helper;
+  if(
+    !direct_call_identifier(*gate, gate_helper) ||
+    !is_restricting_helper(gate_helper, model, ns) ||
+    gate->call_arguments().size() != 1)
+  {
+    reason = "ticket_gate_call";
+    return false;
+  }
+  const exprt &gate_condition =
+    without_cast(gate->call_arguments().front());
+  if(
+    gate_condition.id() != ID_le ||
+    gate_condition.operands().size() != 2)
+  {
+    reason = "ticket_gate_relation";
+    return false;
+  }
+  irep_idt gate_rank;
+  irep_idt completed;
+  if(
+    !direct_symbol(gate_condition.op0(), gate_rank) ||
+    gate_rank != rank ||
+    !direct_symbol(gate_condition.op1(), completed) ||
+    completed == ticket)
+  {
+    reason = "ticket_gate_symbols";
+    return false;
+  }
+  const symbolt *completed_symbol = nullptr;
+  if(
+    ns.lookup(completed, completed_symbol) ||
+    !completed_symbol->is_static_lifetime ||
+    !is_atomic_symbol(*completed_symbol))
+  {
+    reason = "ticket_completion_type";
+    return false;
+  }
+
+  irep_idt completion_object;
+  if(
+    !parse_unit_increment(*completion, completion_object) ||
+    completion_object != completed)
+  {
+    reason = "ticket_completion";
+    return false;
+  }
+
+  const std::set<irep_idt> protocol_objects{
+    ticket, completed, rank};
+  for(std::size_t index = 4; index + 1 < relevant.size(); ++index)
+  {
+    const auto instruction = relevant[index];
+    if(
+      instruction->is_function_call() || instruction->is_assume() ||
+      instruction->is_assert() || instruction->is_other() ||
+      instruction->is_start_thread() || instruction->is_end_thread() ||
+      instruction->is_atomic_begin() || instruction->is_atomic_end())
+    {
+      reason = "ticket_body_effect";
+      return false;
+    }
+    if(
+      instruction->is_assign() &&
+      (contains_symbol(instruction->assign_lhs(), protocol_objects) ||
+       contains_symbol(instruction->assign_rhs(), protocol_objects)))
+    {
+      reason = "ticket_body_protocol_access";
+      return false;
+    }
+    if(instruction->is_goto())
+    {
+      if(
+        instruction->targets.size() != 1 ||
+        positions.at(&*instruction->get_target()) <=
+          positions.at(&*instruction) ||
+        positions.at(&*instruction->get_target()) >
+          positions.at(&*completion))
+      {
+        reason = "ticket_body_control";
+        return false;
+      }
+    }
+    else if(!instruction->is_assign())
+    {
+      reason = "ticket_body_instruction";
+      return false;
+    }
+  }
+
+  region.worker = create.worker;
+  region.ticket = ticket;
+  region.completed = completed;
+  region.rank = rank;
+  region.body_begin = relevant[4];
+  region.completion = completion;
+  return true;
+}
+
+bool validate_ticket_initialization_and_aliases(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const std::vector<create_recordt> &creates,
+  const std::vector<ticket_regiont> &regions,
+  const irep_idt &ticket,
+  const irep_idt &completed,
+  std::string &reason)
+{
+  const auto main = model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != model.goto_functions.function_map.end(),
+    "lifecycle collection found main");
+
+  std::set<irep_idt> protocol_objects{ticket, completed};
+  std::set<irep_idt> ranks;
+  for(const auto &region : regions)
+  {
+    if(!ranks.insert(region.rank).second)
+    {
+      reason = "ticket_rank_alias";
+      return false;
+    }
+    protocol_objects.insert(region.rank);
+  }
+  bool initialized = false;
+  bool create_seen = false;
+  for(const auto &instruction : main->second.body.instructions)
+  {
+    if(
+      contains_address_of_symbol(instruction.code(), protocol_objects) ||
+      (instruction.has_condition() &&
+       contains_address_of_symbol(
+         instruction.condition(), protocol_objects)))
+    {
+      reason = "ticket_counter_alias";
+      return false;
+    }
+
+    irep_idt callee;
+    if(
+      direct_call_identifier(instruction, callee) &&
+      callee == "pthread_create")
+      create_seen = true;
+
+    if(instruction.is_assign())
+    {
+      const exprt &lhs = without_cast(instruction.assign_lhs());
+      irep_idt identifier;
+      if(
+        direct_symbol(lhs, identifier) &&
+        protocol_objects.find(identifier) != protocol_objects.end() &&
+        (create_seen || initialized))
+      {
+        reason = "ticket_main_counter_write";
+        return false;
+      }
+    }
+
+    if(
+      !create_seen && instruction.is_function_call() &&
+      instruction.call_arguments().size() == 1 &&
+      direct_call_identifier(instruction, callee) &&
+      is_restricting_helper(callee, model, ns) &&
+      proves_zero_equalities(
+        instruction.call_arguments().front(),
+        {ticket, completed}))
+      initialized = true;
+  }
+  if(!initialized)
+  {
+    reason = "ticket_initialization";
+    return false;
+  }
+
+  for(std::size_t index = 0; index < creates.size(); ++index)
+  {
+    const auto &create = creates[index];
+    const auto worker =
+      model.goto_functions.function_map.find(create.worker);
+    INVARIANT(
+      worker != model.goto_functions.function_map.end(),
+      "ticket summary found worker");
+    for(const auto &instruction : worker->second.body.instructions)
+    {
+      if(
+        contains_address_of_symbol(
+          instruction.code(), protocol_objects) ||
+        (instruction.has_condition() &&
+         contains_address_of_symbol(
+           instruction.condition(), protocol_objects)))
+      {
+        reason = "ticket_counter_alias";
+        return false;
+      }
+      std::set<irep_idt> foreign_ranks = ranks;
+      foreign_ranks.erase(regions[index].rank);
+      if(
+        contains_symbol(instruction.code(), foreign_ranks) ||
+        (instruction.has_condition() &&
+         contains_symbol(instruction.condition(), foreign_ranks)))
+      {
+        reason = "ticket_foreign_rank_access";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 bool inline_error_bound(
   goto_modelt &model,
   const irep_idt &first,
@@ -1739,6 +2135,87 @@ bool inline_error_bound(
   return true;
 }
 } // namespace
+
+bool ticket_rank_serializability_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  std::vector<create_recordt> creates;
+  std::vector<goto_programt::targett> joins;
+  std::string reason;
+  if(!collect_lifecycle(goto_model, ns, creates, joins, reason))
+  {
+    std::cout << "NATIVE_TICKET_SERIALIZATION applied=0 reason="
+              << reason << '\n';
+    return false;
+  }
+  if(!validate_main_region(goto_model, ns, creates, joins, reason))
+  {
+    std::cout << "NATIVE_TICKET_SERIALIZATION applied=0 reason="
+              << reason << '\n';
+    return false;
+  }
+
+  std::vector<ticket_regiont> regions;
+  for(const auto &create : creates)
+  {
+    ticket_regiont region;
+    if(!summarize_ticket_worker(
+         create, goto_model, ns, region, reason))
+    {
+      std::cout << "NATIVE_TICKET_SERIALIZATION applied=0 reason="
+                << reason << " worker=" << create.worker << '\n';
+      return false;
+    }
+    regions.push_back(std::move(region));
+  }
+  const irep_idt ticket = regions.front().ticket;
+  const irep_idt completed = regions.front().completed;
+  for(const auto &region : regions)
+  {
+    if(region.ticket != ticket || region.completed != completed)
+    {
+      std::cout
+        << "NATIVE_TICKET_SERIALIZATION applied=0 reason="
+        << "ticket_protocol_mismatch worker=" << region.worker << '\n';
+      return false;
+    }
+  }
+  if(!validate_ticket_initialization_and_aliases(
+       goto_model,
+       ns,
+       creates,
+       regions,
+       ticket,
+       completed,
+       reason))
+  {
+    std::cout << "NATIVE_TICKET_SERIALIZATION applied=0 reason="
+              << reason << '\n';
+    return false;
+  }
+
+  for(auto &region : regions)
+  {
+    auto &program =
+      goto_model.goto_functions.function_map.at(region.worker).body;
+    program.insert_before(
+      region.body_begin,
+      goto_programt::make_atomic_begin(
+        region.body_begin->source_location()));
+    program.insert_after(
+      region.completion,
+      goto_programt::make_atomic_end(
+        region.completion->source_location()));
+  }
+  goto_model.goto_functions.update();
+  std::cout << "NATIVE_TICKET_SERIALIZATION applied=1 workers="
+            << regions.size() << " ticket=" << ticket
+            << " completed=" << completed << '\n';
+  (void)message_handler;
+  return true;
+}
 
 bool prefix_affine_envelope_transform(
   goto_modelt &goto_model,

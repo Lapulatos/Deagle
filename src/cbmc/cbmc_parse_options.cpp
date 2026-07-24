@@ -541,7 +541,11 @@ int cbmc_parse_optionst::doit()
   if(
     cmdline.isset("native-jces") &&
     !cmdline.isset("unwind-suggest"))
-    jces_transform(goto_model, ui_message_handler);
+  {
+    if(!ticket_rank_serializability_transform(
+         goto_model, ui_message_handler))
+      jces_transform(goto_model, ui_message_handler);
+  }
 
   if(cmdline.isset("interference-predicate-self-test"))
   {
