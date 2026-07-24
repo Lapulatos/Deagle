@@ -12,6 +12,7 @@ Module: Relational Extremum-Cone Invariant
 
 #include <util/arith_tools.h>
 #include <util/expr_util.h>
+#include <util/find_symbols.h>
 #include <util/message.h>
 #include <util/namespace.h>
 #include <util/pointer_expr.h>
@@ -3681,6 +3682,44 @@ bool zero_initialized_symbols(
   return true;
 }
 
+bool no_main_symbol_writes_before_create(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const std::set<irep_idt> &symbols,
+  const goto_programt::instructiont *after,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr &&
+      instruction.location_number >= life.first_create->location_number)
+      break;
+    if(
+      after != nullptr &&
+      instruction.location_number <= after->location_number)
+      continue;
+    const exprt *lhs = nullptr;
+    if(instruction.is_assign())
+      lhs = &instruction.assign_lhs();
+    else if(
+      instruction.is_function_call() &&
+      !instruction.call_lhs().is_nil())
+      lhs = &instruction.call_lhs();
+    irep_idt identifier;
+    if(
+      lhs != nullptr && symbol_id(*lhs, identifier) &&
+      symbols.count(identifier) != 0)
+    {
+      reason = "flow_initial_relation_overwrite";
+      return false;
+    }
+  }
+  return true;
+}
+
 struct linear_fold_maint
 {
   irep_idt bound;
@@ -3986,6 +4025,2010 @@ bool linear_fold_proof_impl(
   }
   reason = "linear_fold_worker_partition";
   return false;
+}
+
+struct flow_equality_propertyt
+{
+  irep_idt left;
+  irep_idt right;
+  const goto_programt::instructiont *assumption;
+  const goto_programt::instructiont *error;
+
+  flow_equality_propertyt() : assumption(nullptr), error(nullptr)
+  {
+  }
+};
+
+bool find_flow_equality_property(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const lifecyclet &life,
+  flow_equality_propertyt &property,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::size_t matches = 0;
+  std::size_t errors = 0;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(call_id(instruction, callee) && is_reach_error(callee))
+      {
+        ++errors;
+        if(entry.first != ID_main)
+        {
+          reason = "flow_error_function";
+          return false;
+        }
+        property.error = &instruction;
+      }
+    }
+  }
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.last_join == nullptr ||
+      instruction.location_number <= life.last_join->location_number)
+      continue;
+    irep_idt callee;
+    if(
+      !call_id(instruction, callee) || !is_assume(callee) ||
+      instruction.call_arguments().size() != 1)
+      continue;
+    irep_idt left;
+    irep_idt right;
+    if(
+      !unequal_symbols(
+        instruction.call_arguments().front(), left, right) ||
+      !shared_signed(left, ns) || !shared_signed(right, ns))
+      continue;
+    ++matches;
+    property.left = left;
+    property.right = right;
+    property.assumption = &instruction;
+  }
+  if(
+    matches != 1 || errors != 1 || property.assumption == nullptr ||
+    property.error == nullptr ||
+    property.assumption->location_number >= property.error->location_number)
+  {
+    reason =
+      matches == 0 ? "flow_equality_property" :
+                     "flow_equality_property_ambiguous";
+    return false;
+  }
+  return true;
+}
+
+struct flow_loop_dimensiont
+{
+  irep_idt induction;
+  exprt start;
+  exprt bound;
+  std::set<const goto_programt::instructiont *> members;
+};
+
+struct flow_range_workert
+{
+  irep_idt worker;
+  irep_idt accumulator;
+  irep_idt operation;
+  exprt contribution;
+  std::vector<flow_loop_dimensiont> dimensions;
+  exprt normalized_contribution;
+  std::vector<exprt> normalized_inner_starts;
+  std::vector<exprt> normalized_inner_bounds;
+  std::set<irep_idt> input_symbols;
+  std::set<irep_idt> pointer_bases;
+  std::set<const goto_programt::instructiont *> writes;
+};
+
+void collect_pointer_bases(
+  const exprt &src,
+  std::set<irep_idt> &bases)
+{
+  irep_idt base;
+  if(base_pointer(src, base))
+    bases.insert(base);
+  for(const auto &operand : src.operands())
+    collect_pointer_bases(operand, bases);
+}
+
+void collect_static_symbols(
+  const exprt &src,
+  const namespacet &ns,
+  std::set<irep_idt> &symbols)
+{
+  find_symbols_sett found;
+  find_symbols(src, found);
+  for(const auto &identifier : found)
+  {
+    const symbolt *symbol = lookup(identifier, ns);
+    if(symbol != nullptr && symbol->is_static_lifetime && !symbol->is_type)
+      symbols.insert(identifier);
+  }
+}
+
+bool flow_base_use_is_dereference(
+  const exprt &src,
+  const irep_idt &base,
+  bool under_dereference = false)
+{
+  const exprt &expr = strip(src);
+  irep_idt identifier;
+  if(symbol_id(expr, identifier) && identifier == base)
+    return under_dereference;
+  const bool nested =
+    under_dereference || expr.id() == ID_dereference;
+  for(const auto &operand : expr.operands())
+  {
+    if(
+      contains_symbol(operand, base) &&
+      !flow_base_use_is_dereference(operand, base, nested))
+      return false;
+  }
+  return true;
+}
+
+bool flow_alias_free(
+  const goto_modelt &model,
+  const irep_idt &base,
+  std::string &reason)
+{
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(instruction.is_assign())
+      {
+        irep_idt lhs;
+        const bool writes_base =
+          symbol_id(instruction.assign_lhs(), lhs) && lhs == base;
+        if(
+          (!writes_base &&
+           !flow_base_use_is_dereference(
+             instruction.assign_lhs(), base)) ||
+          !flow_base_use_is_dereference(
+            instruction.assign_rhs(), base))
+        {
+          reason = "flow_alias";
+          return false;
+        }
+      }
+      else if(instruction.is_function_call())
+      {
+        for(const auto &argument : instruction.call_arguments())
+        {
+          if(!flow_base_use_is_dereference(argument, base))
+          {
+            reason = "flow_call_escape";
+            return false;
+          }
+        }
+      }
+      else if(
+        instruction.has_condition() &&
+        !flow_base_use_is_dereference(
+          instruction.condition(), base))
+      {
+        reason = "flow_condition_alias";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool loop_initial_value(
+  const goto_programt &program,
+  goto_programt::const_targett head,
+  const irep_idt &induction,
+  exprt &start,
+  std::string &reason)
+{
+  const goto_programt::instructiont *initialization = nullptr;
+  for(auto instruction = program.instructions.begin();
+      instruction != head; ++instruction)
+  {
+    if(!instruction->is_assign())
+      continue;
+    irep_idt lhs;
+    if(symbol_id(instruction->assign_lhs(), lhs) && lhs == induction)
+      initialization = &*instruction;
+  }
+  if(initialization == nullptr)
+  {
+    reason = "flow_loop_initialization";
+    return false;
+  }
+  start = strip(initialization->assign_rhs());
+  return !contains_side_effect(start);
+}
+
+void normalize_flow_expression(
+  const std::vector<flow_loop_dimensiont> &dimensions,
+  exprt &expression)
+{
+  replace_mapt replacements;
+  for(std::size_t index = 0; index < dimensions.size(); ++index)
+  {
+    const typet &type = dimensions[index].start.type();
+    const symbol_exprt original(dimensions[index].induction, type);
+    const symbol_exprt canonical(
+      "__deagle_flow_index_" + std::to_string(index), type);
+    replacements[original] = canonical;
+  }
+  replace_expr(replacements, expression);
+}
+
+bool flow_range_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  flow_range_workert &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  goto_programt::const_targett fold_call = program.instructions.end();
+  unsigned atomic_depth = 0;
+  std::size_t atomic_begins = 0;
+  std::size_t atomic_ends = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_atomic_begin())
+    {
+      ++atomic_depth;
+      ++atomic_begins;
+      if(atomic_depth != 1)
+      {
+        reason = "flow_atomic_nesting";
+        return false;
+      }
+      continue;
+    }
+    if(instruction->is_atomic_end())
+    {
+      if(atomic_depth != 1)
+      {
+        reason = "flow_atomic_balance";
+        return false;
+      }
+      --atomic_depth;
+      ++atomic_ends;
+      continue;
+    }
+    irep_idt callee;
+    if(call_id(*instruction, callee))
+    {
+      if(is_assume(callee))
+        continue;
+      irep_idt accumulator;
+      irep_idt first;
+      if(
+        instruction->call_lhs().is_nil() ||
+        instruction->call_arguments().size() != 2 ||
+        !symbol_id(instruction->call_lhs(), accumulator) ||
+        !symbol_id(instruction->call_arguments()[0], first) ||
+        accumulator != first || !shared_signed(accumulator, ns) ||
+        atomic_depth != 1 || fold_call != program.instructions.end())
+      {
+        reason = "flow_worker_call";
+        return false;
+      }
+      result.accumulator = accumulator;
+      result.operation = callee;
+      result.contribution = strip(instruction->call_arguments()[1]);
+      result.writes.insert(&*instruction);
+      fold_call = instruction;
+      continue;
+    }
+    if(instruction->is_assign())
+    {
+      irep_idt lhs;
+      if(shared_symbol_lhs(*instruction, ns, lhs))
+      {
+        reason = "flow_worker_shared_write";
+        return false;
+      }
+      irep_idt base;
+      if(base_pointer(instruction->assign_lhs(), base))
+      {
+        reason = "flow_worker_array_write";
+        return false;
+      }
+    }
+    else if(
+      instruction->is_assert() || instruction->is_start_thread() ||
+      instruction->is_end_thread() || instruction->is_throw() ||
+      instruction->is_catch())
+    {
+      reason = "flow_worker_effect";
+      return false;
+    }
+  }
+  if(
+    atomic_depth != 0 || atomic_begins != 1 || atomic_ends != 1 ||
+    fold_call == program.instructions.end())
+  {
+    reason = "flow_worker_fold";
+    return false;
+  }
+
+  natural_loopst loops;
+  loops(program);
+  std::vector<std::pair<
+    goto_programt::const_targett,
+    const natural_loopst::natural_loopt *>> containing;
+  typedef std::pair<
+    goto_programt::const_targett,
+    const natural_loopst::natural_loopt *> containing_loopt;
+  for(const auto &entry : loops.loop_map)
+  {
+    if(entry.second.contains(fold_call))
+      containing.emplace_back(entry.first, &entry.second);
+  }
+  if(containing.empty() || containing.size() > 2)
+  {
+    reason = "flow_worker_loop_count";
+    return false;
+  }
+  if(containing.size() != loops.loop_map.size())
+  {
+    reason = "flow_worker_unrelated_loop";
+    return false;
+  }
+  std::sort(
+    containing.begin(),
+    containing.end(),
+    [](const containing_loopt &left, const containing_loopt &right) {
+      return left.second->size() > right.second->size();
+    });
+
+  for(const auto &entry : containing)
+  {
+    flow_loop_dimensiont dimension;
+    if(
+      !parse_loop_exit(
+        *entry.first, dimension.induction, dimension.bound) ||
+      !loop_initial_value(
+        program,
+        entry.first,
+        dimension.induction,
+        dimension.start,
+        reason))
+    {
+      if(reason.empty())
+        reason = "flow_worker_loop_guard";
+      return false;
+    }
+    std::size_t increments = 0;
+    std::size_t backedges = 0;
+    for(auto instruction = program.instructions.begin();
+        instruction != program.instructions.end(); ++instruction)
+    {
+      if(entry.second->contains(instruction))
+        dimension.members.insert(&*instruction);
+      if(
+        entry.second->contains(instruction) &&
+        unit_increment(*instruction, dimension.induction))
+        ++increments;
+      if(
+        instruction->is_goto() &&
+        entry.second->contains(instruction) &&
+        instruction != entry.first &&
+        instruction->condition().is_true() &&
+        instruction->targets.size() == 1 &&
+        instruction->get_target() == entry.first)
+        ++backedges;
+    }
+    if(increments != 1 || backedges != 1)
+    {
+      reason = "flow_worker_loop_skeleton";
+      return false;
+    }
+    result.dimensions.push_back(dimension);
+  }
+
+  result.normalized_contribution = result.contribution;
+  normalize_flow_expression(
+    result.dimensions, result.normalized_contribution);
+  for(std::size_t index = 1; index < result.dimensions.size(); ++index)
+  {
+    exprt start = result.dimensions[index].start;
+    exprt bound = result.dimensions[index].bound;
+    normalize_flow_expression(result.dimensions, start);
+    normalize_flow_expression(result.dimensions, bound);
+    result.normalized_inner_starts.push_back(start);
+    result.normalized_inner_bounds.push_back(bound);
+  }
+  collect_static_symbols(result.contribution, ns, result.input_symbols);
+  for(const auto &dimension : result.dimensions)
+  {
+    collect_static_symbols(dimension.start, ns, result.input_symbols);
+    collect_static_symbols(dimension.bound, ns, result.input_symbols);
+  }
+  result.input_symbols.erase(result.accumulator);
+  collect_pointer_bases(result.contribution, result.pointer_bases);
+  for(const auto &dimension : result.dimensions)
+  {
+    collect_pointer_bases(dimension.start, result.pointer_bases);
+    collect_pointer_bases(dimension.bound, result.pointer_bases);
+  }
+  result.worker = worker;
+  return true;
+}
+
+bool relation_symbols(
+  const exprt &src,
+  const irep_idt &relation_id,
+  const irep_idt &left,
+  const irep_idt &right)
+{
+  const exprt &relation = strip(src);
+  irep_idt lhs;
+  irep_idt rhs;
+  return
+    relation.id() == relation_id && relation.operands().size() == 2 &&
+    symbol_id(relation.op0(), lhs) && lhs == left &&
+    symbol_id(relation.op1(), rhs) && rhs == right;
+}
+
+bool static_partition_precondition(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const irep_idt &split,
+  const irep_idt &bound)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  bool nonnegative = false;
+  bool strict_bound = false;
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr &&
+      instruction.location_number >= life.first_create->location_number)
+      break;
+    irep_idt callee;
+    if(
+      !call_id(instruction, callee) || !is_assume(callee) ||
+      instruction.call_arguments().size() != 1)
+      continue;
+    std::vector<exprt> terms;
+    flatten_and(instruction.call_arguments().front(), terms);
+    for(const auto &term : terms)
+    {
+      nonnegative =
+        nonnegative ||
+        relation_zero(term, split, ID_ge) ||
+        relation_zero(term, split, ID_gt);
+      strict_bound =
+        strict_bound ||
+        relation_symbols(term, ID_gt, bound, split) ||
+        relation_symbols(term, ID_lt, split, bound);
+    }
+  }
+  return nonnegative && strict_bound;
+}
+
+bool flow_main_control(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const flow_equality_propertyt &property,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr && life.last_join != nullptr &&
+      instruction.location_number >= life.first_create->location_number &&
+      instruction.location_number <= life.last_join->location_number)
+    {
+      if(
+        instruction.is_assign() || instruction.is_goto() ||
+        instruction.is_assert() || instruction.is_assume() ||
+        instruction.is_atomic_begin() || instruction.is_atomic_end())
+      {
+        reason = "flow_main_concurrent_effect";
+        return false;
+      }
+      irep_idt callee;
+      if(
+        call_id(instruction, callee) &&
+        !is_create(callee) && !is_join(callee))
+      {
+        reason = "flow_main_concurrent_call";
+        return false;
+      }
+    }
+    if(
+      life.last_join != nullptr &&
+      instruction.location_number > life.last_join->location_number)
+    {
+      if(
+        instruction.is_assign() || instruction.is_goto() ||
+        instruction.is_assert() || instruction.is_assume() ||
+        instruction.is_atomic_begin() || instruction.is_atomic_end())
+      {
+        reason = "flow_main_postjoin_control";
+        return false;
+      }
+      irep_idt callee;
+      if(
+        call_id(instruction, callee) &&
+        &instruction != property.assumption &&
+        &instruction != property.error)
+      {
+        reason = "flow_main_postjoin_call";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool static_partition_global_obligations(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const flow_equality_propertyt &property,
+  const std::vector<flow_range_workert> &workers,
+  const std::set<irep_idt> &protected_symbols,
+  const std::set<irep_idt> &pointer_bases,
+  std::string &reason)
+{
+  std::set<const goto_programt::instructiont *> allowed;
+  for(const auto &worker : workers)
+    allowed.insert(worker.writes.begin(), worker.writes.end());
+  if(
+    !zero_initialized_symbols(
+      model, {property.left, property.right}, allowed, reason))
+    return false;
+  if(
+    !no_main_symbol_writes_before_create(
+      model,
+      life,
+      {property.left, property.right},
+      nullptr,
+      reason))
+    return false;
+
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      const exprt *lhs = nullptr;
+      if(instruction.is_assign())
+        lhs = &instruction.assign_lhs();
+      else if(
+        instruction.is_function_call() &&
+        !instruction.call_lhs().is_nil())
+        lhs = &instruction.call_lhs();
+      if(lhs == nullptr)
+        continue;
+      irep_idt direct;
+      irep_idt base;
+      const bool protected_write =
+        (symbol_id(*lhs, direct) &&
+         protected_symbols.count(direct) != 0) ||
+        (base_pointer(*lhs, base) &&
+         pointer_bases.count(base) != 0);
+      if(!protected_write)
+        continue;
+      if(
+        is_start_function(entry.first) && instruction.is_assign() &&
+        value_is(instruction.assign_rhs(), 0))
+        continue;
+      if(
+        entry.first == ID_main && life.first_create != nullptr &&
+        instruction.location_number < life.first_create->location_number)
+        continue;
+      if(allowed.count(&instruction) == 0)
+      {
+        reason = "flow_external_writer";
+        return false;
+      }
+    }
+  }
+  for(const auto &base : pointer_bases)
+  {
+    if(!flow_alias_free(model, base, reason))
+      return false;
+  }
+  return
+    no_addresses(model, protected_symbols, reason) &&
+    flow_main_control(model, life, property, reason);
+}
+
+bool equivalent_static_partition_proof_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &reason)
+{
+  lifecyclet life;
+  if(!lifecycle(model, life, reason) || life.workers.size() != 3)
+  {
+    if(reason.empty())
+      reason = "flow_static_lifecycle";
+    return false;
+  }
+  flow_equality_propertyt property;
+  if(!find_flow_equality_property(model, ns, life, property, reason))
+    return false;
+
+  std::vector<flow_range_workert> workers;
+  for(const auto &worker_id : life.workers)
+  {
+    flow_range_workert worker;
+    if(!flow_range_worker(model, ns, worker_id, worker, reason))
+      return false;
+    workers.push_back(worker);
+  }
+  const irep_idt operation = workers.front().operation;
+  if(!signed_addition_helper(model, ns, operation, reason))
+    return false;
+  for(const auto &worker : workers)
+  {
+    if(
+      worker.operation != operation ||
+      worker.normalized_contribution !=
+        workers.front().normalized_contribution ||
+      worker.normalized_inner_starts !=
+        workers.front().normalized_inner_starts ||
+      worker.normalized_inner_bounds !=
+        workers.front().normalized_inner_bounds)
+    {
+      reason = "flow_static_map";
+      return false;
+    }
+  }
+
+  const flow_range_workert *whole = nullptr;
+  const flow_range_workert *prefix = nullptr;
+  const flow_range_workert *suffix = nullptr;
+  for(const auto &candidate : workers)
+  {
+    if(
+      value_is(candidate.dimensions.front().start, 0) &&
+      candidate.accumulator == property.left)
+      whole = &candidate;
+    else if(
+      value_is(candidate.dimensions.front().start, 0) &&
+      candidate.accumulator == property.right)
+      prefix = &candidate;
+    else if(candidate.accumulator == property.right)
+      suffix = &candidate;
+  }
+  if(
+    whole == nullptr || prefix == nullptr || suffix == nullptr ||
+    whole->dimensions.front().bound != suffix->dimensions.front().bound ||
+    prefix->dimensions.front().bound != suffix->dimensions.front().start)
+  {
+    reason = "flow_static_partition";
+    return false;
+  }
+  irep_idt split;
+  irep_idt bound;
+  if(
+    !symbol_id(suffix->dimensions.front().start, split) ||
+    !symbol_id(suffix->dimensions.front().bound, bound) ||
+    !static_partition_precondition(model, life, split, bound))
+  {
+    reason = "flow_static_range";
+    return false;
+  }
+
+  std::set<irep_idt> protected_symbols = {
+    property.left, property.right, split, bound};
+  std::set<irep_idt> pointer_bases;
+  for(const auto &worker : workers)
+  {
+    protected_symbols.insert(
+      worker.input_symbols.begin(), worker.input_symbols.end());
+    pointer_bases.insert(
+      worker.pointer_bases.begin(), worker.pointer_bases.end());
+  }
+  if(
+    !static_partition_global_obligations(
+      model,
+      life,
+      property,
+      workers,
+      protected_symbols,
+      pointer_bases,
+      reason))
+    return false;
+
+  std::cout << "NATIVE_RELATIONAL_FLOW applied=1 rule=static_partition"
+            << " left=" << property.left
+            << " right=" << property.right << '\n';
+  return true;
+}
+
+struct dynamic_flow_propertyt
+{
+  irep_idt left_counter;
+  irep_idt right_counter;
+  irep_idt bound;
+  irep_idt left_accumulator;
+  irep_idt right_accumulator;
+  const goto_programt::instructiont *assumption;
+  const goto_programt::instructiont *error;
+
+  dynamic_flow_propertyt() : assumption(nullptr), error(nullptr)
+  {
+  }
+};
+
+bool negated_equal_symbols(
+  const exprt &src,
+  irep_idt &left,
+  irep_idt &right)
+{
+  const exprt &root = strip(src);
+  if(root.id() != ID_not || root.operands().size() != 1)
+    return false;
+  const exprt &relation = strip(root.op0());
+  return
+    relation.id() == ID_equal && relation.operands().size() == 2 &&
+    symbol_id(relation.op0(), left) &&
+    symbol_id(relation.op1(), right) && left != right;
+}
+
+bool find_dynamic_flow_property(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const lifecyclet &life,
+  dynamic_flow_propertyt &property,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::size_t matches = 0;
+  std::size_t errors = 0;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(call_id(instruction, callee) && is_reach_error(callee))
+      {
+        ++errors;
+        if(entry.first != ID_main)
+        {
+          reason = "flow_dynamic_error_function";
+          return false;
+        }
+        property.error = &instruction;
+      }
+    }
+  }
+
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.last_join == nullptr ||
+      instruction.location_number <= life.last_join->location_number)
+      continue;
+    irep_idt callee;
+    if(
+      !call_id(instruction, callee) || !is_assume(callee) ||
+      instruction.call_arguments().size() != 1)
+      continue;
+    std::vector<exprt> terms;
+    flatten_and(instruction.call_arguments().front(), terms);
+    if(terms.size() != 3)
+      continue;
+    irep_idt counter_left;
+    irep_idt counter_right;
+    irep_idt bound;
+    irep_idt accumulator_left;
+    irep_idt accumulator_right;
+    bool counter_equality = false;
+    bool completion = false;
+    bool inequality = false;
+    for(const auto &term_src : terms)
+    {
+      const exprt &term = strip(term_src);
+      irep_idt left;
+      irep_idt right;
+      if(
+        term.id() == ID_equal && term.operands().size() == 2 &&
+        symbol_id(term.op0(), left) && symbol_id(term.op1(), right))
+      {
+        if(!counter_equality)
+        {
+          counter_left = left;
+          counter_right = right;
+          counter_equality = true;
+        }
+        else
+        {
+          if(left == counter_left || left == counter_right)
+          {
+            bound = right;
+            completion = true;
+          }
+          else if(right == counter_left || right == counter_right)
+          {
+            bound = left;
+            completion = true;
+          }
+        }
+      }
+      else if(
+        negated_equal_symbols(
+          term, accumulator_left, accumulator_right))
+        inequality = true;
+    }
+    if(
+      !counter_equality || !completion || !inequality ||
+      counter_left == counter_right ||
+      accumulator_left == accumulator_right ||
+      !shared_signed(counter_left, ns) ||
+      !shared_signed(counter_right, ns) ||
+      !shared_signed(bound, ns) ||
+      !shared_signed(accumulator_left, ns) ||
+      !shared_signed(accumulator_right, ns))
+      continue;
+    ++matches;
+    property.left_counter = counter_left;
+    property.right_counter = counter_right;
+    property.bound = bound;
+    property.left_accumulator = accumulator_left;
+    property.right_accumulator = accumulator_right;
+    property.assumption = &instruction;
+  }
+  if(
+    matches != 1 || errors != 1 || property.assumption == nullptr ||
+    property.error == nullptr ||
+    property.assumption->location_number >= property.error->location_number)
+  {
+    reason =
+      matches == 0 ? "flow_dynamic_property" :
+                     "flow_dynamic_property_ambiguous";
+    return false;
+  }
+  return true;
+}
+
+struct dynamic_flow_workert
+{
+  irep_idt counter;
+  irep_idt bound;
+  irep_idt temporary;
+  irep_idt base;
+  irep_idt accumulator;
+  irep_idt operation;
+  std::set<const goto_programt::instructiont *> writes;
+};
+
+bool dynamic_flow_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  dynamic_flow_workert &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  natural_loopst loops;
+  loops(program);
+  if(loops.loop_map.size() != 1)
+  {
+    reason = "flow_dynamic_loop_count";
+    return false;
+  }
+  const auto &loop = loops.loop_map.begin()->second;
+  unsigned atomic_epoch = 0;
+  unsigned atomic_depth = 0;
+  std::size_t atomic_begins = 0;
+  std::size_t atomic_ends = 0;
+  std::size_t gotos = 0;
+  goto_programt::const_targett counter_write =
+    program.instructions.end();
+  goto_programt::const_targett temporary_write =
+    program.instructions.end();
+  goto_programt::const_targett accumulator_write =
+    program.instructions.end();
+  bool guarded = false;
+
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_atomic_begin())
+    {
+      if(atomic_depth != 0)
+      {
+        reason = "flow_dynamic_atomic_nesting";
+        return false;
+      }
+      atomic_depth = 1;
+      ++atomic_epoch;
+      ++atomic_begins;
+      continue;
+    }
+    if(instruction->is_atomic_end())
+    {
+      if(atomic_depth != 1)
+      {
+        reason = "flow_dynamic_atomic_balance";
+        return false;
+      }
+      atomic_depth = 0;
+      ++atomic_ends;
+      continue;
+    }
+    if(instruction->is_goto() && loop.contains(instruction))
+      ++gotos;
+    irep_idt callee;
+    if(call_id(*instruction, callee))
+    {
+      if(is_assume(callee))
+      {
+        if(
+          atomic_depth != 1 || atomic_epoch != 1 ||
+          instruction->call_arguments().size() != 1)
+        {
+          reason = "flow_dynamic_guard_epoch";
+          return false;
+        }
+        const exprt &guard = strip(instruction->call_arguments().front());
+        irep_idt counter;
+        irep_idt bound;
+        if(
+          guard.id() != ID_lt || guard.operands().size() != 2 ||
+          !symbol_id(guard.op0(), counter) ||
+          !symbol_id(guard.op1(), bound))
+        {
+          reason = "flow_dynamic_guard";
+          return false;
+        }
+        result.counter = counter;
+        result.bound = bound;
+        guarded = true;
+        continue;
+      }
+      irep_idt accumulator;
+      irep_idt first;
+      irep_idt temporary;
+      if(
+        atomic_depth != 1 || atomic_epoch != 2 ||
+        instruction->call_lhs().is_nil() ||
+        instruction->call_arguments().size() != 2 ||
+        !symbol_id(instruction->call_lhs(), accumulator) ||
+        !symbol_id(instruction->call_arguments()[0], first) ||
+        !symbol_id(instruction->call_arguments()[1], temporary) ||
+        accumulator != first || !shared_signed(accumulator, ns) ||
+        accumulator_write != program.instructions.end())
+      {
+        reason = "flow_dynamic_fold";
+        return false;
+      }
+      result.accumulator = accumulator;
+      result.temporary = temporary;
+      result.operation = callee;
+      result.writes.insert(&*instruction);
+      accumulator_write = instruction;
+      continue;
+    }
+    if(!instruction->is_assign())
+      continue;
+    irep_idt lhs;
+    if(!shared_symbol_lhs(*instruction, ns, lhs))
+      continue;
+    if(
+      guarded && lhs == result.counter &&
+      unit_increment(*instruction, result.counter) &&
+      atomic_depth == 1 && atomic_epoch == 1 &&
+      counter_write == program.instructions.end())
+    {
+      result.writes.insert(&*instruction);
+      counter_write = instruction;
+      continue;
+    }
+    irep_idt base;
+    const symbolt *counter_symbol = lookup(result.counter, ns);
+    if(
+      guarded && counter_symbol != nullptr &&
+      base_pointer(instruction->assign_rhs(), base) &&
+      array_at(
+        instruction->assign_rhs(),
+        base,
+        symbol_exprt(
+          result.counter,
+          counter_symbol->type)) &&
+      atomic_depth == 1 && atomic_epoch == 1 &&
+      temporary_write == program.instructions.end())
+    {
+      result.temporary = lhs;
+      result.base = base;
+      result.writes.insert(&*instruction);
+      temporary_write = instruction;
+      continue;
+    }
+    reason = "flow_dynamic_shared_write";
+    return false;
+  }
+  if(
+    atomic_depth != 0 || atomic_begins != 2 || atomic_ends != 2 ||
+    gotos != 2 || !guarded ||
+    counter_write == program.instructions.end() ||
+    temporary_write == program.instructions.end() ||
+    accumulator_write == program.instructions.end() ||
+    counter_write->location_number >= temporary_write->location_number ||
+    temporary_write->location_number >= accumulator_write->location_number ||
+    !shared_signed(result.counter, ns) ||
+    !shared_signed(result.temporary, ns) ||
+    result.counter == result.temporary ||
+    result.counter == result.accumulator ||
+    result.temporary == result.accumulator)
+  {
+    reason = "flow_dynamic_shape";
+    return false;
+  }
+  return true;
+}
+
+bool dynamic_initial_relation(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const dynamic_flow_propertyt &property,
+  const goto_programt::instructiont *&assumption)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  const std::set<irep_idt> required = {
+    property.left_counter,
+    property.right_counter,
+    property.left_accumulator,
+    property.right_accumulator};
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr &&
+      instruction.location_number >= life.first_create->location_number)
+      break;
+    irep_idt callee;
+    if(
+      call_id(instruction, callee) && is_assume(callee) &&
+      instruction.call_arguments().size() == 1 &&
+      zero_equivalence_constraint(
+        instruction.call_arguments().front(), required))
+    {
+      assumption = &instruction;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool dynamic_flow_global_obligations(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const dynamic_flow_propertyt &property,
+  const std::vector<dynamic_flow_workert> &workers,
+  const irep_idt &base,
+  std::string &reason)
+{
+  std::set<irep_idt> protected_symbols = {
+    property.left_counter,
+    property.right_counter,
+    property.left_accumulator,
+    property.right_accumulator,
+    property.bound,
+    base};
+  std::set<const goto_programt::instructiont *> allowed;
+  for(const auto &worker : workers)
+  {
+    protected_symbols.insert(worker.temporary);
+    allowed.insert(worker.writes.begin(), worker.writes.end());
+  }
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      const exprt *lhs = nullptr;
+      if(instruction.is_assign())
+        lhs = &instruction.assign_lhs();
+      else if(
+        instruction.is_function_call() &&
+        !instruction.call_lhs().is_nil())
+        lhs = &instruction.call_lhs();
+      if(lhs == nullptr)
+        continue;
+      irep_idt direct;
+      irep_idt pointer;
+      const bool protected_write =
+        (symbol_id(*lhs, direct) &&
+         protected_symbols.count(direct) != 0) ||
+        (base_pointer(*lhs, pointer) && pointer == base);
+      if(!protected_write)
+        continue;
+      if(
+        is_start_function(entry.first) && instruction.is_assign() &&
+        value_is(instruction.assign_rhs(), 0))
+        continue;
+      if(
+        entry.first == ID_main && life.first_create != nullptr &&
+        instruction.location_number < life.first_create->location_number)
+        continue;
+      if(allowed.count(&instruction) == 0)
+      {
+        reason = "flow_dynamic_external_writer";
+        return false;
+      }
+    }
+  }
+  flow_equality_propertyt equality;
+  equality.left = property.left_accumulator;
+  equality.right = property.right_accumulator;
+  equality.assumption = property.assumption;
+  equality.error = property.error;
+  return
+    flow_alias_free(model, base, reason) &&
+    no_addresses(model, protected_symbols, reason) &&
+    flow_main_control(model, life, equality, reason);
+}
+
+bool equivalent_dynamic_partition_proof_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &reason)
+{
+  lifecyclet life;
+  if(!lifecycle(model, life, reason) || life.workers.size() != 4)
+  {
+    if(reason.empty())
+      reason = "flow_dynamic_lifecycle";
+    return false;
+  }
+  dynamic_flow_propertyt property;
+  if(!find_dynamic_flow_property(model, ns, life, property, reason))
+    return false;
+  const goto_programt::instructiont *initial_relation = nullptr;
+  if(
+    !dynamic_initial_relation(
+      model, life, property, initial_relation))
+  {
+    reason = "flow_dynamic_initial_relation";
+    return false;
+  }
+  if(
+    !no_main_symbol_writes_before_create(
+      model,
+      life,
+      {
+        property.left_counter,
+        property.right_counter,
+        property.left_accumulator,
+        property.right_accumulator
+      },
+      initial_relation,
+      reason))
+    return false;
+
+  std::vector<dynamic_flow_workert> workers;
+  for(const auto &worker_id : life.workers)
+  {
+    dynamic_flow_workert worker;
+    if(!dynamic_flow_worker(model, ns, worker_id, worker, reason))
+      return false;
+    workers.push_back(worker);
+  }
+  const irep_idt operation = workers.front().operation;
+  const irep_idt base = workers.front().base;
+  if(!signed_addition_helper(model, ns, operation, reason))
+    return false;
+  std::map<std::pair<irep_idt, irep_idt>, std::size_t> groups;
+  std::set<irep_idt> temporaries;
+  for(const auto &worker : workers)
+  {
+    if(
+      worker.operation != operation || worker.bound != property.bound ||
+      worker.base != base || !temporaries.insert(worker.temporary).second)
+    {
+      reason = "flow_dynamic_signature";
+      return false;
+    }
+    ++groups[{worker.counter, worker.accumulator}];
+  }
+  if(
+    groups.size() != 2 ||
+    std::any_of(
+      groups.begin(),
+      groups.end(),
+      [](const std::pair<
+           const std::pair<irep_idt, irep_idt>,
+           std::size_t> &entry) {
+        return entry.second != 2;
+      }))
+  {
+    reason = "flow_dynamic_groups";
+    return false;
+  }
+  const std::set<std::pair<irep_idt, irep_idt>> expected = {
+    {property.left_counter, property.left_accumulator},
+    {property.right_counter, property.right_accumulator}};
+  std::set<std::pair<irep_idt, irep_idt>> actual;
+  for(const auto &entry : groups)
+    actual.insert(entry.first);
+  if(actual != expected)
+  {
+    reason = "flow_dynamic_property_groups";
+    return false;
+  }
+  if(
+    !dynamic_flow_global_obligations(
+      model, life, property, workers, base, reason))
+    return false;
+
+  std::cout << "NATIVE_RELATIONAL_FLOW applied=1 rule=dynamic_partition"
+            << " left=" << property.left_accumulator
+            << " right=" << property.right_accumulator << '\n';
+  return true;
+}
+
+struct stream_flow_propertyt
+{
+  irep_idt total;
+  const goto_programt::instructiont *assumption;
+  const goto_programt::instructiont *error;
+
+  stream_flow_propertyt() : assumption(nullptr), error(nullptr)
+  {
+  }
+};
+
+bool find_stream_flow_property(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const lifecyclet &life,
+  stream_flow_propertyt &property,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::size_t matches = 0;
+  std::size_t errors = 0;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(call_id(instruction, callee) && is_reach_error(callee))
+      {
+        ++errors;
+        if(entry.first != ID_main)
+        {
+          reason = "stream_error_function";
+          return false;
+        }
+        property.error = &instruction;
+      }
+    }
+  }
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.last_join == nullptr ||
+      instruction.location_number <= life.last_join->location_number)
+      continue;
+    irep_idt callee;
+    if(
+      !call_id(instruction, callee) || !is_assume(callee) ||
+      instruction.call_arguments().size() != 1)
+      continue;
+    const exprt &condition =
+      strip(instruction.call_arguments().front());
+    irep_idt total;
+    if(
+      condition.id() != ID_le || condition.operands().size() != 2 ||
+      !symbol_id(condition.op0(), total) ||
+      !value_is(condition.op1(), 0) || !shared_signed(total, ns))
+      continue;
+    ++matches;
+    property.total = total;
+    property.assumption = &instruction;
+  }
+  if(
+    matches != 1 || errors != 1 || property.assumption == nullptr ||
+    property.error == nullptr ||
+    property.assumption->location_number >= property.error->location_number)
+  {
+    reason =
+      matches == 0 ? "stream_property" :
+                     "stream_property_ambiguous";
+    return false;
+  }
+  return true;
+}
+
+bool array_equality_term(
+  const exprt &src,
+  irep_idt &base,
+  irep_idt &index,
+  exprt &value)
+{
+  const exprt &relation = strip(src);
+  if(relation.id() != ID_equal || relation.operands().size() != 2)
+    return false;
+  if(array_symbol_index(relation.op0(), base, index))
+  {
+    value = strip(relation.op1());
+    return true;
+  }
+  if(array_symbol_index(relation.op1(), base, index))
+  {
+    value = strip(relation.op0());
+    return true;
+  }
+  return false;
+}
+
+bool publish_drain_condition(
+  const exprt &src,
+  irep_idt &progress,
+  irep_idt &bound,
+  irep_idt &front,
+  irep_idt &back)
+{
+  const exprt &root = strip(src);
+  if(root.id() != ID_or || root.operands().size() != 2)
+    return false;
+  for(unsigned order = 0; order < 2; ++order)
+  {
+    const exprt &publish = strip(root.operands()[order]);
+    const exprt &drain = strip(root.operands()[1 - order]);
+    if(
+      publish.id() != ID_lt || publish.operands().size() != 2 ||
+      drain.id() != ID_lt || drain.operands().size() != 2 ||
+      !symbol_id(publish.op0(), progress) ||
+      !symbol_id(publish.op1(), bound) ||
+      !symbol_id(drain.op0(), front) ||
+      !symbol_id(drain.op1(), back))
+      continue;
+    return true;
+  }
+  return false;
+}
+
+struct stream_flow_rolet
+{
+  bool producer;
+  irep_idt queue;
+  irep_idt progress;
+  irep_idt bound;
+  irep_idt front;
+  irep_idt back;
+  irep_idt total;
+  irep_idt operation;
+  exprt element;
+  std::set<const goto_programt::instructiont *> writes;
+
+  stream_flow_rolet() : producer(false)
+  {
+  }
+};
+
+bool stream_flow_role(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  const irep_idt &expected_total,
+  stream_flow_rolet &role,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  natural_loopst loops;
+  loops(program);
+  if(loops.loop_map.size() != 1)
+  {
+    reason = "stream_loop_count";
+    return false;
+  }
+  const auto &loop = loops.loop_map.begin()->second;
+  unsigned atomic_depth = 0;
+  unsigned atomic_epoch = 0;
+  std::size_t gotos = 0;
+  std::size_t condition_writes = 0;
+  std::size_t assume_calls = 0;
+  goto_programt::const_targett back_write = program.instructions.end();
+  goto_programt::const_targett progress_write = program.instructions.end();
+  goto_programt::const_targett total_write = program.instructions.end();
+  goto_programt::const_targett front_write = program.instructions.end();
+  unsigned back_epoch = 0;
+  unsigned progress_epoch = 0;
+  unsigned total_epoch = 0;
+  unsigned front_epoch = 0;
+
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_atomic_begin())
+    {
+      if(atomic_depth != 0)
+      {
+        reason = "stream_atomic_nesting";
+        return false;
+      }
+      atomic_depth = 1;
+      ++atomic_epoch;
+      continue;
+    }
+    if(instruction->is_atomic_end())
+    {
+      if(atomic_depth != 1)
+      {
+        reason = "stream_atomic_balance";
+        return false;
+      }
+      atomic_depth = 0;
+      continue;
+    }
+    if(instruction->is_goto() && loop.contains(instruction))
+      ++gotos;
+    irep_idt callee;
+    if(call_id(*instruction, callee))
+    {
+      if(is_assume(callee))
+      {
+        if(
+          atomic_depth != 1 ||
+          instruction->call_arguments().size() != 1)
+        {
+          reason = "stream_assume_epoch";
+          return false;
+        }
+        ++assume_calls;
+        std::vector<exprt> terms;
+        flatten_and(instruction->call_arguments().front(), terms);
+        for(const auto &term : terms)
+        {
+          irep_idt base;
+          irep_idt index;
+          exprt value;
+          if(array_equality_term(term, base, index, value))
+          {
+            role.queue = base;
+            role.back = index;
+            role.element = value;
+          }
+        }
+        continue;
+      }
+      irep_idt total;
+      irep_idt first;
+      irep_idt base;
+      irep_idt front;
+      if(
+        instruction->call_lhs().is_nil() ||
+        instruction->call_arguments().size() != 2 ||
+        !symbol_id(instruction->call_lhs(), total) ||
+        !symbol_id(instruction->call_arguments()[0], first) ||
+        total != first || total != expected_total ||
+        !array_symbol_index(
+          instruction->call_arguments()[1], base, front) ||
+        atomic_depth != 1 || total_write != program.instructions.end())
+      {
+        reason = "stream_worker_call";
+        return false;
+      }
+      role.total = total;
+      role.operation = callee;
+      role.queue = base;
+      role.front = front;
+      role.writes.insert(&*instruction);
+      total_write = instruction;
+      total_epoch = atomic_epoch;
+      continue;
+    }
+    if(!instruction->is_assign())
+      continue;
+    irep_idt lhs;
+    if(!shared_symbol_lhs(*instruction, ns, lhs))
+    {
+      irep_idt local;
+      if(!symbol_id(instruction->assign_lhs(), local))
+        continue;
+      irep_idt progress;
+      irep_idt bound;
+      irep_idt front;
+      irep_idt back;
+      const exprt &condition = strip(instruction->assign_rhs());
+      if(
+        condition.id() == ID_lt && condition.operands().size() == 2 &&
+        symbol_id(condition.op0(), progress) &&
+        symbol_id(condition.op1(), bound))
+      {
+        if(
+          (!role.progress.empty() && role.progress != progress) ||
+          (!role.bound.empty() && role.bound != bound))
+        {
+          reason = "stream_producer_condition";
+          return false;
+        }
+        role.progress = progress;
+        role.bound = bound;
+        ++condition_writes;
+      }
+      else if(
+        publish_drain_condition(
+          condition, progress, bound, front, back))
+      {
+        if(
+          (!role.progress.empty() && role.progress != progress) ||
+          (!role.bound.empty() && role.bound != bound) ||
+          (!role.front.empty() && role.front != front) ||
+          (!role.back.empty() && role.back != back))
+        {
+          reason = "stream_consumer_condition";
+          return false;
+        }
+        role.progress = progress;
+        role.bound = bound;
+        role.front = front;
+        role.back = back;
+        ++condition_writes;
+      }
+      continue;
+    }
+    if(
+      unit_increment(*instruction, lhs) && atomic_depth == 1)
+    {
+      if(!role.back.empty() && lhs == role.back)
+      {
+        if(back_write != program.instructions.end())
+        {
+          reason = "stream_back_count";
+          return false;
+        }
+        back_write = instruction;
+        back_epoch = atomic_epoch;
+      }
+      else if(!role.progress.empty() && lhs == role.progress)
+      {
+        if(progress_write != program.instructions.end())
+        {
+          reason = "stream_progress_count";
+          return false;
+        }
+        progress_write = instruction;
+        progress_epoch = atomic_epoch;
+      }
+      else if(!role.front.empty() && lhs == role.front)
+      {
+        if(front_write != program.instructions.end())
+        {
+          reason = "stream_front_count";
+          return false;
+        }
+        front_write = instruction;
+        front_epoch = atomic_epoch;
+      }
+      else
+      {
+        reason =
+          "stream_unrecognized_increment lhs=" + id2string(lhs) +
+          " back=" + id2string(role.back) +
+          " progress=" + id2string(role.progress) +
+          " front=" + id2string(role.front);
+        return false;
+      }
+      role.writes.insert(&*instruction);
+      continue;
+    }
+    reason = "stream_shared_write";
+    return false;
+  }
+  if(atomic_depth != 0 || gotos != 2 || condition_writes != 2)
+  {
+    reason = "stream_control_shape";
+    return false;
+  }
+
+  if(total_write == program.instructions.end())
+  {
+    role.producer = true;
+    if(
+      assume_calls != 1 || role.queue.empty() || role.back.empty() ||
+      role.progress.empty() || role.bound.empty() ||
+      back_write == program.instructions.end() ||
+      progress_write == program.instructions.end() ||
+      back_write->location_number >= progress_write->location_number ||
+      back_epoch > progress_epoch)
+    {
+      reason = "stream_producer_shape";
+      return false;
+    }
+  }
+  else
+  {
+    role.producer = false;
+    if(
+      assume_calls != 1 || role.queue.empty() || role.front.empty() ||
+      role.back.empty() || role.progress.empty() || role.bound.empty() ||
+      front_write == program.instructions.end() ||
+      total_write->location_number >= front_write->location_number ||
+      total_epoch != front_epoch)
+    {
+      reason = "stream_consumer_shape";
+      return false;
+    }
+    bool drain_guard = false;
+    for(const auto &instruction : program.instructions)
+    {
+      irep_idt callee;
+      if(
+        !call_id(instruction, callee) || !is_assume(callee) ||
+        instruction.call_arguments().size() != 1)
+        continue;
+      std::vector<exprt> terms;
+      flatten_and(instruction.call_arguments().front(), terms);
+      drain_guard =
+        drain_guard ||
+        std::any_of(
+          terms.begin(),
+          terms.end(),
+          [&](const exprt &term) {
+            return
+              relation_symbols(
+                term, ID_lt, role.front, role.back);
+          });
+    }
+    if(!drain_guard)
+    {
+      reason = "stream_consumer_commit_guard";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool stream_positive_preconditions(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const irep_idt &positive_bound,
+  const irep_idt &negative_bound,
+  const irep_idt &element,
+  const std::vector<stream_flow_rolet> &roles)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  bool strict_residual = false;
+  bool negative_nonnegative = false;
+  bool element_positive = false;
+  bool defined_negation = false;
+  std::set<std::pair<irep_idt, irep_idt>> empty_channels;
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr &&
+      instruction.location_number >= life.first_create->location_number)
+      break;
+    irep_idt callee;
+    if(
+      !call_id(instruction, callee) || !is_assume(callee) ||
+      instruction.call_arguments().size() != 1)
+      continue;
+    std::vector<exprt> terms;
+    flatten_and(instruction.call_arguments().front(), terms);
+    for(const auto &term : terms)
+    {
+      strict_residual =
+        strict_residual ||
+        relation_symbols(
+          term, ID_gt, positive_bound, negative_bound) ||
+        relation_symbols(
+          term, ID_lt, negative_bound, positive_bound);
+      negative_nonnegative =
+        negative_nonnegative ||
+        relation_zero(term, negative_bound, ID_ge);
+      element_positive =
+        element_positive || relation_zero(term, element, ID_gt);
+      const exprt &relation = strip(term);
+      mp_integer constant;
+      irep_idt candidate;
+      if(
+        relation.id() == ID_gt && relation.operands().size() == 2 &&
+        symbol_id(relation.op0(), candidate) && candidate == element &&
+        integer_constant(relation.op1(), constant) &&
+        constant == -power(2, 31))
+        defined_negation = true;
+      if(relation.id() == ID_equal && relation.operands().size() == 2)
+      {
+        irep_idt left;
+        irep_idt right;
+        if(
+          symbol_id(relation.op0(), left) &&
+          symbol_id(relation.op1(), right))
+          empty_channels.insert({left, right});
+      }
+    }
+  }
+  for(const auto &role : roles)
+  {
+    if(!role.producer)
+      continue;
+    bool empty = false;
+    for(const auto &consumer : roles)
+    {
+      if(
+        consumer.producer || consumer.queue != role.queue ||
+        consumer.back != role.back)
+        continue;
+      empty =
+        empty ||
+        empty_channels.count({consumer.front, role.back}) != 0 ||
+        empty_channels.count({role.back, consumer.front}) != 0;
+    }
+    if(!empty)
+      return false;
+  }
+  return
+    strict_residual && negative_nonnegative &&
+    element_positive && defined_negation;
+}
+
+bool stream_main_allocations(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const std::set<irep_idt> &queues,
+  const namespacet &ns,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::set<irep_idt> allocated;
+  irep_idt allocator;
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr &&
+      instruction.location_number >= life.first_create->location_number)
+      break;
+    irep_idt callee;
+    irep_idt lhs;
+    if(
+      !call_id(instruction, callee) ||
+      instruction.call_lhs().is_nil() ||
+      !symbol_id(instruction.call_lhs(), lhs) ||
+      queues.count(lhs) == 0)
+      continue;
+    if(instruction.call_arguments().size() != 1)
+    {
+      reason = "stream_allocation_arguments";
+      return false;
+    }
+    if(allocator.empty())
+      allocator = callee;
+    else if(allocator != callee)
+    {
+      reason = "stream_allocator_mismatch";
+      return false;
+    }
+    allocated.insert(lhs);
+  }
+  if(
+    allocated != queues || allocator.empty() ||
+    !fresh_array_allocator(model, ns, allocator, reason))
+  {
+    if(reason.empty())
+      reason = "stream_allocations";
+    return false;
+  }
+  return true;
+}
+
+bool ordered_stream_residual_proof_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &reason)
+{
+  lifecyclet life;
+  if(!lifecycle(model, life, reason) || life.workers.size() != 4)
+  {
+    if(reason.empty())
+      reason = "stream_lifecycle";
+    return false;
+  }
+  stream_flow_propertyt property;
+  if(!find_stream_flow_property(model, ns, life, property, reason))
+    return false;
+
+  std::vector<stream_flow_rolet> roles;
+  for(const auto &worker_id : life.workers)
+  {
+    stream_flow_rolet role;
+    if(
+      !stream_flow_role(
+        model, ns, worker_id, property.total, role, reason))
+    {
+      reason =
+        "stream_worker " + id2string(worker_id) + " " + reason;
+      return false;
+    }
+    roles.push_back(role);
+  }
+  std::vector<const stream_flow_rolet *> producers;
+  std::vector<const stream_flow_rolet *> consumers;
+  for(const auto &role : roles)
+    (role.producer ? producers : consumers).push_back(&role);
+  if(producers.size() != 2 || consumers.size() != 2)
+  {
+    reason = "stream_roles";
+    return false;
+  }
+  for(const auto *producer : producers)
+  {
+    std::size_t matches = 0;
+    for(const auto *consumer : consumers)
+    {
+      if(
+        producer->queue == consumer->queue &&
+        producer->back == consumer->back &&
+        producer->progress == consumer->progress &&
+        producer->bound == consumer->bound)
+        ++matches;
+    }
+    if(matches != 1)
+    {
+      reason = "stream_endpoints";
+      return false;
+    }
+  }
+  if(
+    producers[0]->queue == producers[1]->queue ||
+    consumers[0]->total != property.total ||
+    consumers[1]->total != property.total ||
+    consumers[0]->operation != consumers[1]->operation ||
+    !signed_addition_helper(
+      model, ns, consumers[0]->operation, reason))
+  {
+    if(reason.empty())
+      reason = "stream_signature";
+    return false;
+  }
+
+  const stream_flow_rolet *positive = nullptr;
+  const stream_flow_rolet *negative = nullptr;
+  irep_idt element;
+  for(const auto *producer : producers)
+  {
+    irep_idt candidate;
+    if(symbol_id(producer->element, candidate))
+    {
+      positive = producer;
+      element = candidate;
+    }
+    const exprt &value = strip(producer->element);
+    if(
+      value.id() == ID_unary_minus && value.operands().size() == 1 &&
+      symbol_id(value.op0(), candidate))
+    {
+      negative = producer;
+      if(element.empty())
+        element = candidate;
+      else if(element != candidate)
+      {
+        reason = "stream_elements";
+        return false;
+      }
+    }
+  }
+  if(
+    positive == nullptr || negative == nullptr ||
+    positive == negative || element.empty() ||
+    !shared_signed(element, ns) ||
+    !stream_positive_preconditions(
+      model,
+      life,
+      positive->bound,
+      negative->bound,
+      element,
+      roles))
+  {
+    reason = "stream_residual_precondition";
+    return false;
+  }
+
+  std::set<irep_idt> queues = {
+    producers[0]->queue, producers[1]->queue};
+  if(!stream_main_allocations(model, life, queues, ns, reason))
+    return false;
+  std::set<irep_idt> protected_symbols = {
+    property.total,
+    positive->bound,
+    negative->bound,
+    element};
+  std::set<const goto_programt::instructiont *> allowed;
+  for(const auto &role : roles)
+  {
+    protected_symbols.insert(role.queue);
+    protected_symbols.insert(role.progress);
+    protected_symbols.insert(role.bound);
+    protected_symbols.insert(role.back);
+    if(!role.front.empty())
+      protected_symbols.insert(role.front);
+    allowed.insert(role.writes.begin(), role.writes.end());
+  }
+  if(
+    !zero_initialized_symbols(
+      model,
+      {property.total, positive->progress, negative->progress},
+      allowed,
+      reason))
+    return false;
+  if(
+    !no_main_symbol_writes_before_create(
+      model,
+      life,
+      {property.total, positive->progress, negative->progress},
+      nullptr,
+      reason))
+    return false;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      const exprt *lhs = nullptr;
+      if(instruction.is_assign())
+        lhs = &instruction.assign_lhs();
+      else if(
+        instruction.is_function_call() &&
+        !instruction.call_lhs().is_nil())
+        lhs = &instruction.call_lhs();
+      if(lhs == nullptr)
+        continue;
+      irep_idt direct;
+      irep_idt base;
+      const bool protected_write =
+        (symbol_id(*lhs, direct) &&
+         protected_symbols.count(direct) != 0) ||
+        (base_pointer(*lhs, base) && queues.count(base) != 0);
+      if(!protected_write)
+        continue;
+      if(
+        is_start_function(entry.first) && instruction.is_assign() &&
+        value_is(instruction.assign_rhs(), 0))
+        continue;
+      if(
+        entry.first == ID_main && life.first_create != nullptr &&
+        instruction.location_number < life.first_create->location_number)
+        continue;
+      if(allowed.count(&instruction) == 0)
+      {
+        reason = "stream_external_writer";
+        return false;
+      }
+    }
+  }
+  for(const auto &queue : queues)
+  {
+    if(!flow_alias_free(model, queue, reason))
+      return false;
+  }
+  flow_equality_propertyt control_property;
+  control_property.assumption = property.assumption;
+  control_property.error = property.error;
+  if(
+    !no_addresses(model, protected_symbols, reason) ||
+    !flow_main_control(
+      model, life, control_property, reason))
+    return false;
+
+  std::cout << "NATIVE_RELATIONAL_FLOW applied=1 rule=stream_residual"
+            << " total=" << property.total
+            << " positive_bound=" << positive->bound
+            << " negative_bound=" << negative->bound << '\n';
+  return true;
 }
 
 bool shared_unsigned32(
@@ -4992,6 +7035,21 @@ bool extremum_cone_proof(
   (void)message_handler;
   const namespacet ns(goto_model.symbol_table);
   std::string reason;
+  if(equivalent_static_partition_proof_impl(goto_model, ns, reason))
+    return true;
+  std::cout << "NATIVE_RELATIONAL_FLOW applied=0 reason="
+            << reason << '\n';
+  reason.clear();
+  if(equivalent_dynamic_partition_proof_impl(goto_model, ns, reason))
+    return true;
+  std::cout << "NATIVE_RELATIONAL_FLOW applied=0 reason="
+            << reason << '\n';
+  reason.clear();
+  if(ordered_stream_residual_proof_impl(goto_model, ns, reason))
+    return true;
+  std::cout << "NATIVE_RELATIONAL_FLOW applied=0 reason="
+            << reason << '\n';
+  reason.clear();
   if(linear_fold_proof_impl(goto_model, ns, reason))
     return true;
   std::cout << "NATIVE_LINEAR_ANNIHILATOR applied=0 reason="
