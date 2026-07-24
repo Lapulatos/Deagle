@@ -30,4 +30,10 @@ bool ticket_rank_serializability_transform(
   goto_modelt &goto_model,
   message_handlert &message_handler);
 
+/// Aggregate fixed-count, same-mutex, commuting affine critical sections into
+/// their exact post-join state. Unsupported programs are unchanged.
+bool lock_scoped_commutative_aggregation_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 #endif // CPROVER_ANALYSES_JCES_ANALYSIS_H

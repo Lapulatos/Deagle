@@ -542,8 +542,11 @@ int cbmc_parse_optionst::doit()
     cmdline.isset("native-jces") &&
     !cmdline.isset("unwind-suggest"))
   {
-    if(!ticket_rank_serializability_transform(
-         goto_model, ui_message_handler))
+    if(
+      !lock_scoped_commutative_aggregation_transform(
+        goto_model, ui_message_handler) &&
+      !ticket_rank_serializability_transform(
+        goto_model, ui_message_handler))
       jces_transform(goto_model, ui_message_handler);
   }
 

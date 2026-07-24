@@ -80,6 +80,25 @@ struct ticket_regiont
   goto_programt::targett completion;
 };
 
+struct affine_formt
+{
+  mp_integer coefficient = 0;
+  mp_integer offset = 0;
+};
+
+struct locked_loop_summaryt
+{
+  irep_idt function;
+  irep_idt induction;
+  irep_idt object;
+  irep_idt mutex;
+  mp_integer count;
+  mp_integer delta;
+  goto_programt::targett loop_head;
+  goto_programt::targett backedge;
+  std::set<const goto_programt::instructiont *> covered;
+};
+
 const exprt &without_cast(const exprt &expr)
 {
   return skip_typecast(expr);
@@ -807,6 +826,21 @@ bool signed_value_fits(const mp_integer &value, const typet &type)
   return value >= -limit && value < limit;
 }
 
+bool integer_value_fits(const mp_integer &value, const typet &type)
+{
+  if(type.id() == ID_signedbv)
+    return signed_value_fits(value, type);
+  if(type.id() != ID_unsignedbv)
+    return false;
+  const auto width = to_unsignedbv_type(type).get_width();
+  if(width == 0 || value < 0)
+    return false;
+  mp_integer limit = 1;
+  for(std::size_t index = 0; index < width; ++index)
+    limit *= 2;
+  return value < limit;
+}
+
 bool constant_bound(const exprt &expr, mp_integer &bound)
 {
   return constant_eval(expr, {}, bound) && bound >= 0 && bound <= 256;
@@ -1523,6 +1557,597 @@ bool static_initial_value(
     constant_eval(symbol->second.value, {}, value);
 }
 
+bool collect_affine_form(
+  const exprt &src,
+  const namespacet &ns,
+  irep_idt &object,
+  const std::map<irep_idt, affine_formt> &locals,
+  affine_formt &form)
+{
+  const exprt &expr = without_cast(src);
+  if(expr.id() == ID_constant)
+  {
+    form.coefficient = 0;
+    return !to_integer(to_constant_expr(expr), form.offset);
+  }
+  if(expr.id() == ID_symbol)
+  {
+    const irep_idt identifier =
+      to_symbol_expr(expr).get_identifier();
+    const symbolt *symbol = nullptr;
+    if(ns.lookup(identifier, symbol))
+      return false;
+    if(symbol->is_static_lifetime)
+    {
+      if(
+        symbol->is_type || symbol->type.id() == ID_pointer ||
+        (object.empty() ? false : identifier != object))
+      {
+        if(
+          symbol->is_type || symbol->type.id() == ID_pointer ||
+          !object.empty())
+          return false;
+      }
+      if(object.empty())
+        object = identifier;
+      form.coefficient = 1;
+      form.offset = 0;
+      return true;
+    }
+    const auto local = locals.find(identifier);
+    if(local == locals.end())
+      return false;
+    form = local->second;
+    return true;
+  }
+  if(
+    (expr.id() == ID_plus || expr.id() == ID_minus) &&
+    expr.operands().size() == 2)
+  {
+    affine_formt lhs;
+    affine_formt rhs;
+    if(
+      !collect_affine_form(
+        expr.op0(), ns, object, locals, lhs) ||
+      !collect_affine_form(
+        expr.op1(), ns, object, locals, rhs))
+      return false;
+    form.coefficient =
+      expr.id() == ID_plus
+        ? lhs.coefficient + rhs.coefficient
+        : lhs.coefficient - rhs.coefficient;
+    form.offset =
+      expr.id() == ID_plus
+        ? lhs.offset + rhs.offset
+        : lhs.offset - rhs.offset;
+    return true;
+  }
+  return false;
+}
+
+bool contains_any_shared_scalar(
+  const exprt &expr,
+  const namespacet &ns)
+{
+  if(expr.id() == ID_symbol)
+  {
+    const symbolt *symbol = nullptr;
+    if(
+      !ns.lookup(
+        to_symbol_expr(expr).get_identifier(), symbol) &&
+      symbol->is_static_lifetime && !symbol->is_type)
+      return true;
+  }
+  for(const auto &operand : expr.operands())
+  {
+    if(contains_any_shared_scalar(operand, ns))
+      return true;
+  }
+  return false;
+}
+
+bool uses_only_object_and_constants(
+  const exprt &src,
+  const irep_idt &object)
+{
+  const exprt &expr = without_cast(src);
+  if(expr.id() == ID_constant)
+    return true;
+  if(expr.id() == ID_symbol)
+    return
+      to_symbol_expr(expr).get_identifier() == object;
+  if(expr.id() == ID_side_effect || expr.id() == ID_dereference)
+    return false;
+  for(const auto &operand : expr.operands())
+  {
+    if(!uses_only_object_and_constants(operand, object))
+      return false;
+  }
+  return true;
+}
+
+bool state_independent_call(
+  const irep_idt &identifier,
+  const goto_modelt &model,
+  const namespacet &ns)
+{
+  const auto function =
+    model.goto_functions.function_map.find(identifier);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+    return false;
+  for(const auto &instruction : function->second.body.instructions)
+  {
+    if(
+      instruction.is_assert() || instruction.is_assume() ||
+      instruction.is_start_thread() || instruction.is_end_thread() ||
+      instruction.is_atomic_begin() || instruction.is_atomic_end() ||
+      instruction.is_function_call())
+      return false;
+    if(instruction.is_assign())
+    {
+      const exprt &lhs = without_cast(instruction.assign_lhs());
+      const symbolt *symbol = nullptr;
+      if(is_shared_scalar(lhs, ns, symbol))
+        return false;
+    }
+  }
+  return true;
+}
+
+bool parse_locked_affine_loop(
+  const irep_idt &function_id,
+  goto_modelt &model,
+  const namespacet &ns,
+  locked_loop_summaryt &summary,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "lock_missing_function";
+    return false;
+  }
+  auto &program = function->second.body;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+    positions.emplace(&*instruction, position++);
+
+  auto backedge = program.instructions.end();
+  auto loop_head = program.instructions.end();
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(
+      instruction->is_goto() && instruction->condition().is_true() &&
+      instruction->targets.size() == 1 &&
+      positions.at(&*instruction->get_target()) <
+        positions.at(&*instruction))
+    {
+      if(backedge != program.instructions.end())
+      {
+        reason = "lock_multiple_loops";
+        return false;
+      }
+      backedge = instruction;
+      loop_head = instruction->get_target();
+    }
+  }
+  if(backedge == program.instructions.end())
+  {
+    reason = "lock_missing_loop";
+    return false;
+  }
+
+  irep_idt induction;
+  exprt bound;
+  mp_integer count;
+  if(
+    !parse_exit_guard(*loop_head, induction, bound) ||
+    !constant_bound(bound, count))
+  {
+    reason = "lock_loop_bound";
+    return false;
+  }
+  std::size_t zero_initializations = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != loop_head; ++instruction)
+    zero_initializations +=
+      parse_zero_initialization(*instruction, induction) ? 1 : 0;
+  if(zero_initializations != 1)
+  {
+    reason = "lock_loop_initialization";
+    return false;
+  }
+
+  bool locked = false;
+  bool lock_seen = false;
+  bool unlock_seen = false;
+  std::size_t induction_updates = 0;
+  std::size_t shared_writes = 0;
+  irep_idt object;
+  irep_idt mutex;
+  std::map<irep_idt, affine_formt> locals;
+  affine_formt final_form;
+  for(auto instruction = loop_head;
+      instruction != std::next(backedge); ++instruction)
+  {
+    summary.covered.insert(&*instruction);
+    if(instruction == loop_head || instruction == backedge)
+      continue;
+
+    irep_idt callee;
+    if(direct_call_identifier(*instruction, callee))
+    {
+      if(callee == "pthread_mutex_lock")
+      {
+        irep_idt candidate;
+        if(
+          locked || lock_seen ||
+          instruction->call_arguments().size() != 1 ||
+          !addressed_symbol(
+            instruction->call_arguments().front(), candidate))
+        {
+          reason = "lock_acquire_shape";
+          return false;
+        }
+        mutex = candidate;
+        locked = true;
+        lock_seen = true;
+      }
+      else if(callee == "pthread_mutex_unlock")
+      {
+        irep_idt candidate;
+        if(
+          !locked || unlock_seen ||
+          instruction->call_arguments().size() != 1 ||
+          !addressed_symbol(
+            instruction->call_arguments().front(), candidate) ||
+          candidate != mutex)
+        {
+          reason = "lock_release_shape";
+          return false;
+        }
+        locked = false;
+        unlock_seen = true;
+      }
+      else if(!state_independent_call(callee, model, ns))
+      {
+        reason = "lock_loop_call";
+        return false;
+      }
+      continue;
+    }
+
+    if(instruction->is_goto())
+    {
+      reason = "lock_loop_control";
+      return false;
+    }
+    if(!instruction->is_assign())
+    {
+      if(
+        instruction->is_decl() || instruction->is_dead() ||
+        instruction->is_skip() || instruction->is_location() ||
+        instruction->is_set_return_value())
+        continue;
+      reason = "lock_loop_instruction";
+      return false;
+    }
+
+    irep_idt incremented;
+    if(
+      parse_unit_increment(*instruction, incremented) &&
+      incremented == induction)
+    {
+      if(locked)
+      {
+        reason = "lock_induction_inside";
+        return false;
+      }
+      ++induction_updates;
+      continue;
+    }
+
+    const exprt &lhs = without_cast(instruction->assign_lhs());
+    if(lhs.id() != ID_symbol)
+    {
+      reason = "lock_loop_lhs";
+      return false;
+    }
+    const irep_idt lhs_id =
+      to_symbol_expr(lhs).get_identifier();
+    const symbolt *lhs_symbol = nullptr;
+    if(ns.lookup(lhs_id, lhs_symbol))
+    {
+      reason = "lock_loop_symbol";
+      return false;
+    }
+    affine_formt rhs_form;
+    if(lhs_symbol->is_static_lifetime)
+    {
+      if(!locked)
+      {
+        reason = "lock_unprotected_write";
+        return false;
+      }
+      if(object.empty())
+        object = lhs_id;
+      if(
+        lhs_id != object ||
+        !collect_affine_form(
+          instruction->assign_rhs(),
+          ns,
+          object,
+          locals,
+          rhs_form) ||
+        rhs_form.coefficient != 1)
+      {
+        reason = "lock_nontranslation";
+        return false;
+      }
+      final_form = rhs_form;
+      ++shared_writes;
+    }
+    else
+    {
+      if(
+        !collect_affine_form(
+          instruction->assign_rhs(),
+          ns,
+          object,
+          locals,
+          rhs_form))
+      {
+        reason = "lock_local_dataflow";
+        return false;
+      }
+      locals[lhs_id] = rhs_form;
+    }
+  }
+  if(
+    locked || !lock_seen || !unlock_seen ||
+    induction_updates != 1 || shared_writes != 1 ||
+    object.empty() || mutex.empty() || final_form.offset == 0)
+  {
+    reason = "lock_loop_shape";
+    return false;
+  }
+
+  summary.function = function_id;
+  summary.induction = induction;
+  summary.object = object;
+  summary.mutex = mutex;
+  summary.count = count;
+  summary.delta = final_form.offset;
+  summary.loop_head = loop_head;
+  summary.backedge = backedge;
+  return true;
+}
+
+bool validate_lock_aggregate_property(
+  goto_modelt &model,
+  const namespacet &ns,
+  const locked_loop_summaryt &main_loop,
+  const locked_loop_summaryt &worker_loop,
+  const goto_programt::targett create,
+  const goto_programt::targett join,
+  goto_programt::targett &initialization,
+  mp_integer &initial_value,
+  std::string &reason)
+{
+  const auto main =
+    model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != model.goto_functions.function_map.end(),
+    "lock aggregate found main");
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : main->second.body.instructions)
+    positions.emplace(&instruction, position++);
+  if(
+    positions.at(&*create) >=
+      positions.at(&*main_loop.loop_head) ||
+    positions.at(&*main_loop.backedge) >=
+      positions.at(&*join))
+  {
+    reason = "lock_lifecycle_order";
+    return false;
+  }
+
+  const auto worker =
+    model.goto_functions.function_map.find(worker_loop.function);
+  INVARIANT(
+    worker != model.goto_functions.function_map.end(),
+    "lock aggregate parsed worker");
+  for(const auto &instruction : worker->second.body.instructions)
+  {
+    if(worker_loop.covered.find(&instruction) !=
+       worker_loop.covered.end())
+      continue;
+    if(
+      instruction.is_decl() || instruction.is_dead() ||
+      instruction.is_skip() || instruction.is_location() ||
+      instruction.is_set_return_value() ||
+      instruction.is_end_function())
+      continue;
+    if(instruction.is_assign())
+    {
+      if(
+        contains_any_shared_scalar(
+          instruction.assign_lhs(), ns) ||
+        contains_any_shared_scalar(
+          instruction.assign_rhs(), ns))
+      {
+        reason = "lock_worker_outer_shared";
+        return false;
+      }
+      continue;
+    }
+    reason = "lock_worker_outer_effect";
+    return false;
+  }
+
+  std::size_t initializations = 0;
+  std::size_t property_calls = 0;
+  goto_programt::const_targett property =
+    main->second.body.instructions.end();
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != main->second.body.instructions.end(); ++instruction)
+  {
+    if(instruction->is_assign())
+    {
+      irep_idt lhs;
+      mp_integer value;
+      if(
+        direct_symbol(instruction->assign_lhs(), lhs) &&
+        lhs == main_loop.object &&
+        positions.at(&*instruction) < positions.at(&*create) &&
+        constant_eval(instruction->assign_rhs(), {}, value))
+      {
+        initialization = instruction;
+        initial_value = value;
+        ++initializations;
+      }
+    }
+    irep_idt callee;
+    if(
+      direct_call_identifier(*instruction, callee) &&
+      callee == "__VERIFIER_assert")
+    {
+      if(
+        positions.at(&*instruction) <= positions.at(&*join) ||
+        instruction->call_arguments().size() != 1 ||
+        !uses_only_object_and_constants(
+          instruction->call_arguments().front(),
+          main_loop.object))
+      {
+        reason = "lock_property_scope";
+        return false;
+      }
+      property = instruction;
+      ++property_calls;
+    }
+  }
+  if(initializations != 1 || property_calls != 1)
+  {
+    reason = "lock_property_shape";
+    return false;
+  }
+
+  std::set<const goto_programt::instructiont *> allowed =
+    main_loop.covered;
+  allowed.insert(
+    worker_loop.covered.begin(),
+    worker_loop.covered.end());
+  allowed.insert(&*initialization);
+  allowed.insert(&*property);
+  std::size_t assertions = 0;
+  std::size_t all_creates = 0;
+  std::size_t all_joins = 0;
+  std::size_t builtin_worker_dispatches = 0;
+  for(const auto &function : model.goto_functions.function_map)
+  {
+    if(!function.second.body_available())
+      continue;
+    for(const auto &instruction : function.second.body.instructions)
+    {
+      assertions += instruction.is_assert() ? 1 : 0;
+      irep_idt callee;
+      if(direct_call_identifier(instruction, callee))
+      {
+        if(callee == "pthread_create")
+          ++all_creates;
+        else if(callee == "pthread_join")
+          ++all_joins;
+        else if(callee == worker_loop.function)
+        {
+          if(function.first != "__spawned_thread")
+          {
+            reason = "lock_direct_worker_call";
+            return false;
+          }
+          ++builtin_worker_dispatches;
+        }
+      }
+      const bool mentions =
+        contains_symbol(
+          instruction.code(), {main_loop.object}) ||
+        (instruction.has_condition() &&
+         contains_symbol(
+           instruction.condition(), {main_loop.object}));
+      const bool mentions_mutex =
+        contains_symbol(
+          instruction.code(), {main_loop.mutex}) ||
+        (instruction.has_condition() &&
+         contains_symbol(
+           instruction.condition(), {main_loop.mutex}));
+      if(
+        contains_address_of_symbol(
+          instruction.code(), {main_loop.object}) ||
+        (instruction.has_condition() &&
+         contains_address_of_symbol(
+           instruction.condition(), {main_loop.object})))
+      {
+        reason = "lock_object_alias";
+        return false;
+      }
+      if(mentions && allowed.find(&instruction) == allowed.end())
+      {
+        if(
+          function.first == "__CPROVER_initialize" &&
+          instruction.is_assign())
+          continue;
+        reason = "lock_extra_object_access";
+        return false;
+      }
+      if(
+        mentions_mutex &&
+        allowed.find(&instruction) == allowed.end())
+      {
+        if(
+          function.first == "__CPROVER_initialize" &&
+          instruction.is_assign())
+          continue;
+        reason = "lock_extra_mutex_access";
+        return false;
+      }
+    }
+  }
+  if(assertions != 1)
+  {
+    reason = "lock_property_count";
+    return false;
+  }
+  if(
+    all_creates != 1 || all_joins != 1 ||
+    builtin_worker_dispatches != 1)
+  {
+    reason = "lock_global_lifecycle";
+    return false;
+  }
+
+  const symbolt *object_symbol = nullptr;
+  const symbolt *mutex_symbol = nullptr;
+  if(
+    ns.lookup(main_loop.object, object_symbol) ||
+    ns.lookup(main_loop.mutex, mutex_symbol) ||
+    !object_symbol->is_static_lifetime ||
+    !mutex_symbol->is_static_lifetime ||
+    object_symbol->is_type || mutex_symbol->is_type)
+  {
+    reason = "lock_symbol_types";
+    return false;
+  }
+  return true;
+}
+
 void collect_zero_equalities(
   const exprt &src,
   std::map<irep_idt, std::set<irep_idt>> &equalities,
@@ -2135,6 +2760,169 @@ bool inline_error_bound(
   return true;
 }
 } // namespace
+
+bool lock_scoped_commutative_aggregation_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  auto main =
+    goto_model.goto_functions.function_map.find("main");
+  if(
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+    return false;
+
+  goto_programt::targett create =
+    main->second.body.instructions.end();
+  goto_programt::targett join =
+    main->second.body.instructions.end();
+  irep_idt handle;
+  irep_idt worker;
+  std::size_t creates = 0;
+  std::size_t joins = 0;
+  std::string reason;
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != main->second.body.instructions.end(); ++instruction)
+  {
+    irep_idt callee;
+    if(!direct_call_identifier(*instruction, callee))
+      continue;
+    if(callee == "pthread_create")
+    {
+      irep_idt candidate_handle;
+      irep_idt candidate_worker;
+      if(
+        instruction->call_arguments().size() < 3 ||
+        !addressed_symbol(
+          instruction->call_arguments()[0], candidate_handle) ||
+        !addressed_symbol(
+          instruction->call_arguments()[2], candidate_worker))
+      {
+        reason = "lock_create_resolution";
+        break;
+      }
+      handle = candidate_handle;
+      worker = candidate_worker;
+      create = instruction;
+      ++creates;
+    }
+    else if(callee == "pthread_join")
+    {
+      irep_idt candidate_handle;
+      if(
+        instruction->call_arguments().empty() ||
+        !direct_symbol(
+          instruction->call_arguments().front(),
+          candidate_handle) ||
+        candidate_handle != handle)
+      {
+        reason = "lock_join_resolution";
+        break;
+      }
+      join = instruction;
+      ++joins;
+    }
+  }
+  if(
+    !reason.empty() || creates != 1 || joins != 1 ||
+    create == main->second.body.instructions.end() ||
+    join == main->second.body.instructions.end())
+  {
+    if(reason.empty())
+      reason = "lock_lifecycle";
+    std::cout << "NATIVE_LOCK_AGGREGATION applied=0 reason="
+              << reason << '\n';
+    return false;
+  }
+
+  locked_loop_summaryt main_loop;
+  locked_loop_summaryt worker_loop;
+  if(
+    !parse_locked_affine_loop(
+      "main", goto_model, ns, main_loop, reason) ||
+    !parse_locked_affine_loop(
+      worker, goto_model, ns, worker_loop, reason) ||
+    main_loop.object != worker_loop.object ||
+    main_loop.mutex != worker_loop.mutex)
+  {
+    if(reason.empty())
+      reason = "lock_protocol_mismatch";
+    std::cout << "NATIVE_LOCK_AGGREGATION applied=0 reason="
+              << reason << '\n';
+    return false;
+  }
+
+  goto_programt::targett initialization =
+    main->second.body.instructions.end();
+  mp_integer initial_value;
+  if(!validate_lock_aggregate_property(
+       goto_model,
+       ns,
+       main_loop,
+       worker_loop,
+       create,
+       join,
+       initialization,
+       initial_value,
+       reason))
+  {
+    std::cout << "NATIVE_LOCK_AGGREGATION applied=0 reason="
+              << reason << '\n';
+    return false;
+  }
+
+  const mp_integer main_total =
+    main_loop.count * main_loop.delta;
+  const mp_integer worker_total =
+    worker_loop.count * worker_loop.delta;
+  const mp_integer positive_total =
+    std::max(mp_integer(0), main_total) +
+    std::max(mp_integer(0), worker_total);
+  const mp_integer negative_total =
+    std::min(mp_integer(0), main_total) +
+    std::min(mp_integer(0), worker_total);
+  const mp_integer final_value =
+    initial_value + main_total + worker_total;
+  const symbolt &object_symbol =
+    ns.lookup(main_loop.object);
+  if(
+    !integer_value_fits(
+      initial_value + positive_total, object_symbol.type) ||
+    !integer_value_fits(
+      initial_value + negative_total, object_symbol.type) ||
+    !integer_value_fits(final_value, object_symbol.type))
+  {
+    std::cout
+      << "NATIVE_LOCK_AGGREGATION applied=0 reason=lock_overflow\n";
+    return false;
+  }
+
+  for(auto instruction = main_loop.loop_head;
+      instruction != std::next(main_loop.backedge); ++instruction)
+    instruction->turn_into_skip();
+  const auto location = join->source_location();
+  main->second.body.insert_after(
+    join,
+    goto_programt::make_assignment(
+      symbol_exprt(main_loop.object, object_symbol.type),
+      from_integer(final_value, object_symbol.type),
+      location));
+  create->turn_into_skip();
+  join->turn_into_skip();
+  goto_model.goto_functions.update();
+
+  std::cout
+    << "NATIVE_LOCK_AGGREGATION applied=1 object="
+    << main_loop.object << " mutex=" << main_loop.mutex
+    << " main_count=" << main_loop.count
+    << " worker_count=" << worker_loop.count
+    << " main_delta=" << main_loop.delta
+    << " worker_delta=" << worker_loop.delta
+    << " final=" << final_value << '\n';
+  (void)message_handler;
+  return true;
+}
 
 bool ticket_rank_serializability_transform(
   goto_modelt &goto_model,
