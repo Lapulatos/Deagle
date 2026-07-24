@@ -40,6 +40,7 @@ Author: Daniel Kroening, kroening@kroening.com
 #include <analyses/interference_predicate_cube.h>
 #include <analyses/cas_stability_analysis.h>
 #include <analyses/predicate_stability_analysis.h>
+#include <analyses/relational_order_analysis.h>
 #include <analyses/jces_analysis.h>
 #include <analyses/commuting_sequentialization.h>
 #include <analyses/extremum_cone_analysis.h>
@@ -557,6 +558,11 @@ int cbmc_parse_optionst::doit()
     cmdline.isset("native-jces") &&
     !cmdline.isset("unwind-suggest"))
   {
+    if(relational_order_law_proof(goto_model, ui_message_handler))
+    {
+      std::cout << "VERIFICATION SUCCESSFUL\n";
+      return CPROVER_EXIT_SUCCESS;
+    }
     if(extremum_cone_proof(goto_model, ui_message_handler))
     {
       std::cout << "VERIFICATION SUCCESSFUL\n";

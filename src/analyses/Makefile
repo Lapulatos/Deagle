@@ -36,6 +36,7 @@ SRC = ai.cpp \
       locals.cpp \
       predicate_stability_analysis.cpp \
       reaching_definitions.cpp \
+      relational_order_analysis.cpp \
       sese_regions.cpp \
       static_analysis.cpp \
       uncaught_exceptions_analysis.cpp \
