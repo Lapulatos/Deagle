@@ -14,6 +14,7 @@ Module: Join-Scoped Compositional Effect Summary
 #include <util/message.h>
 #include <util/namespace.h>
 #include <util/pointer_expr.h>
+#include <util/replace_expr.h>
 #include <util/simplify_expr.h>
 #include <util/std_code.h>
 #include <util/std_expr.h>
@@ -49,6 +50,21 @@ struct worker_summaryt
   irep_idt worker;
   exprt count;
   std::vector<effectt> effects;
+};
+
+struct transition_word_stept
+{
+  exprt guard;
+  exprt update;
+};
+
+struct transition_word_summaryt
+{
+  irep_idt worker;
+  irep_idt state;
+  irep_idt induction;
+  exprt bound;
+  std::vector<transition_word_stept> steps;
 };
 
 struct affine_worker_summaryt
@@ -3327,7 +3343,840 @@ bool inline_error_bound(
   failure_guard = guard;
   return true;
 }
+
+bool transition_word_error_function(
+  const irep_idt &identifier,
+  const goto_modelt &model)
+{
+  const auto function =
+    model.goto_functions.function_map.find(identifier);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+    return false;
+
+  std::size_t assertions = 0;
+  for(const auto &instruction : function->second.body.instructions)
+  {
+    if(instruction.is_assert())
+    {
+      if(!instruction.condition().is_false())
+        return false;
+      ++assertions;
+    }
+    else if(
+      instruction.is_assign() || instruction.is_function_call() ||
+      instruction.is_goto() || instruction.is_assume() ||
+      instruction.is_start_thread() || instruction.is_end_thread() ||
+      instruction.is_atomic_begin() || instruction.is_atomic_end())
+      return false;
+  }
+  return assertions == 1;
+}
+
+bool transition_word_property(
+  goto_modelt &model,
+  const namespacet &ns,
+  const std::vector<goto_programt::targett> &joins,
+  irep_idt &first,
+  irep_idt &second,
+  goto_programt::targett &error_call,
+  std::string &reason)
+{
+  auto main = model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != model.goto_functions.function_map.end(),
+    "lifecycle collection found main");
+
+  std::vector<goto_programt::targett> calls;
+  bool after_join = false;
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != main->second.body.instructions.end(); ++instruction)
+  {
+    if(instruction == joins.back())
+    {
+      after_join = true;
+      continue;
+    }
+    if(!after_join)
+      continue;
+    if(instruction->is_function_call())
+      calls.push_back(instruction);
+    else if(
+      instruction->is_assign() || instruction->is_goto() ||
+      instruction->is_assume() || instruction->is_assert() ||
+      instruction->is_start_thread() || instruction->is_end_thread() ||
+      instruction->is_atomic_begin() || instruction->is_atomic_end())
+    {
+      reason = "transition_post_join_effect";
+      return false;
+    }
+  }
+  if(calls.size() != 2)
+  {
+    reason = "transition_property_calls";
+    return false;
+  }
+
+  irep_idt guard_helper;
+  irep_idt error_function;
+  if(
+    !direct_call_identifier(*calls[0], guard_helper) ||
+    calls[0]->call_arguments().size() != 1 ||
+    !is_restricting_helper(guard_helper, model, ns) ||
+    !direct_call_identifier(*calls[1], error_function) ||
+    !calls[1]->call_arguments().empty() ||
+    !transition_word_error_function(error_function, model))
+  {
+    reason = "transition_property_shape";
+    return false;
+  }
+  error_call = calls[1];
+
+  std::size_t assertion_count = 0;
+  for(const auto &function_entry : model.goto_functions.function_map)
+  {
+    if(!function_entry.second.body_available())
+      continue;
+    for(const auto &instruction :
+        function_entry.second.body.instructions)
+    {
+      if(instruction.is_assert())
+      {
+        ++assertion_count;
+        if(function_entry.first != error_function)
+        {
+          reason = "transition_additional_property";
+          return false;
+        }
+      }
+    }
+  }
+  if(assertion_count != 1)
+  {
+    reason = "transition_property_count";
+    return false;
+  }
+
+  const exprt &bad =
+    without_cast(calls[0]->call_arguments().front());
+  if(
+    bad.id() != ID_notequal || bad.operands().size() != 2 ||
+    !direct_symbol(bad.op0(), first) ||
+    !direct_symbol(bad.op1(), second) || first == second)
+  {
+    reason = "transition_property_relation";
+    return false;
+  }
+  const symbolt *first_symbol = nullptr;
+  const symbolt *second_symbol = nullptr;
+  if(
+    !is_shared_scalar(without_cast(bad.op0()), ns, first_symbol) ||
+    !is_shared_scalar(without_cast(bad.op1()), ns, second_symbol) ||
+    first_symbol->type != second_symbol->type)
+  {
+    reason = "transition_property_state";
+    return false;
+  }
+  return true;
+}
+
+exprt transition_word_normalize(
+  exprt value,
+  const symbol_exprt &from,
+  const symbol_exprt &to,
+  const namespacet &ns)
+{
+  replace_expr(from, to, value);
+  simplify_expr(value, ns);
+  return value;
+}
+
+bool transition_word_bound_factor(
+  const exprt &src,
+  mp_integer &factor,
+  irep_idt &base)
+{
+  const exprt &bound = without_cast(src);
+  if(bound.id() != ID_mult || bound.operands().size() != 2)
+    return false;
+
+  mp_integer first_constant;
+  mp_integer second_constant;
+  irep_idt first_symbol;
+  irep_idt second_symbol;
+  if(
+    constant_eval(bound.op0(), {}, first_constant) &&
+    direct_symbol(bound.op1(), second_symbol))
+  {
+    factor = first_constant;
+    base = second_symbol;
+    return factor > 1;
+  }
+  if(
+    direct_symbol(bound.op0(), first_symbol) &&
+    constant_eval(bound.op1(), {}, second_constant))
+  {
+    factor = second_constant;
+    base = first_symbol;
+    return factor > 1;
+  }
+  return false;
+}
+
+bool transition_word_no_overflow_guard(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const goto_programt::targett &first_create,
+  const irep_idt &base,
+  const mp_integer &factor)
+{
+  const auto main =
+    model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != model.goto_functions.function_map.end(),
+    "lifecycle collection found main");
+  const symbolt *base_symbol = nullptr;
+  if(
+    ns.lookup(base, base_symbol) ||
+    base_symbol->type.id() != ID_unsignedbv)
+    return false;
+  const mp_integer range =
+    power(2, to_unsignedbv_type(base_symbol->type).get_width());
+
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != first_create; ++instruction)
+  {
+    irep_idt helper;
+    if(
+      !direct_call_identifier(*instruction, helper) ||
+      instruction->call_arguments().size() != 1 ||
+      !is_restricting_helper(helper, model, ns))
+      continue;
+    const exprt &relation =
+      without_cast(instruction->call_arguments().front());
+    if(
+      relation.id() != ID_lt ||
+      relation.operands().size() != 2)
+      continue;
+    irep_idt guarded;
+    const exprt &limit = without_cast(relation.op1());
+    if(
+      !direct_symbol(relation.op0(), guarded) ||
+      guarded != base || limit.id() != ID_div ||
+      limit.operands().size() != 2)
+      continue;
+    mp_integer numerator;
+    mp_integer denominator;
+    if(
+      constant_eval(limit.op0(), {}, numerator) &&
+      constant_eval(limit.op1(), {}, denominator) &&
+      numerator == range && denominator == factor)
+      return true;
+  }
+  return false;
+}
+
+bool transition_word_worker(
+  const irep_idt &worker,
+  const irep_idt &state,
+  const goto_modelt &model,
+  const namespacet &ns,
+  transition_word_summaryt &summary,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(worker);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "transition_missing_worker";
+    return false;
+  }
+  const auto &program = function->second.body;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : program.instructions)
+    positions.emplace(&instruction, position++);
+
+  auto backedge = program.instructions.end();
+  auto loop_head = program.instructions.end();
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(!instruction->is_goto())
+      continue;
+    if(instruction->targets.size() != 1)
+    {
+      reason = "transition_multi_target";
+      return false;
+    }
+    const bool backward =
+      positions.at(&*instruction->get_target()) <
+      positions.at(&*instruction);
+    if(backward)
+    {
+      if(
+        !instruction->condition().is_true() ||
+        backedge != program.instructions.end())
+      {
+        reason = "transition_backedge";
+        return false;
+      }
+      backedge = instruction;
+      loop_head = instruction->get_target();
+    }
+  }
+  if(backedge == program.instructions.end())
+  {
+    reason = "transition_no_loop";
+    return false;
+  }
+
+  irep_idt induction;
+  exprt bound;
+  if(!parse_exit_guard(*loop_head, induction, bound))
+  {
+    reason = "transition_loop_guard";
+    return false;
+  }
+  const symbolt *induction_symbol = nullptr;
+  if(
+    ns.lookup(induction, induction_symbol) ||
+    induction_symbol->type.id() != ID_unsignedbv)
+  {
+    reason = "transition_induction_type";
+    return false;
+  }
+
+  std::size_t initializations = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != loop_head; ++instruction)
+  {
+    if(parse_zero_initialization(*instruction, induction))
+      ++initializations;
+    else if(
+      instruction->is_assign() &&
+      without_cast(instruction->assign_lhs()).id() == ID_symbol &&
+      to_symbol_expr(without_cast(instruction->assign_lhs()))
+          .get_identifier() == induction)
+    {
+      reason = "transition_induction_initialization";
+      return false;
+    }
+  }
+  if(initializations != 1)
+  {
+    reason = "transition_induction_initialization";
+    return false;
+  }
+
+  std::vector<goto_programt::const_targett> body;
+  for(auto instruction = std::next(loop_head);
+      instruction != backedge; ++instruction)
+  {
+    if(
+      instruction->is_skip() || instruction->is_location() ||
+      instruction->is_decl() || instruction->is_dead())
+      continue;
+    if(instruction->is_goto())
+    {
+      reason = "transition_body_control";
+      return false;
+    }
+    body.push_back(instruction);
+  }
+  if(body.empty() || body.size() % 3 != 0)
+  {
+    reason = "transition_body_word";
+    return false;
+  }
+
+  const symbolt *state_symbol = nullptr;
+  const auto state_entry = model.symbol_table.symbols.find(state);
+  if(
+    state_entry == model.symbol_table.symbols.end() ||
+    !state_entry->second.is_static_lifetime)
+  {
+    reason = "transition_state_symbol";
+    return false;
+  }
+  state_symbol = &state_entry->second;
+
+  for(std::size_t index = 0; index < body.size(); index += 3)
+  {
+    irep_idt helper;
+    if(
+      !direct_call_identifier(*body[index], helper) ||
+      body[index]->call_arguments().size() != 1 ||
+      !is_restricting_helper(helper, model, ns))
+    {
+      reason = "transition_step_guard";
+      return false;
+    }
+    if(!body[index + 1]->is_assign())
+    {
+      reason = "transition_step_update";
+      return false;
+    }
+    irep_idt updated;
+    if(
+      !direct_symbol(body[index + 1]->assign_lhs(), updated) ||
+      updated != state ||
+      body[index + 1]->assign_lhs().type() != state_symbol->type)
+    {
+      reason = "transition_step_state";
+      return false;
+    }
+    irep_idt incremented;
+    if(
+      !parse_unit_increment(*body[index + 2], incremented) ||
+      incremented != induction)
+    {
+      reason = "transition_step_increment";
+      return false;
+    }
+    summary.steps.push_back(
+      {body[index]->call_arguments().front(),
+       body[index + 1]->assign_rhs()});
+  }
+
+  for(const auto &instruction : program.instructions)
+  {
+    if(instruction.is_assert() || instruction.is_assume() ||
+       instruction.is_start_thread() || instruction.is_atomic_begin() ||
+       instruction.is_atomic_end())
+    {
+      reason = "transition_worker_effect";
+      return false;
+    }
+    if(instruction.is_function_call())
+    {
+      const bool inside =
+        positions.at(&instruction) > positions.at(&*loop_head) &&
+        positions.at(&instruction) < positions.at(&*backedge);
+      irep_idt helper;
+      if(
+        !inside || !direct_call_identifier(instruction, helper) ||
+        !is_restricting_helper(helper, model, ns))
+      {
+        reason = "transition_worker_call";
+        return false;
+      }
+    }
+    if(!instruction.is_assign())
+      continue;
+    const exprt &lhs = without_cast(instruction.assign_lhs());
+    const symbolt *lhs_symbol = nullptr;
+    if(
+      is_shared_scalar(lhs, ns, lhs_symbol) &&
+      to_symbol_expr(lhs).get_identifier() != state)
+    {
+      reason = "transition_environment_write";
+      return false;
+    }
+    if(
+      lhs.id() == ID_dereference ||
+      (lhs.id() != ID_symbol && lhs.id() != ID_member &&
+       lhs.id() != ID_index))
+    {
+      reason = "transition_indirect_write";
+      return false;
+    }
+  }
+
+  summary.worker = worker;
+  summary.state = state;
+  summary.induction = induction;
+  summary.bound = bound;
+  return true;
+}
+
+bool transition_word_initial_and_accesses(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const std::vector<transition_word_summaryt> &summaries,
+  const irep_idt &first,
+  const irep_idt &second,
+  std::string &reason)
+{
+  const std::set<irep_idt> states{first, second};
+  const auto main =
+    model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != model.goto_functions.function_map.end(),
+    "lifecycle collection found main");
+
+  std::map<irep_idt, std::vector<exprt>> main_values;
+  bool create_seen = false;
+  for(const auto &instruction : main->second.body.instructions)
+  {
+    if(
+      contains_address_of_symbol(instruction.code(), states) ||
+      (instruction.has_condition() &&
+       contains_address_of_symbol(instruction.condition(), states)))
+    {
+      reason = "transition_state_alias";
+      return false;
+    }
+    irep_idt callee;
+    if(
+      direct_call_identifier(instruction, callee) &&
+      callee == "pthread_create")
+      create_seen = true;
+    if(!instruction.is_assign())
+      continue;
+    irep_idt target;
+    if(
+      direct_symbol(instruction.assign_lhs(), target) &&
+      states.find(target) != states.end())
+    {
+      if(create_seen)
+      {
+        reason = "transition_late_state_write";
+        return false;
+      }
+      main_values[target].push_back(instruction.assign_rhs());
+    }
+  }
+
+  exprt first_initial;
+  exprt second_initial;
+  if(main_values[first].empty() && main_values[second].empty())
+  {
+    std::map<irep_idt, std::vector<exprt>> initializer_values;
+    const auto initializer =
+      model.goto_functions.function_map.find("__CPROVER_initialize");
+    if(
+      initializer != model.goto_functions.function_map.end() &&
+      initializer->second.body_available())
+    {
+      for(const auto &instruction :
+          initializer->second.body.instructions)
+      {
+        if(!instruction.is_assign())
+          continue;
+        irep_idt target;
+        if(
+          direct_symbol(instruction.assign_lhs(), target) &&
+          states.find(target) != states.end())
+          initializer_values[target].push_back(
+            instruction.assign_rhs());
+      }
+    }
+    if(
+      initializer_values[first].size() == 1 &&
+      initializer_values[second].size() == 1)
+    {
+      first_initial = initializer_values[first].front();
+      second_initial = initializer_values[second].front();
+    }
+    else
+    {
+      const auto first_symbol =
+        model.symbol_table.symbols.find(first);
+      const auto second_symbol =
+        model.symbol_table.symbols.find(second);
+      if(
+        first_symbol == model.symbol_table.symbols.end() ||
+        second_symbol == model.symbol_table.symbols.end() ||
+        first_symbol->second.value.is_nil() ||
+        second_symbol->second.value.is_nil())
+      {
+        reason = "transition_static_initialization";
+        return false;
+      }
+      first_initial = first_symbol->second.value;
+      second_initial = second_symbol->second.value;
+    }
+  }
+  else
+  {
+    if(
+      main_values[first].size() != 1 ||
+      main_values[second].size() != 1)
+    {
+      reason = "transition_explicit_initialization";
+      return false;
+    }
+    first_initial = main_values[first].front();
+    second_initial = main_values[second].front();
+  }
+  simplify_expr(first_initial, ns);
+  simplify_expr(second_initial, ns);
+  if(first_initial != second_initial)
+  {
+    reason = "transition_initial_inequality";
+    return false;
+  }
+
+  std::map<irep_idt, irep_idt> owner;
+  for(const auto &summary : summaries)
+    owner[summary.state] = summary.worker;
+  if(owner.size() != 2)
+  {
+    reason = "transition_state_ownership";
+    return false;
+  }
+  for(const auto &function_entry : model.goto_functions.function_map)
+  {
+    if(!function_entry.second.body_available())
+      continue;
+    for(const auto &instruction :
+        function_entry.second.body.instructions)
+    {
+      if(
+        contains_address_of_symbol(instruction.code(), states) ||
+        (instruction.has_condition() &&
+         contains_address_of_symbol(instruction.condition(), states)))
+      {
+        reason = "transition_state_alias";
+        return false;
+      }
+      if(!instruction.is_assign())
+        continue;
+      irep_idt target;
+      if(
+        !direct_symbol(instruction.assign_lhs(), target) ||
+        states.find(target) == states.end())
+        continue;
+      if(
+        function_entry.first == "main" ||
+        function_entry.first == "__CPROVER_initialize")
+        continue;
+      if(function_entry.first != owner[target])
+      {
+        reason = "transition_foreign_state_write";
+        return false;
+      }
+    }
+  }
+  for(const auto &summary : summaries)
+  {
+    const auto worker =
+      model.goto_functions.function_map.find(summary.worker);
+    INVARIANT(
+      worker != model.goto_functions.function_map.end(),
+      "transition summary found worker");
+    std::set<irep_idt> foreign = states;
+    foreign.erase(summary.state);
+    for(const auto &instruction : worker->second.body.instructions)
+    {
+      if(
+        contains_symbol(instruction.code(), foreign) ||
+        (instruction.has_condition() &&
+         contains_symbol(instruction.condition(), foreign)))
+      {
+        reason = "transition_foreign_state_read";
+        return false;
+      }
+    }
+  }
+  return true;
+}
 } // namespace
+
+bool transition_word_equivalence_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  std::vector<create_recordt> creates;
+  std::vector<goto_programt::targett> joins;
+  std::string reason;
+  if(!collect_lifecycle(goto_model, ns, creates, joins, reason))
+  {
+    std::cout
+      << "NATIVE_TRANSITION_WORD applied=0 reason=" << reason << '\n';
+    return false;
+  }
+  if(creates.size() != 2)
+  {
+    std::cout
+      << "NATIVE_TRANSITION_WORD applied=0 reason=transition_create_count"
+      << " count=" << creates.size() << '\n';
+    return false;
+  }
+  if(!validate_main_region(goto_model, ns, creates, joins, reason))
+  {
+    std::cout
+      << "NATIVE_TRANSITION_WORD applied=0 reason=" << reason << '\n';
+    return false;
+  }
+
+  irep_idt first;
+  irep_idt second;
+  goto_programt::targett error_call;
+  if(!transition_word_property(
+       goto_model,
+       ns,
+       joins,
+       first,
+       second,
+       error_call,
+       reason))
+  {
+    std::cout
+      << "NATIVE_TRANSITION_WORD applied=0 reason=" << reason << '\n';
+    return false;
+  }
+
+  std::vector<transition_word_summaryt> summaries(2);
+  bool summarized = false;
+  for(std::size_t permutation = 0; permutation < 2; ++permutation)
+  {
+    std::vector<transition_word_summaryt> candidates(2);
+    const irep_idt &first_state =
+      permutation == 0 ? first : second;
+    const irep_idt &second_state =
+      permutation == 0 ? second : first;
+    std::string candidate_reason;
+    if(
+      transition_word_worker(
+        creates[0].worker,
+        first_state,
+        goto_model,
+        ns,
+        candidates[0],
+        candidate_reason) &&
+      transition_word_worker(
+        creates[1].worker,
+        second_state,
+        goto_model,
+        ns,
+        candidates[1],
+        candidate_reason))
+    {
+      summaries = std::move(candidates);
+      summarized = true;
+      break;
+    }
+    reason = candidate_reason;
+  }
+  if(!summarized)
+  {
+    std::cout
+      << "NATIVE_TRANSITION_WORD applied=0 reason=" << reason << '\n';
+    return false;
+  }
+
+  if(
+    !transition_word_initial_and_accesses(
+      goto_model, ns, summaries, first, second, reason))
+  {
+    std::cout
+      << "NATIVE_TRANSITION_WORD applied=0 reason=" << reason << '\n';
+    return false;
+  }
+
+  exprt first_bound = summaries[0].bound;
+  exprt second_bound = summaries[1].bound;
+  simplify_expr(first_bound, ns);
+  simplify_expr(second_bound, ns);
+  if(first_bound != second_bound)
+  {
+    std::cout
+      << "NATIVE_TRANSITION_WORD applied=0 reason=transition_bound_mismatch\n";
+    return false;
+  }
+
+  const std::size_t first_width = summaries[0].steps.size();
+  const std::size_t second_width = summaries[1].steps.size();
+  const std::size_t factor = std::max(first_width, second_width);
+  if(
+    std::min(first_width, second_width) != 1 ||
+    factor < 2 || factor > 64)
+  {
+    std::cout
+      << "NATIVE_TRANSITION_WORD applied=0 reason=transition_word_width"
+      << " first=" << first_width << " second=" << second_width << '\n';
+    return false;
+  }
+  mp_integer bound_factor;
+  irep_idt bound_base;
+  if(
+    !transition_word_bound_factor(
+      first_bound, bound_factor, bound_base) ||
+    bound_factor != factor)
+  {
+    std::cout
+      << "NATIVE_TRANSITION_WORD applied=0 reason=transition_bound_factor\n";
+    return false;
+  }
+  if(
+    !transition_word_no_overflow_guard(
+      goto_model,
+      ns,
+      creates.front().instruction,
+      bound_base,
+      bound_factor))
+  {
+    std::cout
+      << "NATIVE_TRANSITION_WORD applied=0 reason=transition_overflow_guard\n";
+    return false;
+  }
+
+  const std::size_t reference_index =
+    first_width == 1 ? 0 : 1;
+  const std::size_t expanded_index = 1 - reference_index;
+  const auto reference_symbol_entry =
+    goto_model.symbol_table.symbols.find(
+      summaries[reference_index].state);
+  const auto expanded_symbol_entry =
+    goto_model.symbol_table.symbols.find(
+      summaries[expanded_index].state);
+  INVARIANT(
+    reference_symbol_entry != goto_model.symbol_table.symbols.end() &&
+    expanded_symbol_entry != goto_model.symbol_table.symbols.end(),
+    "transition summaries use symbols");
+  const symbol_exprt reference_symbol(
+    summaries[reference_index].state,
+    reference_symbol_entry->second.type);
+  const symbol_exprt expanded_symbol(
+    summaries[expanded_index].state,
+    expanded_symbol_entry->second.type);
+  exprt reference_guard =
+    summaries[reference_index].steps.front().guard;
+  exprt reference_update =
+    summaries[reference_index].steps.front().update;
+  simplify_expr(reference_guard, ns);
+  simplify_expr(reference_update, ns);
+  for(const auto &step : summaries[expanded_index].steps)
+  {
+    const exprt guard = transition_word_normalize(
+      step.guard, expanded_symbol, reference_symbol, ns);
+    const exprt update = transition_word_normalize(
+      step.update, expanded_symbol, reference_symbol, ns);
+    if(guard != reference_guard || update != reference_update)
+    {
+      std::cout
+        << "NATIVE_TRANSITION_WORD applied=0"
+        << " reason=transition_step_mismatch\n";
+      return false;
+    }
+  }
+
+  auto main =
+    goto_model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != goto_model.goto_functions.function_map.end(),
+    "lifecycle collection found main");
+  for(auto &instruction : main->second.body.instructions)
+  {
+    if(!instruction.is_end_function())
+      instruction.turn_into_skip();
+  }
+  error_call->turn_into_skip();
+  goto_model.goto_functions.update();
+
+  std::cout
+    << "NATIVE_TRANSITION_WORD applied=1 workers=2 factor="
+    << factor << " state_first=" << first
+    << " state_second=" << second << '\n';
+  (void)message_handler;
+  return true;
+}
 
 bool lock_linearization_stability_transform(
   goto_modelt &goto_model,

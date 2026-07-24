@@ -10,6 +10,13 @@ Module: Join-Scoped Compositional Effect Summary
 class goto_modelt;
 class message_handlert;
 
+/// Prove equality of two fully joined workers whose loop bodies spell the
+/// same guarded transition word at different unrolling factors. Unsupported
+/// programs are unchanged and return false.
+bool transition_word_equivalence_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 /// Replace a fully joined finite worker region by the composition of exact
 /// worker-loop translations over shared atomic scalars. Unsupported programs
 /// are left byte-for-byte unchanged and return false.

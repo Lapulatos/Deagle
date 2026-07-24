@@ -554,6 +554,8 @@ int cbmc_parse_optionst::doit()
       !lock_scoped_commutative_aggregation_transform(
         goto_model, ui_message_handler) &&
       !ticket_rank_serializability_transform(
+        goto_model, ui_message_handler) &&
+      !transition_word_equivalence_transform(
         goto_model, ui_message_handler))
       jces_transform(goto_model, ui_message_handler);
   }

@@ -56,6 +56,7 @@ def get_result(remove = True):
                 or line.startswith("NATIVE_ADAPTIVE_DISPATCH ")
                 or line.startswith("NATIVE_PACKED_DELTA_SHADOW ")
                 or line.startswith("NATIVE_RF_FIRST_BRANCHING ")
+                or line.startswith("NATIVE_TRANSITION_WORD ")
                 or line.startswith("NATIVE_JCES ")
                 or line.startswith("NATIVE_PREFIX_AFFINE ")
                 or line.startswith("NATIVE_TICKET_SERIALIZATION ")
