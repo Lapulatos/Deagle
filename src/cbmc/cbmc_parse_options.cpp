@@ -38,6 +38,7 @@ Author: Daniel Kroening, kroening@kroening.com
 
 #include <analyses/interference_predicate_analysis.h>
 #include <analyses/interference_predicate_cube.h>
+#include <analyses/cas_stability_analysis.h>
 #include <analyses/jces_analysis.h>
 #include <goto-checker/all_properties_verifier.h>
 #include <goto-checker/all_properties_verifier_with_fault_localization.h>
@@ -543,6 +544,8 @@ int cbmc_parse_optionst::doit()
     !cmdline.isset("unwind-suggest"))
   {
     if(
+      !cas_linearization_stability_transform(
+        goto_model, ui_message_handler) &&
       !lock_linearization_stability_transform(
         goto_model, ui_message_handler) &&
       !lock_scoped_commutative_aggregation_transform(
