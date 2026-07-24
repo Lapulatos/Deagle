@@ -71,6 +71,7 @@ Author: Daniel Kroening, kroening@kroening.com
 
 #include <goto-instrument/cover.h>
 #include <goto-instrument/full_slicer.h>
+#include <goto-instrument/nondet_bulk_init.h>
 #include <goto-instrument/nondet_static.h>
 #include <goto-instrument/reachability_slicer.h>
 
@@ -157,6 +158,9 @@ void cbmc_parse_optionst::get_command_line_options(optionst &options)
 
   if(cmdline.isset("mm-cutting"))
     options.set_option("mm-cutting", true);
+
+  if(cmdline.isset("deagle-nondet-bulk-init"))
+    options.set_option("deagle-nondet-bulk-init", true);
 
   if(cmdline.isset("allow-pointer-unsoundness") || cmdline.isset("refined-pointer-analysis"))
     options.set_option("allow-pointer-unsoundness", true);
@@ -853,6 +857,17 @@ bool cbmc_parse_optionst::process_goto_program(
     goto_model, log.get_message_handler(), cprover_cpp_library_factory);
   link_to_library(
     goto_model, log.get_message_handler(), cprover_c_library_factory);
+
+  if(options.get_bool_option("deagle-nondet-bulk-init"))
+  {
+    const auto stats = nondet_bulk_init(goto_model, log.get_message_handler());
+    log.status() << "Deagle nondet bulk init: candidates="
+                 << stats.candidate_loops << " transformed="
+                 << stats.transformed_loops << " rejected_non_prethread="
+                 << stats.rejected_non_prethread
+                 << " rejected_nonterminal="
+                 << stats.rejected_nonterminal << messaget::eom;
+  }
 
   // Common removal of types and complex constructs
   if(::process_goto_program(goto_model, options, log))

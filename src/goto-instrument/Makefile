@@ -56,6 +56,7 @@ SRC = accelerate/accelerate.cpp \
       mmio.cpp \
       model_argc_argv.cpp \
       nondet_static.cpp \
+      nondet_bulk_init.cpp \
       nondet_volatile.cpp \
       object_id.cpp \
       points_to.cpp \

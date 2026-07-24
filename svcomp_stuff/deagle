@@ -314,7 +314,10 @@ if "unreach-call.prp" in property_path:
 run_directory = tempfile.mkdtemp(prefix="deagle-")
 atexit.register(shutil.rmtree, run_directory, ignore_errors=True)
 os.chdir(run_directory)
-base_flags = "--refined-pointer-analysis --graphml-witness error-witness.graphml "
+base_flags = (
+    "--refined-pointer-analysis --graphml-witness error-witness.graphml "
+    "--deagle-nondet-bulk-init "
+)
 force_experiment_direct = "--deagle-experiment-direct" in sys.argv[3:]
 shallow_counterexample_prepass = (
     "--deagle-shallow-counterexample-prepass" in sys.argv[3:]
