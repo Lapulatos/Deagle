@@ -495,7 +495,12 @@ if lock_ego_prepass and "unreach-call.prp" in property_path:
         ego_args = (
             [deagle_exe_path, program_path]
             + shlex.split(flags)
-            + ["--native-lock-ego-abstraction"]
+            + [
+                "--native-lock-ego-abstraction",
+                "--unwind",
+                "16",
+                "--unwinding-assertions",
+            ]
         )
         try:
             with open(ego_output, "w") as output:
