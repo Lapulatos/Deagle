@@ -1665,6 +1665,1590 @@ bool no_addresses(
   }
   return true;
 }
+
+struct hom_propertyt
+{
+  irep_idt left_summary;
+  irep_idt right_summary;
+  irep_idt result_summary;
+  irep_idt operation;
+  irep_idt temporary;
+  bool minimum;
+  const goto_programt::instructiont *operation_call;
+  const goto_programt::instructiont *assumption;
+  const goto_programt::instructiont *error;
+
+  hom_propertyt()
+    : minimum(false),
+      operation_call(nullptr),
+      assumption(nullptr),
+      error(nullptr)
+  {
+  }
+};
+
+bool hom_relation(
+  const exprt &src,
+  irep_idt &result,
+  irep_idt &temporary,
+  bool &minimum)
+{
+  const exprt &relation = strip(src);
+  if(
+    (relation.id() != ID_gt && relation.id() != ID_lt) ||
+    relation.operands().size() != 2 ||
+    !symbol_id(relation.op0(), result) ||
+    !symbol_id(relation.op1(), temporary))
+    return false;
+  minimum = relation.id() == ID_lt;
+  return true;
+}
+
+bool find_hom_property(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const lifecyclet &life,
+  hom_propertyt &property,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::map<irep_idt, const goto_programt::instructiont *> value_calls;
+  std::size_t matches = 0;
+  std::size_t errors = 0;
+
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(call_id(instruction, callee) && is_reach_error(callee))
+      {
+        ++errors;
+        if(entry.first != ID_main)
+        {
+          reason = "hom_error_function";
+          return false;
+        }
+        property.error = &instruction;
+      }
+    }
+  }
+
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.last_join == nullptr ||
+      instruction.location_number <= life.last_join->location_number)
+      continue;
+    irep_idt callee;
+    if(!call_id(instruction, callee))
+      continue;
+    if(
+      !instruction.call_lhs().is_nil() &&
+      instruction.call_arguments().size() == 2)
+    {
+      irep_idt temporary;
+      if(symbol_id(instruction.call_lhs(), temporary))
+        value_calls[temporary] = &instruction;
+      continue;
+    }
+    if(!is_assume(callee) || instruction.call_arguments().size() != 1)
+      continue;
+
+    irep_idt result;
+    irep_idt temporary;
+    bool minimum = false;
+    if(
+      !hom_relation(
+        instruction.call_arguments().front(),
+        result,
+        temporary,
+        minimum))
+      continue;
+    const auto producer = value_calls.find(temporary);
+    if(producer == value_calls.end())
+      continue;
+    irep_idt operation;
+    irep_idt left;
+    irep_idt right;
+    if(
+      !call_id(*producer->second, operation) ||
+      !symbol_id(producer->second->call_arguments()[0], left) ||
+      !symbol_id(producer->second->call_arguments()[1], right) ||
+      !shared_signed(left, ns) || !shared_signed(right, ns) ||
+      !shared_signed(result, ns) || left == right || left == result ||
+      right == result)
+      continue;
+
+    ++matches;
+    property.left_summary = left;
+    property.right_summary = right;
+    property.result_summary = result;
+    property.operation = operation;
+    property.temporary = temporary;
+    property.minimum = minimum;
+    property.operation_call = producer->second;
+    property.assumption = &instruction;
+  }
+
+  if(
+    matches != 1 || errors != 1 || property.error == nullptr ||
+    property.operation_call == nullptr || property.assumption == nullptr ||
+    property.operation_call->location_number >=
+      property.assumption->location_number ||
+    property.assumption->location_number >= property.error->location_number)
+  {
+    reason = matches == 0 ? "hom_property" : "hom_property_ambiguous";
+    return false;
+  }
+  return true;
+}
+
+bool array_at(
+  const exprt &src,
+  const irep_idt &base,
+  const exprt &index)
+{
+  const exprt &expr = strip(src);
+  if(expr.id() != ID_dereference)
+    return false;
+  const exprt &pointer = strip(to_dereference_expr(expr).pointer());
+  if(pointer.id() != ID_plus || pointer.operands().size() != 2)
+    return false;
+  irep_idt candidate;
+  return
+    ((symbol_id(pointer.op0(), candidate) && candidate == base &&
+      strip(pointer.op1()) == strip(index)) ||
+     (symbol_id(pointer.op1(), candidate) && candidate == base &&
+     strip(pointer.op0()) == strip(index)));
+}
+
+bool array_at_zero(
+  const exprt &src,
+  const irep_idt &base)
+{
+  const exprt &expr = strip(src);
+  if(expr.id() != ID_dereference)
+    return false;
+  const exprt &pointer = strip(to_dereference_expr(expr).pointer());
+  if(pointer.id() != ID_plus || pointer.operands().size() != 2)
+    return false;
+  irep_idt candidate;
+  return
+    ((symbol_id(pointer.op0(), candidate) && candidate == base &&
+      value_is(pointer.op1(), 0)) ||
+     (symbol_id(pointer.op1(), candidate) && candidate == base &&
+      value_is(pointer.op0(), 0)));
+}
+
+bool array_symbol_index(
+  const exprt &src,
+  irep_idt &base,
+  irep_idt &index)
+{
+  const exprt &expr = strip(src);
+  if(expr.id() != ID_dereference)
+    return false;
+  const exprt &pointer = strip(to_dereference_expr(expr).pointer());
+  if(pointer.id() != ID_plus || pointer.operands().size() != 2)
+    return false;
+  irep_idt first;
+  irep_idt second;
+  if(
+    symbol_id(pointer.op0(), first) &&
+    symbol_id(pointer.op1(), second) && first != second)
+  {
+    base = first;
+    index = second;
+    return true;
+  }
+  return false;
+}
+
+struct hom_main_initt
+{
+  irep_idt left_base;
+  irep_idt right_base;
+  const goto_programt::instructiont *left_summary;
+  const goto_programt::instructiont *right_summary;
+  const goto_programt::instructiont *result_summary;
+
+  hom_main_initt()
+    : left_summary(nullptr), right_summary(nullptr), result_summary(nullptr)
+  {
+  }
+};
+
+bool find_hom_initial_summaries(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const hom_propertyt &property,
+  hom_main_initt &initial,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::size_t left = 0;
+  std::size_t right = 0;
+  std::size_t result = 0;
+
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create == nullptr ||
+      instruction.location_number >= life.first_create->location_number)
+      break;
+    if(instruction.is_assign())
+    {
+      irep_idt lhs;
+      irep_idt base;
+      if(!symbol_id(instruction.assign_lhs(), lhs))
+        continue;
+      if(
+        lhs == property.left_summary &&
+        base_pointer(instruction.assign_rhs(), base) &&
+        array_at_zero(instruction.assign_rhs(), base))
+      {
+        ++left;
+        initial.left_base = base;
+        initial.left_summary = &instruction;
+      }
+      else if(
+        lhs == property.right_summary &&
+        base_pointer(instruction.assign_rhs(), base) &&
+        array_at_zero(instruction.assign_rhs(), base))
+      {
+        ++right;
+        initial.right_base = base;
+        initial.right_summary = &instruction;
+      }
+    }
+
+    irep_idt callee;
+    if(
+      call_id(instruction, callee) &&
+      callee == property.operation &&
+      !instruction.call_lhs().is_nil() &&
+      instruction.call_arguments().size() == 2)
+    {
+      irep_idt lhs;
+      if(
+        symbol_id(instruction.call_lhs(), lhs) &&
+        lhs == property.result_summary &&
+        !initial.left_base.empty() && !initial.right_base.empty() &&
+        array_at_zero(
+          instruction.call_arguments()[0], initial.left_base) &&
+        array_at_zero(
+          instruction.call_arguments()[1], initial.right_base))
+      {
+        ++result;
+        initial.result_summary = &instruction;
+      }
+    }
+  }
+
+  if(
+    left != 1 || right != 1 || result != 1 ||
+    initial.left_base == initial.right_base)
+  {
+    reason = "hom_initial_summaries";
+    return false;
+  }
+  return true;
+}
+
+struct hom_loopt
+{
+  irep_idt induction;
+  irep_idt bound;
+  goto_programt::const_targett head;
+  std::set<const goto_programt::instructiont *> members;
+
+  hom_loopt() : head()
+  {
+  }
+};
+
+bool hom_loop_skeleton(
+  const goto_programt &program,
+  hom_loopt &result,
+  std::string &reason)
+{
+  natural_loopst loops;
+  loops(program);
+  if(loops.loop_map.size() != 1)
+  {
+    reason = "hom_loop_count";
+    return false;
+  }
+  result.head = loops.loop_map.begin()->first;
+  const auto &loop = loops.loop_map.begin()->second;
+  exprt bound;
+  if(
+    !parse_loop_exit(*result.head, result.induction, bound) ||
+    !symbol_id(bound, result.bound))
+  {
+    reason = "hom_loop_guard";
+    return false;
+  }
+
+  std::size_t initializations = 0;
+  std::size_t increments = 0;
+  std::size_t backedges = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(loop.contains(instruction))
+      result.members.insert(&*instruction);
+    if(instruction->is_assign())
+    {
+      irep_idt lhs;
+      if(
+        symbol_id(instruction->assign_lhs(), lhs) &&
+        lhs == result.induction)
+      {
+        if(
+          instruction->location_number < result.head->location_number &&
+          value_is(instruction->assign_rhs(), 1))
+          ++initializations;
+        else if(
+          loop.contains(instruction) &&
+          unit_increment(*instruction, result.induction))
+          ++increments;
+        else
+        {
+          reason = "hom_induction_write";
+          return false;
+        }
+      }
+    }
+    if(
+      instruction->is_goto() && loop.contains(instruction) &&
+      instruction != result.head &&
+      instruction->condition().is_true() &&
+      instruction->targets.size() == 1 &&
+      instruction->get_target() == result.head)
+      ++backedges;
+  }
+  if(initializations != 1 || increments != 1 || backedges != 1)
+  {
+    reason = "hom_loop_skeleton";
+    return false;
+  }
+  return true;
+}
+
+bool shared_symbol_lhs(
+  const goto_programt::instructiont &instruction,
+  const namespacet &ns,
+  irep_idt &identifier)
+{
+  if(
+    !instruction.is_assign() ||
+    !symbol_id(instruction.assign_lhs(), identifier))
+    return false;
+  const symbolt *symbol = lookup(identifier, ns);
+  return
+    symbol != nullptr && symbol->is_static_lifetime && !symbol->is_type;
+}
+
+struct hom_worker_resultt
+{
+  irep_idt bound;
+  irep_idt result_base;
+  irep_idt progress;
+  std::set<const goto_programt::instructiont *> writes;
+};
+
+bool hom_fold_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  const hom_propertyt &property,
+  const hom_main_initt &initial,
+  hom_worker_resultt &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  hom_loopt loop;
+  if(!hom_loop_skeleton(program, loop, reason))
+    return false;
+
+  std::vector<goto_programt::const_targett> updates;
+  std::size_t gotos = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_atomic_begin() || instruction->is_atomic_end())
+    {
+      reason = "hom_fold_atomic";
+      return false;
+    }
+    if(instruction->is_function_call())
+    {
+      reason = "hom_fold_call";
+      return false;
+    }
+    if(instruction->is_goto() && loop.members.count(&*instruction) != 0)
+      ++gotos;
+    if(!instruction->is_assign())
+      continue;
+    irep_idt lhs;
+    if(shared_symbol_lhs(*instruction, ns, lhs))
+    {
+      if(
+        lhs != property.left_summary &&
+        lhs != property.right_summary)
+      {
+        reason = "hom_fold_shared_write";
+        return false;
+      }
+      updates.push_back(instruction);
+      result.writes.insert(&*instruction);
+    }
+    else
+    {
+      irep_idt base;
+      if(base_pointer(instruction->assign_lhs(), base))
+      {
+        reason = "hom_fold_array_write";
+        return false;
+      }
+    }
+  }
+  if(updates.size() != 2 || gotos != 4)
+  {
+    reason = "hom_fold_shape";
+    return false;
+  }
+
+  bool left = false;
+  bool right = false;
+  const symbolt *induction_symbol = lookup(loop.induction, ns);
+  if(induction_symbol == nullptr)
+  {
+    reason = "hom_fold_induction_symbol";
+    return false;
+  }
+  const exprt induction =
+    symbol_exprt(loop.induction, induction_symbol->type);
+  for(const auto update : updates)
+  {
+    irep_idt summary;
+    if(!symbol_id(update->assign_lhs(), summary))
+      return false;
+    const irep_idt &base =
+      summary == property.left_summary
+        ? initial.left_base
+        : initial.right_base;
+    if(
+      !array_at(update->assign_rhs(), base, induction) ||
+      !guarded_direction(
+        program, update, summary, property.minimum))
+    {
+      reason = "hom_fold_update";
+      return false;
+    }
+    if(summary == property.left_summary)
+      left = true;
+    if(summary == property.right_summary)
+      right = true;
+  }
+  if(!left || !right)
+  {
+    reason = "hom_fold_summaries";
+    return false;
+  }
+  result.bound = loop.bound;
+  return true;
+}
+
+bool hom_producer_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  const hom_propertyt &property,
+  const hom_main_initt &initial,
+  hom_worker_resultt &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  hom_loopt loop;
+  if(!hom_loop_skeleton(program, loop, reason))
+    return false;
+
+  goto_programt::const_targett operation = program.instructions.end();
+  goto_programt::const_targett array_write = program.instructions.end();
+  goto_programt::const_targett progress_write = program.instructions.end();
+  std::size_t gotos = 0;
+  int atomic_depth = 0;
+  std::size_t atomic_begins = 0;
+  std::size_t atomic_ends = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_atomic_begin())
+    {
+      ++atomic_depth;
+      ++atomic_begins;
+      if(atomic_depth != 1)
+      {
+        reason = "hom_producer_atomic_nesting";
+        return false;
+      }
+      continue;
+    }
+    if(instruction->is_atomic_end())
+    {
+      --atomic_depth;
+      ++atomic_ends;
+      if(atomic_depth != 0)
+      {
+        reason = "hom_producer_atomic_balance";
+        return false;
+      }
+      continue;
+    }
+    if(instruction->is_goto() && loop.members.count(&*instruction) != 0)
+      ++gotos;
+    if(instruction->is_function_call())
+    {
+      irep_idt callee;
+      if(
+        atomic_depth != 1 || !call_id(*instruction, callee) ||
+        callee != property.operation ||
+        instruction->call_lhs().is_nil() ||
+        instruction->call_arguments().size() != 2)
+      {
+        reason = "hom_producer_call";
+        return false;
+      }
+      const symbolt *induction_symbol = lookup(loop.induction, ns);
+      if(induction_symbol == nullptr)
+      {
+        reason = "hom_producer_induction_symbol";
+        return false;
+      }
+      const exprt induction =
+        symbol_exprt(loop.induction, induction_symbol->type);
+      if(
+        !array_at(
+          instruction->call_arguments()[0],
+          initial.left_base,
+          induction) ||
+        !array_at(
+          instruction->call_arguments()[1],
+          initial.right_base,
+          induction))
+      {
+        reason = "hom_producer_arguments";
+        return false;
+      }
+      if(operation != program.instructions.end())
+      {
+        reason = "hom_producer_call_count";
+        return false;
+      }
+      operation = instruction;
+      continue;
+    }
+    if(!instruction->is_assign())
+      continue;
+
+    irep_idt lhs;
+    if(shared_symbol_lhs(*instruction, ns, lhs))
+    {
+      if(
+        atomic_depth != 1 ||
+        !unit_increment(*instruction, loop.induction))
+      {
+        const exprt &rhs = strip(instruction->assign_rhs());
+        irep_idt index;
+        if(
+          rhs.id() != ID_plus || rhs.operands().size() != 2 ||
+          !symbol_id(rhs.op0(), index) || index != loop.induction ||
+          !value_is(rhs.op1(), 1))
+        {
+          reason = "hom_progress_write";
+          return false;
+        }
+      }
+      if(progress_write != program.instructions.end())
+      {
+        reason = "hom_progress_count";
+        return false;
+      }
+      result.progress = lhs;
+      progress_write = instruction;
+      result.writes.insert(&*instruction);
+      continue;
+    }
+
+    irep_idt base;
+    irep_idt index;
+    if(array_symbol_index(instruction->assign_lhs(), base, index))
+    {
+      irep_idt temporary;
+      if(
+        atomic_depth != 1 || index != loop.induction ||
+        !symbol_id(instruction->assign_rhs(), temporary) ||
+        operation == program.instructions.end() ||
+        !symbol_id(operation->call_lhs(), lhs) || temporary != lhs)
+      {
+        reason = "hom_result_array_write";
+        return false;
+      }
+      if(array_write != program.instructions.end())
+      {
+        reason = "hom_result_array_count";
+        return false;
+      }
+      result.result_base = base;
+      array_write = instruction;
+      result.writes.insert(&*instruction);
+    }
+  }
+  if(
+    atomic_depth != 0 || atomic_begins != 1 || atomic_ends != 1 ||
+    gotos != 2 || operation == program.instructions.end() ||
+    array_write == program.instructions.end() ||
+    progress_write == program.instructions.end() ||
+    operation->location_number >= array_write->location_number ||
+    array_write->location_number >= progress_write->location_number ||
+    result.result_base == initial.left_base ||
+    result.result_base == initial.right_base)
+  {
+    reason = "hom_producer_shape";
+    return false;
+  }
+  result.bound = loop.bound;
+  return true;
+}
+
+bool hom_consumer_condition(
+  const exprt &src,
+  const irep_idt &induction,
+  const irep_idt &progress)
+{
+  const exprt &relation = strip(src);
+  irep_idt left;
+  irep_idt right;
+  return
+    relation.id() == ID_lt && relation.operands().size() == 2 &&
+    symbol_id(relation.op0(), left) && left == induction &&
+    symbol_id(relation.op1(), right) && right == progress;
+}
+
+bool hom_consumer_guard(
+  const exprt &src,
+  const irep_idt &condition)
+{
+  const exprt &outer = strip(src);
+  if(outer.id() != ID_not || outer.operands().size() != 1)
+    return false;
+  const exprt &relation = strip(outer.op0());
+  irep_idt symbol;
+  return
+    relation.id() == ID_notequal && relation.operands().size() == 2 &&
+    symbol_id(relation.op0(), symbol) && symbol == condition &&
+    value_is(relation.op1(), 0);
+}
+
+bool hom_consumer_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  const hom_propertyt &property,
+  const hom_worker_resultt &producer,
+  hom_worker_resultt &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  hom_loopt loop;
+  if(!hom_loop_skeleton(program, loop, reason))
+    return false;
+  if(loop.bound != producer.bound)
+  {
+    reason = "hom_consumer_bound";
+    return false;
+  }
+
+  goto_programt::const_targett condition_write =
+    program.instructions.end();
+  goto_programt::const_targett condition_guard =
+    program.instructions.end();
+  goto_programt::const_targett summary_write =
+    program.instructions.end();
+  irep_idt condition;
+  std::size_t gotos = 0;
+  int atomic_depth = 0;
+  std::size_t atomic_begins = 0;
+  std::size_t atomic_ends = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_atomic_begin())
+    {
+      ++atomic_depth;
+      ++atomic_begins;
+      if(atomic_depth != 1)
+      {
+        reason = "hom_consumer_atomic_nesting";
+        return false;
+      }
+      continue;
+    }
+    if(instruction->is_atomic_end())
+    {
+      --atomic_depth;
+      ++atomic_ends;
+      if(atomic_depth != 0)
+      {
+        reason = "hom_consumer_atomic_balance";
+        return false;
+      }
+      continue;
+    }
+    if(instruction->is_function_call())
+    {
+      reason = "hom_consumer_call";
+      return false;
+    }
+    if(instruction->is_goto() && loop.members.count(&*instruction) != 0)
+    {
+      ++gotos;
+      if(
+        instruction != loop.head &&
+        !instruction->condition().is_true() &&
+        condition_guard == program.instructions.end() &&
+        !condition.empty() &&
+        hom_consumer_guard(instruction->condition(), condition))
+        condition_guard = instruction;
+    }
+    if(!instruction->is_assign())
+      continue;
+    irep_idt lhs;
+    if(shared_symbol_lhs(*instruction, ns, lhs))
+    {
+      const symbolt *induction_symbol = lookup(loop.induction, ns);
+      if(
+        induction_symbol == nullptr ||
+        lhs != property.result_summary || atomic_depth != 1 ||
+        !array_at(
+          instruction->assign_rhs(),
+          producer.result_base,
+          symbol_exprt(loop.induction, induction_symbol->type)) ||
+        !guarded_direction(
+          program,
+          instruction,
+          property.result_summary,
+          property.minimum))
+      {
+        reason = "hom_consumer_summary";
+        return false;
+      }
+      if(summary_write != program.instructions.end())
+      {
+        reason = "hom_consumer_summary_count";
+        return false;
+      }
+      summary_write = instruction;
+      result.writes.insert(&*instruction);
+      continue;
+    }
+
+    if(
+      symbol_id(instruction->assign_lhs(), lhs) &&
+      hom_consumer_condition(
+        instruction->assign_rhs(), loop.induction, producer.progress))
+    {
+      if(
+        atomic_depth != 1 ||
+        condition_write != program.instructions.end())
+      {
+        reason = "hom_consumer_condition_count";
+        return false;
+      }
+      condition = lhs;
+      condition_write = instruction;
+      continue;
+    }
+
+    irep_idt base;
+    if(base_pointer(instruction->assign_lhs(), base))
+    {
+      reason = "hom_consumer_array_write";
+      return false;
+    }
+  }
+  if(
+    atomic_depth != 0 || atomic_begins != 2 || atomic_ends != 2 ||
+    gotos != 4 || condition_write == program.instructions.end() ||
+    condition_guard == program.instructions.end() ||
+    summary_write == program.instructions.end() ||
+    condition_write->location_number >= condition_guard->location_number ||
+    condition_guard->location_number >= summary_write->location_number)
+  {
+    reason = "hom_consumer_shape";
+    return false;
+  }
+  result.bound = loop.bound;
+  return true;
+}
+
+bool relation_zero(
+  const exprt &src,
+  const irep_idt &symbol,
+  const irep_idt &relation_id)
+{
+  const exprt &relation = strip(src);
+  irep_idt candidate;
+  return
+    relation.id() == relation_id && relation.operands().size() == 2 &&
+    symbol_id(relation.op0(), candidate) && candidate == symbol &&
+    value_is(relation.op1(), 0);
+}
+
+bool overflow_half(
+  const exprt &src,
+  const irep_idt &left,
+  const irep_idt &right,
+  bool lower)
+{
+  const exprt &root = strip(src);
+  if(root.id() != ID_or || root.operands().size() != 2)
+    return false;
+  for(unsigned order = 0; order < 2; ++order)
+  {
+    const exprt &sign = strip(root.operands()[order]);
+    const exprt &bound = strip(root.operands()[1 - order]);
+    const irep_idt sign_relation = lower ? ID_ge : ID_le;
+    const irep_idt bound_relation = lower ? ID_ge : ID_le;
+    if(!relation_zero(sign, right, sign_relation))
+      continue;
+    if(
+      bound.id() != bound_relation || bound.operands().size() != 2)
+      continue;
+    irep_idt candidate;
+    if(!symbol_id(bound.op0(), candidate) || candidate != left)
+      continue;
+    const exprt &difference = strip(bound.op1());
+    if(difference.id() != ID_minus || difference.operands().size() != 2)
+      continue;
+    mp_integer constant;
+    irep_idt rhs;
+    if(
+      integer_constant(difference.op0(), constant) &&
+      symbol_id(difference.op1(), rhs) && rhs == right &&
+      constant ==
+        (lower ? -power(2, 31) : power(2, 31) - 1))
+      return true;
+  }
+  return false;
+}
+
+bool signed_addition_helper(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &operation,
+  std::string &reason)
+{
+  const symbolt *symbol = lookup(operation, ns);
+  const auto function =
+    model.goto_functions.function_map.find(operation);
+  if(
+    symbol == nullptr || symbol->type.id() != ID_code ||
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "hom_operation_body";
+    return false;
+  }
+  const auto &parameters =
+    to_code_type(symbol->type).parameters();
+  if(
+    parameters.size() != 2 ||
+    parameters[0].type().id() != ID_signedbv ||
+    parameters[1].type().id() != ID_signedbv ||
+    to_signedbv_type(parameters[0].type()).get_width() != 32 ||
+    to_signedbv_type(parameters[1].type()).get_width() != 32)
+  {
+    reason = "hom_operation_type";
+    return false;
+  }
+  const irep_idt left = parameters[0].get_identifier();
+  const irep_idt right = parameters[1].get_identifier();
+  std::size_t assumes = 0;
+  std::size_t returns = 0;
+  bool lower = false;
+  bool upper = false;
+  for(const auto &instruction : function->second.body.instructions)
+  {
+    irep_idt callee;
+    if(call_id(instruction, callee))
+    {
+      if(!is_assume(callee) || instruction.call_arguments().size() != 1)
+      {
+        reason = "hom_operation_call";
+        return false;
+      }
+      ++assumes;
+      lower =
+        lower ||
+        overflow_half(
+          instruction.call_arguments().front(), left, right, true);
+      upper =
+        upper ||
+        overflow_half(
+          instruction.call_arguments().front(), left, right, false);
+    }
+    else if(instruction.is_set_return_value())
+    {
+      const exprt &value = strip(instruction.return_value());
+      irep_idt lhs;
+      irep_idt rhs;
+      if(
+        value.id() != ID_plus || value.operands().size() != 2 ||
+        !symbol_id(value.op0(), lhs) || lhs != left ||
+        !symbol_id(value.op1(), rhs) || rhs != right)
+      {
+        reason = "hom_operation_return";
+        return false;
+      }
+      ++returns;
+    }
+    else if(
+      instruction.is_assign() || instruction.is_goto() ||
+      instruction.is_assert() || instruction.is_assume() ||
+      instruction.is_atomic_begin() || instruction.is_atomic_end() ||
+      instruction.is_start_thread() || instruction.is_end_thread())
+    {
+      reason = "hom_operation_effect";
+      return false;
+    }
+  }
+  if(assumes != 2 || returns != 1 || !lower || !upper)
+  {
+    reason = "hom_operation_overflow";
+    return false;
+  }
+  return true;
+}
+
+struct hom_main_statet
+{
+  irep_idt allocator;
+  const goto_programt::instructiont *bound_init;
+  const goto_programt::instructiont *progress_init;
+  std::set<const goto_programt::instructiont *> base_initializers;
+
+  hom_main_statet() : bound_init(nullptr), progress_init(nullptr)
+  {
+  }
+};
+
+bool hom_main_obligations(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const hom_propertyt &property,
+  const hom_main_initt &initial,
+  const hom_worker_resultt &producer,
+  hom_main_statet &state,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::size_t positive_bounds = 0;
+  std::size_t progress_inits = 0;
+  std::map<irep_idt, const goto_programt::instructiont *> bases;
+  irep_idt allocator;
+
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr &&
+      instruction.location_number >= life.first_create->location_number)
+      break;
+    if(instruction.is_assign())
+    {
+      irep_idt lhs;
+      if(!symbol_id(instruction.assign_lhs(), lhs))
+        continue;
+      if(lhs == producer.bound)
+      {
+        if(state.bound_init != nullptr)
+        {
+          reason = "hom_bound_init_count";
+          return false;
+        }
+        state.bound_init = &instruction;
+      }
+      if(
+        lhs == producer.progress &&
+        value_is(instruction.assign_rhs(), 1))
+      {
+        ++progress_inits;
+        state.progress_init = &instruction;
+      }
+    }
+
+    irep_idt callee;
+    if(!call_id(instruction, callee))
+      continue;
+    if(
+      is_assume(callee) && instruction.call_arguments().size() == 1 &&
+      relation_zero(
+        instruction.call_arguments().front(), producer.bound, ID_gt))
+      ++positive_bounds;
+    irep_idt lhs;
+    if(
+      !instruction.call_lhs().is_nil() &&
+      symbol_id(instruction.call_lhs(), lhs) &&
+      (lhs == initial.left_base || lhs == initial.right_base ||
+       lhs == producer.result_base))
+    {
+      const irep_idt initialized_base = lhs;
+      irep_idt argument;
+      if(
+        instruction.call_arguments().size() != 1 ||
+        !symbol_id(instruction.call_arguments().front(), argument) ||
+        argument != producer.bound)
+      {
+        reason = "hom_array_initializer_bound";
+        return false;
+      }
+      if(allocator.empty())
+        allocator = callee;
+      else if(allocator != callee)
+      {
+        reason = "hom_array_initializer";
+        return false;
+      }
+      if(!bases.emplace(initialized_base, &instruction).second)
+      {
+        reason = "hom_array_initializer_count";
+        return false;
+      }
+      state.base_initializers.insert(&instruction);
+    }
+  }
+  if(
+    state.bound_init == nullptr || positive_bounds != 1 ||
+    progress_inits != 1 || bases.size() != 3 ||
+    bases.count(initial.left_base) == 0 ||
+    bases.count(initial.right_base) == 0 ||
+    bases.count(producer.result_base) == 0)
+  {
+    reason = "hom_main_initialization";
+    return false;
+  }
+  state.allocator = allocator;
+
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr && life.last_join != nullptr &&
+      instruction.location_number >= life.first_create->location_number &&
+      instruction.location_number <= life.last_join->location_number)
+    {
+      if(
+        instruction.is_assign() || instruction.is_goto() ||
+        instruction.is_assert() || instruction.is_assume() ||
+        instruction.is_atomic_begin() || instruction.is_atomic_end())
+      {
+        reason = "hom_main_concurrent_effect";
+        return false;
+      }
+      irep_idt callee;
+      if(
+        call_id(instruction, callee) &&
+        !is_create(callee) && !is_join(callee))
+      {
+        reason = "hom_main_concurrent_call";
+        return false;
+      }
+    }
+    if(
+      life.last_join != nullptr &&
+      instruction.location_number > life.last_join->location_number)
+    {
+      if(
+        instruction.is_assign() || instruction.is_goto() ||
+        instruction.is_assert() || instruction.is_assume() ||
+        instruction.is_atomic_begin() || instruction.is_atomic_end())
+      {
+        reason = "hom_main_postjoin_control";
+        return false;
+      }
+      irep_idt callee;
+      if(
+        call_id(instruction, callee) &&
+        &instruction != property.operation_call &&
+        &instruction != property.assumption &&
+        &instruction != property.error)
+      {
+        reason = "hom_main_postjoin_call";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool allocation_size(
+  const exprt &src,
+  const irep_idt &size_parameter)
+{
+  const exprt &product = strip(src);
+  if(product.id() != ID_mult || product.operands().size() != 2)
+    return false;
+  for(unsigned order = 0; order < 2; ++order)
+  {
+    irep_idt candidate;
+    if(
+      value_is(product.operands()[order], 4) &&
+      symbol_id(product.operands()[1 - order], candidate) &&
+      candidate == size_parameter)
+      return true;
+  }
+  return false;
+}
+
+bool allocation_upper_bound(
+  const exprt &src,
+  const irep_idt &size_parameter)
+{
+  const exprt &relation = strip(src);
+  if(relation.id() != ID_le || relation.operands().size() != 2)
+    return false;
+  irep_idt candidate;
+  if(
+    !symbol_id(relation.op0(), candidate) ||
+    candidate != size_parameter)
+    return false;
+  const exprt &division = strip(relation.op1());
+  if(division.id() != ID_div || division.operands().size() != 2)
+    return false;
+  mp_integer numerator;
+  return
+    integer_constant(division.op0(), numerator) &&
+    numerator == power(2, 32) - 1 &&
+    value_is(division.op1(), 4);
+}
+
+bool fresh_array_allocator(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &allocator,
+  std::string &reason)
+{
+  const symbolt *symbol = lookup(allocator, ns);
+  const auto function =
+    model.goto_functions.function_map.find(allocator);
+  if(
+    symbol == nullptr || symbol->type.id() != ID_code ||
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "hom_allocator_body";
+    return false;
+  }
+  const auto &parameters = to_code_type(symbol->type).parameters();
+  if(
+    parameters.size() != 1 ||
+    parameters[0].type().id() != ID_signedbv ||
+    to_signedbv_type(parameters[0].type()).get_width() != 32)
+  {
+    reason = "hom_allocator_type";
+    return false;
+  }
+  const irep_idt size_parameter =
+    parameters.front().get_identifier();
+  const auto &program = function->second.body;
+  natural_loopst loops;
+  loops(program);
+  if(loops.loop_map.size() != 1)
+  {
+    reason = "hom_allocator_loop_count";
+    return false;
+  }
+  const auto loop_head = loops.loop_map.begin()->first;
+  const auto &loop = loops.loop_map.begin()->second;
+  irep_idt induction;
+  exprt bound;
+  if(
+    !parse_loop_exit(*loop_head, induction, bound) ||
+    !contains_symbol(bound, size_parameter))
+  {
+    reason = "hom_allocator_loop_guard";
+    return false;
+  }
+
+  irep_idt malloc_temporary;
+  irep_idt result_pointer;
+  irep_idt nondet_value;
+  std::size_t malloc_calls = 0;
+  std::size_t pointer_assignments = 0;
+  std::size_t returns = 0;
+  std::size_t zero_initializations = 0;
+  std::size_t increments = 0;
+  std::size_t backedges = 0;
+  std::size_t element_writes = 0;
+  std::size_t nondet_values = 0;
+  std::size_t upper_bounds = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    irep_idt callee;
+    if(call_id(*instruction, callee))
+    {
+      if(is_named(callee, "malloc"))
+      {
+        if(
+          instruction->call_lhs().is_nil() ||
+          instruction->call_arguments().size() != 1 ||
+          !symbol_id(instruction->call_lhs(), malloc_temporary) ||
+          !allocation_size(
+            instruction->call_arguments().front(), size_parameter))
+        {
+          reason = "hom_allocator_malloc";
+          return false;
+        }
+        ++malloc_calls;
+      }
+      else if(
+        is_assume(callee) &&
+        instruction->call_arguments().size() == 1)
+      {
+        if(
+          allocation_upper_bound(
+            instruction->call_arguments().front(), size_parameter))
+          ++upper_bounds;
+      }
+      else
+      {
+        reason = "hom_allocator_call";
+        return false;
+      }
+    }
+    else if(instruction->is_set_return_value())
+    {
+      irep_idt returned;
+      if(
+        !symbol_id(instruction->return_value(), returned) ||
+        returned != result_pointer)
+      {
+        reason = "hom_allocator_return";
+        return false;
+      }
+      ++returns;
+    }
+    else if(instruction->is_assign())
+    {
+      irep_idt lhs;
+      if(shared_symbol_lhs(*instruction, ns, lhs))
+      {
+        reason = "hom_allocator_shared_write";
+        return false;
+      }
+      if(symbol_id(instruction->assign_lhs(), lhs))
+      {
+        if(lhs == induction)
+        {
+          if(
+            instruction->location_number < loop_head->location_number &&
+            value_is(instruction->assign_rhs(), 0))
+            ++zero_initializations;
+          else if(
+            loop.contains(instruction) &&
+            unit_increment(*instruction, induction))
+            ++increments;
+          else
+          {
+            reason = "hom_allocator_induction";
+            return false;
+          }
+        }
+        else
+        {
+          irep_idt rhs;
+          if(
+            symbol_id(instruction->assign_rhs(), rhs) &&
+            rhs == malloc_temporary)
+          {
+            result_pointer = lhs;
+            ++pointer_assignments;
+          }
+          else if(
+            contains_side_effect(instruction->assign_rhs()) &&
+            loop.contains(instruction))
+          {
+            nondet_value = lhs;
+            ++nondet_values;
+          }
+        }
+      }
+      irep_idt base;
+      irep_idt index;
+      if(array_symbol_index(instruction->assign_lhs(), base, index))
+      {
+        if(base != result_pointer)
+        {
+          reason = "hom_allocator_element_base";
+          return false;
+        }
+        if(index != induction)
+        {
+          reason = "hom_allocator_element_index";
+          return false;
+        }
+        irep_idt value;
+        if(
+          !symbol_id(instruction->assign_rhs(), value) ||
+          value != nondet_value)
+        {
+          reason = "hom_allocator_element_value";
+          return false;
+        }
+        if(!loop.contains(instruction))
+        {
+          reason = "hom_allocator_element_scope";
+          return false;
+        }
+        ++element_writes;
+      }
+    }
+    else if(
+      instruction->is_goto() && loop.contains(instruction) &&
+      instruction != loop_head)
+    {
+      if(
+        instruction->condition().is_true() &&
+        instruction->targets.size() == 1 &&
+        instruction->get_target() == loop_head)
+        ++backedges;
+      else
+      {
+        reason = "hom_allocator_control";
+        return false;
+      }
+    }
+    else if(
+      instruction->is_assert() || instruction->is_assume() ||
+      instruction->is_atomic_begin() || instruction->is_atomic_end() ||
+      instruction->is_start_thread() || instruction->is_end_thread() ||
+      instruction->is_other() || instruction->is_throw() ||
+      instruction->is_catch())
+    {
+      reason = "hom_allocator_effect";
+      return false;
+    }
+  }
+  if(
+    malloc_calls != 1 || pointer_assignments != 1 || returns != 1 ||
+    zero_initializations != 1 || increments != 1 || backedges != 1 ||
+    element_writes != 1 || nondet_values != 1 || upper_bounds != 1)
+  {
+    reason = "hom_allocator_shape";
+    return false;
+  }
+  return true;
+}
+
+bool hom_global_writes(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const lifecyclet &life,
+  const hom_propertyt &property,
+  const hom_main_initt &initial,
+  const hom_worker_resultt &fold,
+  const hom_worker_resultt &producer,
+  const hom_worker_resultt &consumer,
+  const hom_main_statet &main_state,
+  std::string &reason)
+{
+  const std::set<irep_idt> symbols = {
+    property.left_summary,
+    property.right_summary,
+    property.result_summary,
+    initial.left_base,
+    initial.right_base,
+    producer.result_base,
+    producer.progress,
+    producer.bound};
+  std::set<const goto_programt::instructiont *> allowed = fold.writes;
+  allowed.insert(producer.writes.begin(), producer.writes.end());
+  allowed.insert(consumer.writes.begin(), consumer.writes.end());
+  allowed.insert(initial.left_summary);
+  allowed.insert(initial.right_summary);
+  allowed.insert(initial.result_summary);
+  allowed.insert(main_state.bound_init);
+  allowed.insert(main_state.progress_init);
+  allowed.insert(
+    main_state.base_initializers.begin(),
+    main_state.base_initializers.end());
+
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      const exprt *lhs = nullptr;
+      if(instruction.is_assign())
+        lhs = &instruction.assign_lhs();
+      else if(
+        instruction.is_function_call() &&
+        !instruction.call_lhs().is_nil())
+        lhs = &instruction.call_lhs();
+      if(lhs == nullptr)
+        continue;
+
+      irep_idt direct;
+      irep_idt base;
+      bool protected_write =
+        symbol_id(*lhs, direct) && symbols.count(direct) != 0;
+      if(
+        base_pointer(*lhs, base) &&
+        (base == initial.left_base || base == initial.right_base ||
+         base == producer.result_base))
+        protected_write = true;
+      if(!protected_write)
+        continue;
+      if(
+        is_start_function(entry.first) && instruction.is_assign() &&
+        value_is(instruction.assign_rhs(), 0))
+        continue;
+      if(allowed.count(&instruction) == 0)
+      {
+        reason = "hom_external_writer";
+        return false;
+      }
+    }
+  }
+
+  if(
+    !anchor_alias_free(model, initial.left_base, reason) ||
+    !anchor_alias_free(model, initial.right_base, reason) ||
+    !anchor_alias_free(model, producer.result_base, reason) ||
+    !no_addresses(model, symbols, reason))
+    return false;
+  (void)ns;
+  (void)life;
+  return true;
+}
+
+bool extremum_homomorphism_proof_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &reason)
+{
+  lifecyclet life;
+  if(!lifecycle(model, life, reason) || life.workers.size() != 3)
+  {
+    if(reason.empty())
+      reason = "hom_lifecycle";
+    return false;
+  }
+
+  hom_propertyt property;
+  if(!find_hom_property(model, ns, life, property, reason))
+    return false;
+  if(!signed_addition_helper(model, ns, property.operation, reason))
+    return false;
+
+  hom_main_initt initial;
+  if(!find_hom_initial_summaries(model, life, property, initial, reason))
+    return false;
+
+  for(const auto &fold_worker : life.workers)
+  {
+    hom_worker_resultt fold;
+    std::string fold_reason;
+    if(
+      !hom_fold_worker(
+        model,
+        ns,
+        fold_worker,
+        property,
+        initial,
+        fold,
+        fold_reason))
+      continue;
+    for(const auto &producer_worker : life.workers)
+    {
+      if(producer_worker == fold_worker)
+        continue;
+      hom_worker_resultt producer;
+      std::string producer_reason;
+      if(
+        !hom_producer_worker(
+          model,
+          ns,
+          producer_worker,
+          property,
+          initial,
+          producer,
+          producer_reason) ||
+        producer.bound != fold.bound)
+        continue;
+      irep_idt consumer_worker;
+      for(const auto &worker : life.workers)
+      {
+        if(worker != fold_worker && worker != producer_worker)
+          consumer_worker = worker;
+      }
+      hom_worker_resultt consumer;
+      std::string consumer_reason;
+      if(
+        consumer_worker.empty() ||
+        !hom_consumer_worker(
+          model,
+          ns,
+          consumer_worker,
+          property,
+          producer,
+          consumer,
+          consumer_reason))
+        continue;
+
+      hom_main_statet main_state;
+      if(
+        !hom_main_obligations(
+          model,
+          life,
+          property,
+          initial,
+          producer,
+          main_state,
+          reason) ||
+        !fresh_array_allocator(
+          model, ns, main_state.allocator, reason) ||
+        !hom_global_writes(
+          model,
+          ns,
+          life,
+          property,
+          initial,
+          fold,
+          producer,
+          consumer,
+          main_state,
+          reason))
+        return false;
+      std::cout << "NATIVE_EXTREMUM_HOMOMORPHISM applied=1 direction="
+                << (property.minimum ? "min" : "max")
+                << " left=" << property.left_summary
+                << " right=" << property.right_summary
+                << " result=" << property.result_summary << '\n';
+      return true;
+    }
+  }
+  reason = "hom_worker_partition";
+  return false;
+}
 } // namespace
 
 bool extremum_cone_proof(
@@ -1674,6 +3258,11 @@ bool extremum_cone_proof(
   (void)message_handler;
   const namespacet ns(goto_model.symbol_table);
   std::string reason;
+  if(extremum_homomorphism_proof_impl(goto_model, ns, reason))
+    return true;
+  std::cout << "NATIVE_EXTREMUM_HOMOMORPHISM applied=0 reason="
+            << reason << '\n';
+  reason.clear();
   propertyt property;
   if(!find_property(goto_model, ns, property, reason))
   {
