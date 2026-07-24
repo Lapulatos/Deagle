@@ -543,6 +543,8 @@ int cbmc_parse_optionst::doit()
     !cmdline.isset("unwind-suggest"))
   {
     if(
+      !lock_linearization_stability_transform(
+        goto_model, ui_message_handler) &&
       !lock_scoped_commutative_aggregation_transform(
         goto_model, ui_message_handler) &&
       !ticket_rank_serializability_transform(

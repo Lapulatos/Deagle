@@ -36,4 +36,11 @@ bool lock_scoped_commutative_aggregation_transform(
   goto_modelt &goto_model,
   message_handlert &message_handler);
 
+/// Prove postconditions established at mutex-protected unit-update
+/// linearization points and stable under every homogeneous worker transition.
+/// This permits removing an otherwise unbounded homogeneous spawn loop.
+bool lock_linearization_stability_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 #endif // CPROVER_ANALYSES_JCES_ANALYSIS_H

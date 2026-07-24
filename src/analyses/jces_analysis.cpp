@@ -99,6 +99,27 @@ struct locked_loop_summaryt
   std::set<const goto_programt::instructiont *> covered;
 };
 
+struct stable_transitiont
+{
+  irep_idt function;
+  irep_idt object;
+  irep_idt snapshot;
+  irep_idt mutex;
+  irep_idt property_witness;
+  irep_idt set_witness;
+  int direction = 0;
+  goto_programt::targett snapshot_assignment;
+  goto_programt::targett object_assignment;
+  goto_programt::targett witness_assignment;
+  goto_programt::targett property_guard;
+  goto_programt::targett error_call;
+};
+
+bool constant_eval(
+  const exprt &src,
+  const std::map<irep_idt, mp_integer> &environment,
+  mp_integer &value);
+
 const exprt &without_cast(const exprt &expr)
 {
   return skip_typecast(expr);
@@ -208,6 +229,553 @@ bool contains_symbol(
       return true;
   }
   return false;
+}
+
+bool is_zero_constant(const exprt &expr)
+{
+  mp_integer value;
+  return constant_eval(without_cast(expr), {}, value) && value == 0;
+}
+
+bool parse_nonzero_witness(
+  const exprt &src,
+  irep_idt &identifier)
+{
+  const exprt &expr = without_cast(src);
+  if(expr.id() != ID_notequal || expr.operands().size() != 2)
+    return false;
+  if(direct_symbol(expr.op0(), identifier) &&
+     is_zero_constant(expr.op1()))
+    return true;
+  return
+    direct_symbol(expr.op1(), identifier) &&
+    is_zero_constant(expr.op0());
+}
+
+bool parse_snapshot_relation(
+  const exprt &src,
+  irep_idt &object,
+  irep_idt &snapshot,
+  int &direction)
+{
+  const exprt &expr = without_cast(src);
+  if(
+    (expr.id() != ID_gt && expr.id() != ID_lt) ||
+    expr.operands().size() != 2 ||
+    !direct_symbol(expr.op0(), object) ||
+    !direct_symbol(expr.op1(), snapshot))
+    return false;
+  direction = expr.id() == ID_gt ? 1 : -1;
+  return true;
+}
+
+bool parse_stable_property(
+  const exprt &src,
+  irep_idt &object,
+  irep_idt &snapshot,
+  irep_idt &witness,
+  int &direction)
+{
+  const exprt &expr = without_cast(src);
+  if(parse_snapshot_relation(
+       expr, object, snapshot, direction))
+  {
+    witness.clear();
+    return true;
+  }
+  if(expr.id() != ID_or || expr.operands().size() != 2)
+    return false;
+  return
+    (parse_nonzero_witness(expr.op0(), witness) &&
+     parse_snapshot_relation(
+       expr.op1(), object, snapshot, direction)) ||
+    (parse_nonzero_witness(expr.op1(), witness) &&
+     parse_snapshot_relation(
+       expr.op0(), object, snapshot, direction));
+}
+
+bool parse_unit_snapshot_update(
+  const goto_programt::instructiont &instruction,
+  const irep_idt &object,
+  const irep_idt &snapshot,
+  const int direction)
+{
+  if(!instruction.is_assign())
+    return false;
+  irep_idt lhs;
+  if(
+    !direct_symbol(instruction.assign_lhs(), lhs) ||
+    lhs != object)
+    return false;
+  const exprt &rhs = without_cast(instruction.assign_rhs());
+  if(
+    rhs.operands().size() != 2 ||
+    (direction > 0 ? rhs.id() != ID_plus : rhs.id() != ID_minus))
+    return false;
+  irep_idt rhs_snapshot;
+  mp_integer unit;
+  return
+    direct_symbol(rhs.op0(), rhs_snapshot) &&
+    rhs_snapshot == snapshot &&
+    constant_eval(rhs.op1(), {}, unit) &&
+    unit == 1;
+}
+
+bool parse_mutex_call(
+  const goto_programt::instructiont &instruction,
+  const irep_idt &callee_expected,
+  irep_idt &mutex)
+{
+  irep_idt callee;
+  return
+    direct_call_identifier(instruction, callee) &&
+    callee == callee_expected &&
+    instruction.call_arguments().size() == 1 &&
+    addressed_symbol(instruction.call_arguments().front(), mutex);
+}
+
+bool instruction_mentions_any(
+  const goto_programt::instructiont &instruction,
+  const std::set<irep_idt> &identifiers)
+{
+  if(instruction.is_assign())
+    return
+      contains_symbol(instruction.assign_lhs(), identifiers) ||
+      contains_symbol(instruction.assign_rhs(), identifiers);
+  if(instruction.is_goto() || instruction.is_assume() ||
+     instruction.is_assert())
+    return contains_symbol(instruction.condition(), identifiers);
+  if(instruction.is_function_call())
+  {
+    if(contains_symbol(instruction.call_function(), identifiers))
+      return true;
+    for(const auto &argument : instruction.call_arguments())
+    {
+      if(contains_symbol(argument, identifiers))
+        return true;
+    }
+  }
+  if(instruction.is_set_return_value())
+    return contains_symbol(instruction.return_value(), identifiers);
+  return false;
+}
+
+bool boolean_constant_eval(const exprt &src, bool &value)
+{
+  const exprt &expr = without_cast(src);
+  if(expr.is_true())
+  {
+    value = true;
+    return true;
+  }
+  if(expr.is_false())
+  {
+    value = false;
+    return true;
+  }
+  if(expr.id() == ID_not && expr.operands().size() == 1)
+  {
+    if(!boolean_constant_eval(expr.op0(), value))
+      return false;
+    value = !value;
+    return true;
+  }
+  if(
+    (expr.id() == ID_equal || expr.id() == ID_notequal) &&
+    expr.operands().size() == 2)
+  {
+    mp_integer lhs;
+    mp_integer rhs;
+    if(
+      !constant_eval(expr.op0(), {}, lhs) ||
+      !constant_eval(expr.op1(), {}, rhs))
+      return false;
+    value =
+      expr.id() == ID_equal ? lhs == rhs : lhs != rhs;
+    return true;
+  }
+  return false;
+}
+
+bool parse_stable_transition(
+  const irep_idt &function_id,
+  goto_modelt &model,
+  const namespacet &ns,
+  stable_transitiont &summary,
+  std::set<const goto_programt::instructiont *> &recognized,
+  std::string &reason)
+{
+  auto function = model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "stable_missing_function";
+    return false;
+  }
+  auto &program = function->second.body;
+  std::vector<goto_programt::targett> order;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    positions.emplace(&*instruction, order.size());
+    order.push_back(instruction);
+  }
+
+  goto_programt::targett error_call = program.instructions.end();
+  std::size_t error_calls = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    irep_idt callee;
+    if(
+      direct_call_identifier(*instruction, callee) &&
+      callee == "reach_error")
+    {
+      error_call = instruction;
+      ++error_calls;
+    }
+  }
+  if(error_calls != 1 || positions.at(&*error_call) == 0)
+  {
+    reason = "stable_property_count";
+    return false;
+  }
+  const auto property_guard =
+    order[positions.at(&*error_call) - 1];
+  if(
+    !property_guard->is_goto() ||
+    property_guard->targets.size() != 1)
+  {
+    reason = "stable_property_guard";
+    return false;
+  }
+
+  irep_idt object;
+  irep_idt snapshot;
+  irep_idt property_witness;
+  int direction = 0;
+  if(!parse_stable_property(
+       property_guard->condition(),
+       object,
+       snapshot,
+       property_witness,
+       direction))
+  {
+    reason = "stable_property_schema";
+    return false;
+  }
+  const symbolt *object_symbol = nullptr;
+  if(
+    ns.lookup(object, object_symbol) ||
+    !object_symbol->is_static_lifetime ||
+    object_symbol->type.id() != ID_unsignedbv)
+  {
+    reason = "stable_object_type";
+    return false;
+  }
+  const symbolt *snapshot_symbol = nullptr;
+  if(
+    ns.lookup(snapshot, snapshot_symbol) ||
+    snapshot_symbol->is_static_lifetime ||
+    snapshot_symbol->type != object_symbol->type)
+  {
+    reason = "stable_snapshot_type";
+    return false;
+  }
+
+  goto_programt::targett snapshot_assignment =
+    program.instructions.end();
+  goto_programt::targett object_assignment =
+    program.instructions.end();
+  goto_programt::targett witness_assignment =
+    program.instructions.end();
+  std::size_t snapshot_writes = 0;
+  std::size_t object_writes = 0;
+  std::size_t witness_writes = 0;
+  std::vector<goto_programt::targett> snapshot_initializations;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(!instruction->is_assign())
+      continue;
+    irep_idt lhs;
+    if(!direct_symbol(instruction->assign_lhs(), lhs))
+      continue;
+    if(lhs == snapshot)
+    {
+      irep_idt rhs;
+      if(
+        direct_symbol(instruction->assign_rhs(), rhs) &&
+        rhs == object)
+      {
+        snapshot_assignment = instruction;
+        ++snapshot_writes;
+      }
+      else
+      {
+        mp_integer value;
+        if(!constant_eval(instruction->assign_rhs(), {}, value))
+        {
+          reason = "stable_snapshot_definition";
+          return false;
+        }
+        snapshot_initializations.push_back(instruction);
+      }
+    }
+    if(lhs == object)
+    {
+      if(!parse_unit_snapshot_update(
+           *instruction, object, snapshot, direction))
+      {
+        reason = "stable_update_schema";
+        return false;
+      }
+      object_assignment = instruction;
+      ++object_writes;
+    }
+    const symbolt *lhs_symbol = nullptr;
+    if(
+      lhs != object && lhs != snapshot &&
+      !ns.lookup(lhs, lhs_symbol) &&
+      lhs_symbol->is_static_lifetime &&
+      !lhs_symbol->is_type)
+    {
+      mp_integer value;
+      if(
+        !constant_eval(instruction->assign_rhs(), {}, value) ||
+        value != 1)
+      {
+        reason = "stable_witness_value";
+        return false;
+      }
+      witness_assignment = instruction;
+      ++witness_writes;
+    }
+  }
+  if(
+    snapshot_writes != 1 || object_writes != 1 ||
+    witness_writes > 1)
+  {
+    reason = "stable_transition_writes";
+    return false;
+  }
+  const auto snapshot_position =
+    positions.at(&*snapshot_assignment);
+  const auto update_position =
+    positions.at(&*object_assignment);
+  const auto property_position =
+    positions.at(&*property_guard);
+  if(
+    snapshot_position >= update_position ||
+    update_position >= property_position ||
+    (witness_writes == 1 &&
+     positions.at(&*witness_assignment) >= update_position))
+  {
+    reason = "stable_transition_order";
+    return false;
+  }
+  for(const auto initialization : snapshot_initializations)
+  {
+    if(positions.at(&*initialization) >= snapshot_position)
+    {
+      reason = "stable_snapshot_redefinition";
+      return false;
+    }
+  }
+  for(std::size_t index = snapshot_position;
+      index < property_position; ++index)
+  {
+    if(order[index]->is_goto())
+    {
+      reason = "stable_transition_control";
+      return false;
+    }
+  }
+  for(std::size_t index = snapshot_position;
+      index < update_position; ++index)
+  {
+    irep_idt candidate;
+    if(
+      parse_mutex_call(
+        *order[index], "pthread_mutex_lock", candidate) ||
+      parse_mutex_call(
+        *order[index], "pthread_mutex_unlock", candidate))
+    {
+      reason = "stable_linearization_lock_scope";
+      return false;
+    }
+  }
+
+  goto_programt::targett update_lock = program.instructions.end();
+  goto_programt::targett update_unlock = program.instructions.end();
+  irep_idt mutex;
+  for(std::size_t index = 0; index < snapshot_position; ++index)
+  {
+    irep_idt candidate;
+    if(parse_mutex_call(*order[index], "pthread_mutex_lock", candidate))
+    {
+      update_lock = order[index];
+      mutex = candidate;
+    }
+  }
+  for(std::size_t index = update_position + 1;
+      index < property_position; ++index)
+  {
+    irep_idt candidate;
+    if(
+      parse_mutex_call(
+        *order[index], "pthread_mutex_unlock", candidate) &&
+      candidate == mutex)
+    {
+      update_unlock = order[index];
+      break;
+    }
+  }
+  if(
+    update_lock == program.instructions.end() ||
+    update_unlock == program.instructions.end())
+  {
+    reason = "stable_update_lock";
+    return false;
+  }
+
+  int property_lock_depth = 0;
+  int atomic_depth = 0;
+  for(std::size_t index =
+        positions.at(&*update_unlock) + 1;
+      index < property_position; ++index)
+  {
+    if(order[index]->is_atomic_begin())
+      ++atomic_depth;
+    else if(order[index]->is_atomic_end())
+      --atomic_depth;
+    irep_idt candidate;
+    if(
+      parse_mutex_call(
+        *order[index], "pthread_mutex_lock", candidate) &&
+      candidate == mutex)
+      ++property_lock_depth;
+    else if(
+      parse_mutex_call(
+        *order[index], "pthread_mutex_unlock", candidate) &&
+      candidate == mutex)
+      --property_lock_depth;
+  }
+  if(property_lock_depth <= 0 && atomic_depth <= 0)
+  {
+    reason = "stable_property_protection";
+    return false;
+  }
+
+  bool guarded = false;
+  std::size_t guard_position = 0;
+  for(std::size_t index = positions.at(&*update_lock) + 1;
+      index < snapshot_position; ++index)
+  {
+    auto instruction = order[index];
+    if(
+      !instruction->is_goto() ||
+      instruction->targets.size() != 1 ||
+      instruction->targets.front() != snapshot_assignment)
+      continue;
+    const exprt &condition = instruction->condition();
+    if(condition.id() != ID_not || condition.operands().size() != 1)
+      continue;
+    const exprt &equality = without_cast(condition.op0());
+    if(equality.id() != ID_equal ||
+       equality.operands().size() != 2)
+      continue;
+    irep_idt guarded_object;
+    mp_integer boundary;
+    if(
+      direct_symbol(equality.op0(), guarded_object) &&
+      guarded_object == object &&
+      constant_eval(equality.op1(), {}, boundary) &&
+      ((direction > 0 && boundary == -1) ||
+       (direction < 0 && boundary == 0)))
+    {
+      guarded = true;
+      guard_position = index;
+    }
+  }
+  if(!guarded)
+  {
+    reason = "stable_arithmetic_guard";
+    return false;
+  }
+  recognized.insert(&*order[guard_position]);
+
+  // When the arithmetic guard is false, its fall-through path must terminate
+  // without reaching the snapshot/update path. This makes the guard a real
+  // overflow/underflow exclusion rather than a syntactic decoration.
+  std::set<std::size_t> pending;
+  std::set<std::size_t> visited;
+  if(guard_position + 1 < order.size())
+    pending.insert(guard_position + 1);
+  while(!pending.empty())
+  {
+    const auto index = *pending.begin();
+    pending.erase(pending.begin());
+    if(!visited.insert(index).second)
+      continue;
+    if(index == snapshot_position)
+    {
+      reason = "stable_guard_bypass";
+      return false;
+    }
+    const auto instruction = order[index];
+    if(instruction->is_end_function())
+      continue;
+    if(instruction->is_goto())
+    {
+      for(const auto &target : instruction->targets)
+        pending.insert(positions.at(&*target));
+      if(!instruction->condition().is_true() &&
+         index + 1 < order.size())
+        pending.insert(index + 1);
+    }
+    else if(index + 1 < order.size())
+      pending.insert(index + 1);
+  }
+
+  for(const auto &instruction : program.instructions)
+  {
+    if(
+      instruction.is_goto() &&
+      instruction.get_target() != program.instructions.end() &&
+      positions.at(&*instruction.get_target()) <
+        positions.at(&instruction))
+    {
+      reason = "stable_worker_loop";
+      return false;
+    }
+  }
+
+  summary.function = function_id;
+  summary.object = object;
+  summary.snapshot = snapshot;
+  summary.mutex = mutex;
+  summary.property_witness = property_witness;
+  if(witness_writes == 1)
+  {
+    direct_symbol(
+      witness_assignment->assign_lhs(), summary.set_witness);
+  }
+  summary.direction = direction;
+  summary.snapshot_assignment = snapshot_assignment;
+  summary.object_assignment = object_assignment;
+  summary.witness_assignment = witness_assignment;
+  summary.property_guard = property_guard;
+  summary.error_call = error_call;
+  recognized.insert(&*snapshot_assignment);
+  recognized.insert(&*object_assignment);
+  if(witness_writes == 1)
+    recognized.insert(&*witness_assignment);
+  recognized.insert(&*property_guard);
+  recognized.insert(&*error_call);
+  return true;
 }
 
 bool uses_only_immutable_shared(
@@ -2760,6 +3328,437 @@ bool inline_error_bound(
   return true;
 }
 } // namespace
+
+bool lock_linearization_stability_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  auto main =
+    goto_model.goto_functions.function_map.find("main");
+  if(
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+    return false;
+
+  auto &main_program = main->second.body;
+  std::vector<goto_programt::targett> main_order;
+  std::map<const goto_programt::instructiont *, std::size_t>
+    main_positions;
+  for(auto instruction = main_program.instructions.begin();
+      instruction != main_program.instructions.end(); ++instruction)
+  {
+    main_positions.emplace(&*instruction, main_order.size());
+    main_order.push_back(instruction);
+  }
+
+  goto_programt::targett create =
+    main_program.instructions.end();
+  irep_idt worker;
+  std::size_t create_count = 0;
+  for(auto &function_entry :
+      goto_model.goto_functions.function_map)
+  {
+    if(!function_entry.second.body_available())
+      continue;
+    for(auto instruction =
+          function_entry.second.body.instructions.begin();
+        instruction !=
+          function_entry.second.body.instructions.end();
+        ++instruction)
+    {
+      irep_idt callee;
+      if(
+        !direct_call_identifier(*instruction, callee) ||
+        callee != "pthread_create")
+        continue;
+      ++create_count;
+      if(
+        function_entry.first != "main" ||
+        instruction->call_arguments().size() < 3 ||
+        !addressed_symbol(
+          instruction->call_arguments()[2], worker))
+      {
+        std::cout
+          << "NATIVE_LOCK_STABILITY applied=0 reason="
+          << "stable_create_resolution\n";
+        return false;
+      }
+      create = instruction;
+    }
+  }
+  if(
+    create_count != 1 ||
+    create == main_program.instructions.end())
+  {
+    std::cout
+      << "NATIVE_LOCK_STABILITY applied=0 reason="
+      << "stable_create_count\n";
+    return false;
+  }
+
+  goto_programt::targett backedge =
+    main_program.instructions.end();
+  goto_programt::targett loop_head =
+    main_program.instructions.end();
+  std::size_t backedges = 0;
+  const auto create_position = main_positions.at(&*create);
+  for(auto instruction = main_program.instructions.begin();
+      instruction != main_program.instructions.end(); ++instruction)
+  {
+    if(
+      !instruction->is_goto() ||
+      !instruction->condition().is_true() ||
+      instruction->targets.size() != 1)
+      continue;
+    const auto source = main_positions.at(&*instruction);
+    const auto target =
+      main_positions.at(&*instruction->targets.front());
+    if(target <= create_position && create_position < source)
+    {
+      backedge = instruction;
+      loop_head = instruction->targets.front();
+      ++backedges;
+    }
+  }
+  if(backedges != 1)
+  {
+    std::cout
+      << "NATIVE_LOCK_STABILITY applied=0 reason="
+      << "stable_spawn_backedge\n";
+    return false;
+  }
+  const auto loop_begin = main_positions.at(&*loop_head);
+  const auto loop_end = main_positions.at(&*backedge);
+  std::size_t loop_creates = 0;
+  std::size_t conditional_exits = 0;
+  for(std::size_t index = loop_begin; index <= loop_end; ++index)
+  {
+    auto instruction = main_order[index];
+    irep_idt callee;
+    if(
+      direct_call_identifier(*instruction, callee) &&
+      callee == "pthread_create")
+    {
+      ++loop_creates;
+      continue;
+    }
+    if(instruction == backedge)
+      continue;
+    bool exit_condition;
+    if(
+      instruction->is_goto() &&
+      instruction->targets.size() == 1 &&
+      main_positions.at(&*instruction->targets.front()) >
+        loop_end &&
+      boolean_constant_eval(
+        instruction->condition(), exit_condition) &&
+      !exit_condition)
+    {
+      ++conditional_exits;
+      continue;
+    }
+    if(
+      instruction->is_skip() || instruction->is_location())
+      continue;
+    std::cout
+      << "NATIVE_LOCK_STABILITY applied=0 reason="
+      << "stable_spawn_loop_shape\n";
+    return false;
+  }
+  if(loop_creates != 1 || conditional_exits != 1)
+  {
+    std::cout
+      << "NATIVE_LOCK_STABILITY applied=0 reason="
+      << "stable_spawn_loop_counts\n";
+    return false;
+  }
+
+  const std::set<irep_idt> ignored_calls = {
+    "pthread_mutex_lock",
+    "pthread_mutex_unlock",
+    "reach_error",
+    "abort"};
+  std::set<irep_idt> reachable;
+  std::vector<irep_idt> pending{worker};
+  std::set<const goto_programt::instructiont *> recognized;
+  std::vector<stable_transitiont> transitions;
+  std::string reason;
+  while(!pending.empty())
+  {
+    const auto function_id = pending.back();
+    pending.pop_back();
+    if(!reachable.insert(function_id).second)
+      continue;
+    auto function =
+      goto_model.goto_functions.function_map.find(function_id);
+    if(
+      function == goto_model.goto_functions.function_map.end() ||
+      !function->second.body_available())
+    {
+      reason = "stable_reachable_function";
+      break;
+    }
+    std::size_t property_calls = 0;
+    for(const auto &instruction :
+        function->second.body.instructions)
+    {
+      if(instruction.is_assert())
+      {
+        reason = "stable_reachable_assertion";
+        break;
+      }
+      if(!instruction.is_function_call())
+        continue;
+      irep_idt callee;
+      if(!direct_call_identifier(instruction, callee))
+      {
+        reason = "stable_indirect_call";
+        break;
+      }
+      if(callee == "reach_error")
+        ++property_calls;
+      if(ignored_calls.find(callee) != ignored_calls.end())
+        continue;
+      const auto called =
+        goto_model.goto_functions.function_map.find(callee);
+      if(
+        called == goto_model.goto_functions.function_map.end() ||
+        !called->second.body_available())
+      {
+        reason = "stable_unknown_call";
+        break;
+      }
+      pending.push_back(callee);
+    }
+    if(!reason.empty())
+      break;
+    if(property_calls != 0)
+    {
+      stable_transitiont transition;
+      if(!parse_stable_transition(
+           function_id,
+           goto_model,
+           ns,
+           transition,
+           recognized,
+           reason))
+        break;
+      transitions.push_back(std::move(transition));
+    }
+  }
+  if(!reason.empty() || transitions.empty())
+  {
+    if(reason.empty())
+      reason = "stable_no_transition";
+    std::cout
+      << "NATIVE_LOCK_STABILITY applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+
+  const auto object = transitions.front().object;
+  const auto mutex = transitions.front().mutex;
+  std::set<irep_idt> proof_symbols{object};
+  std::set<irep_idt> witness_symbols;
+  std::set<irep_idt> transition_functions;
+  for(const auto &property : transitions)
+  {
+    transition_functions.insert(property.function);
+    if(
+      property.object != object ||
+      property.mutex != mutex)
+    {
+      reason = "stable_protocol_mismatch";
+      break;
+    }
+    if(!property.property_witness.empty())
+    {
+      const symbolt *symbol = nullptr;
+      if(
+        ns.lookup(property.property_witness, symbol) ||
+        !symbol->is_static_lifetime ||
+        symbol->type.id() != ID_unsignedbv)
+      {
+        reason = "stable_property_witness_type";
+        break;
+      }
+      witness_symbols.insert(property.property_witness);
+      proof_symbols.insert(property.property_witness);
+    }
+    if(!property.set_witness.empty())
+    {
+      witness_symbols.insert(property.set_witness);
+      proof_symbols.insert(property.set_witness);
+    }
+    for(const auto &interference : transitions)
+    {
+      if(
+        interference.direction != property.direction &&
+        (property.property_witness.empty() ||
+         property.property_witness !=
+           interference.set_witness))
+      {
+        reason = "stable_interference_not_covered";
+        break;
+      }
+    }
+    if(!reason.empty())
+      break;
+  }
+  if(!reason.empty())
+  {
+    std::cout
+      << "NATIVE_LOCK_STABILITY applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+
+  std::map<irep_idt, std::size_t> initialization_counts;
+  std::size_t global_property_calls = 0;
+  const std::set<irep_idt> mutex_symbol{mutex};
+  for(auto &function_entry :
+      goto_model.goto_functions.function_map)
+  {
+    if(!function_entry.second.body_available())
+      continue;
+    for(auto instruction =
+          function_entry.second.body.instructions.begin();
+        instruction !=
+          function_entry.second.body.instructions.end();
+        ++instruction)
+    {
+      irep_idt callee;
+      if(
+        direct_call_identifier(*instruction, callee) &&
+        callee == "reach_error")
+        ++global_property_calls;
+
+      if(
+        contains_address_of_symbol(
+          instruction->is_assign()
+            ? instruction->assign_rhs()
+            : nil_exprt(),
+          proof_symbols))
+      {
+        reason = "stable_address_escape";
+        break;
+      }
+      if(instruction->is_function_call())
+      {
+        irep_idt called;
+        const bool direct =
+          direct_call_identifier(*instruction, called);
+        for(const auto &argument : instruction->call_arguments())
+        {
+          if(contains_address_of_symbol(argument, proof_symbols))
+          {
+            reason = "stable_address_escape";
+            break;
+          }
+          if(
+            contains_address_of_symbol(argument, mutex_symbol) &&
+            (!direct ||
+             (called != "pthread_mutex_lock" &&
+              called != "pthread_mutex_unlock")))
+          {
+            reason = "stable_mutex_escape";
+            break;
+          }
+        }
+      }
+      if(
+        instruction->is_assign() &&
+        function_entry.first != "__CPROVER_initialize" &&
+        (contains_symbol(
+           instruction->assign_lhs(), mutex_symbol) ||
+         contains_symbol(
+           instruction->assign_rhs(), mutex_symbol)))
+      {
+        reason = "stable_mutex_write";
+        break;
+      }
+      if(!reason.empty())
+        break;
+
+      if(instruction->is_assign())
+      {
+        irep_idt lhs;
+        if(
+          direct_symbol(instruction->assign_lhs(), lhs) &&
+          proof_symbols.find(lhs) != proof_symbols.end())
+        {
+          if(recognized.find(&*instruction) != recognized.end())
+            continue;
+          if(function_entry.first != "__CPROVER_initialize")
+          {
+            reason = "stable_extra_write";
+            break;
+          }
+          mp_integer value;
+          if(
+            !constant_eval(instruction->assign_rhs(), {}, value) ||
+            (witness_symbols.find(lhs) !=
+               witness_symbols.end() &&
+             value != 0))
+          {
+            reason = "stable_initialization";
+            break;
+          }
+          ++initialization_counts[lhs];
+          continue;
+        }
+      }
+      if(
+        instruction_mentions_any(*instruction, proof_symbols) &&
+        function_entry.first != "__CPROVER_initialize" &&
+        transition_functions.find(function_entry.first) ==
+          transition_functions.end())
+      {
+        reason = "stable_external_access";
+        break;
+      }
+      if(
+        transition_functions.find(function_entry.first) !=
+          transition_functions.end() &&
+        instruction_mentions_any(*instruction, proof_symbols) &&
+        recognized.find(&*instruction) == recognized.end())
+      {
+        reason = "stable_unrecognized_access";
+        break;
+      }
+    }
+    if(!reason.empty())
+      break;
+  }
+  for(const auto &identifier : proof_symbols)
+  {
+    if(initialization_counts[identifier] != 1)
+      reason = "stable_initialization_count";
+  }
+  if(
+    global_property_calls != transitions.size() ||
+    !reason.empty())
+  {
+    if(reason.empty())
+      reason = "stable_global_property_count";
+    std::cout
+      << "NATIVE_LOCK_STABILITY applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+
+  for(std::size_t index = loop_begin; index <= loop_end; ++index)
+    main_order[index]->turn_into_skip();
+  goto_model.goto_functions.update();
+  std::cout
+    << "NATIVE_LOCK_STABILITY applied=1 worker=" << worker
+    << " transitions=" << transitions.size()
+    << " object=" << object << " mutex=" << mutex
+    << " witnesses=" << witness_symbols.size() << '\n';
+  (void)message_handler;
+  return true;
+}
 
 bool lock_scoped_commutative_aggregation_transform(
   goto_modelt &goto_model,
