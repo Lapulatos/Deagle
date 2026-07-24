@@ -5006,13 +5006,14 @@ bool dynamic_flow_worker(
         !symbol_id(instruction->call_arguments()[0], first) ||
         !symbol_id(instruction->call_arguments()[1], temporary) ||
         accumulator != first || !shared_signed(accumulator, ns) ||
+        temporary_write == program.instructions.end() ||
+        result.temporary != temporary ||
         accumulator_write != program.instructions.end())
       {
         reason = "flow_dynamic_fold";
         return false;
       }
       result.accumulator = accumulator;
-      result.temporary = temporary;
       result.operation = callee;
       result.writes.insert(&*instruction);
       accumulator_write = instruction;
@@ -5272,6 +5273,958 @@ bool equivalent_dynamic_partition_proof_impl(
   std::cout << "NATIVE_RELATIONAL_FLOW applied=1 rule=dynamic_partition"
             << " left=" << property.left_accumulator
             << " right=" << property.right_accumulator << '\n';
+  return true;
+}
+
+struct hierarchical_lifecyclet
+{
+  std::vector<irep_idt> workers;
+  std::set<irep_idt> handles;
+  std::set<irep_idt> joins;
+  const goto_programt::instructiont *first_create;
+  const goto_programt::instructiont *last_join;
+
+  hierarchical_lifecyclet() : first_create(nullptr), last_join(nullptr)
+  {
+  }
+};
+
+bool hierarchical_lifecycle(
+  const goto_modelt &model,
+  const irep_idt &owner,
+  hierarchical_lifecyclet &result,
+  std::string &reason)
+{
+  const auto found = model.goto_functions.function_map.find(owner);
+  if(
+    found == model.goto_functions.function_map.end() ||
+    !found->second.body_available())
+  {
+    reason = "hier_lifecycle_owner";
+    return false;
+  }
+  bool joining = false;
+  for(const auto &instruction : found->second.body.instructions)
+  {
+    irep_idt callee;
+    if(!call_id(instruction, callee))
+      continue;
+    const auto &arguments = instruction.call_arguments();
+    if(is_create(callee))
+    {
+      if(joining)
+      {
+        reason = "hier_create_after_join";
+        return false;
+      }
+      irep_idt handle;
+      irep_idt worker;
+      if(
+        arguments.size() < 3 ||
+        !addressed_id(arguments[0], handle) ||
+        !addressed_id(arguments[2], worker) ||
+        !result.handles.insert(handle).second ||
+        std::find(
+          result.workers.begin(), result.workers.end(), worker) !=
+          result.workers.end())
+      {
+        reason = "hier_create";
+        return false;
+      }
+      result.workers.push_back(worker);
+      if(result.first_create == nullptr)
+        result.first_create = &instruction;
+    }
+    else if(is_join(callee))
+    {
+      joining = true;
+      irep_idt handle;
+      if(
+        arguments.empty() || !symbol_id(arguments[0], handle) ||
+        !result.joins.insert(handle).second)
+      {
+        reason = "hier_join";
+        return false;
+      }
+      result.last_join = &instruction;
+    }
+  }
+  if(
+    result.workers.size() != 2 ||
+    result.handles.size() != result.workers.size() ||
+    result.handles != result.joins ||
+    result.first_create == nullptr || result.last_join == nullptr ||
+    result.first_create->location_number >= result.last_join->location_number)
+  {
+    reason = "hier_lifecycle_shape";
+    return false;
+  }
+  for(const auto &worker : result.workers)
+  {
+    const auto worker_found =
+      model.goto_functions.function_map.find(worker);
+    if(
+      worker_found == model.goto_functions.function_map.end() ||
+      !worker_found->second.body_available())
+    {
+      reason = "hier_worker_body";
+      return false;
+    }
+  }
+  return true;
+}
+
+struct hierarchical_leaft
+{
+  irep_idt worker;
+  irep_idt counter;
+  irep_idt bound;
+  irep_idt temporary;
+  irep_idt base;
+  irep_idt accumulator;
+  irep_idt operation;
+  bool terminal;
+  std::set<irep_idt> local_zero;
+  std::set<const goto_programt::instructiont *> writes;
+
+  hierarchical_leaft() : terminal(false)
+  {
+  }
+};
+
+bool hierarchical_terminal_guard(
+  const exprt &src,
+  const irep_idt &counter,
+  const irep_idt &bound)
+{
+  const exprt &condition = strip(src);
+  if(condition.id() == ID_equal && condition.operands().size() == 2)
+  {
+    irep_idt left;
+    irep_idt right;
+    return
+      ((symbol_id(condition.op0(), left) && left == counter &&
+        symbol_id(condition.op1(), right) && right == bound) ||
+       (symbol_id(condition.op1(), left) && left == counter &&
+        symbol_id(condition.op0(), right) && right == bound));
+  }
+  if(condition.id() != ID_not || condition.operands().size() != 1)
+    return false;
+  const exprt &relation = strip(condition.op0());
+  if(relation.id() != ID_lt || relation.operands().size() != 2)
+    return false;
+  irep_idt left;
+  irep_idt right;
+  return
+    symbol_id(relation.op0(), left) && left == counter &&
+    symbol_id(relation.op1(), right) && right == bound;
+}
+
+bool hierarchical_leaf(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  hierarchical_leaft &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  natural_loopst loops;
+  loops(program);
+  if(loops.loop_map.size() != 1)
+  {
+    reason = "hier_leaf_loop_count";
+    return false;
+  }
+  const auto &loop = loops.loop_map.begin()->second;
+  unsigned atomic_epoch = 0;
+  unsigned atomic_depth = 0;
+  std::size_t atomic_begins = 0;
+  std::size_t atomic_ends = 0;
+  std::size_t gotos = 0;
+  bool guarded = false;
+  goto_programt::const_targett counter_write =
+    program.instructions.end();
+  goto_programt::const_targett temporary_write =
+    program.instructions.end();
+  goto_programt::const_targett accumulator_write =
+    program.instructions.end();
+
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    const bool in_loop = loop.contains(instruction);
+    if(in_loop && instruction->is_atomic_begin())
+    {
+      if(atomic_depth != 0)
+      {
+        reason = "hier_leaf_atomic_nesting";
+        return false;
+      }
+      atomic_depth = 1;
+      ++atomic_epoch;
+      ++atomic_begins;
+      continue;
+    }
+    if(in_loop && instruction->is_atomic_end())
+    {
+      if(atomic_depth != 1)
+      {
+        reason = "hier_leaf_atomic_balance";
+        return false;
+      }
+      atomic_depth = 0;
+      ++atomic_ends;
+      continue;
+    }
+    if(in_loop && instruction->is_goto())
+      ++gotos;
+
+    irep_idt callee;
+    if(in_loop && call_id(*instruction, callee))
+    {
+      if(is_assume(callee))
+      {
+        if(
+          atomic_depth != 1 || atomic_epoch != 1 ||
+          instruction->call_arguments().size() != 1)
+        {
+          reason = "hier_leaf_guard_epoch";
+          return false;
+        }
+        const exprt &guard =
+          strip(instruction->call_arguments().front());
+        irep_idt counter;
+        irep_idt bound;
+        if(
+          guard.id() != ID_lt || guard.operands().size() != 2 ||
+          !symbol_id(guard.op0(), counter) ||
+          !symbol_id(guard.op1(), bound))
+        {
+          reason = "hier_leaf_guard";
+          return false;
+        }
+        result.counter = counter;
+        result.bound = bound;
+        guarded = true;
+        continue;
+      }
+      irep_idt accumulator;
+      irep_idt first;
+      irep_idt temporary;
+      if(
+        atomic_depth != 1 || atomic_epoch != 2 ||
+        instruction->call_lhs().is_nil() ||
+        instruction->call_arguments().size() != 2 ||
+        !symbol_id(instruction->call_lhs(), accumulator) ||
+        !symbol_id(instruction->call_arguments()[0], first) ||
+        !symbol_id(instruction->call_arguments()[1], temporary) ||
+        accumulator != first || !shared_signed(accumulator, ns) ||
+        temporary_write == program.instructions.end() ||
+        result.temporary != temporary ||
+        accumulator_write != program.instructions.end())
+      {
+        reason = "hier_leaf_fold";
+        return false;
+      }
+      result.accumulator = accumulator;
+      result.operation = callee;
+      result.writes.insert(&*instruction);
+      accumulator_write = instruction;
+      continue;
+    }
+    if(in_loop && instruction->is_assign())
+    {
+      irep_idt lhs;
+      if(!shared_symbol_lhs(*instruction, ns, lhs))
+        continue;
+      if(
+        guarded && lhs == result.counter &&
+        unit_increment(*instruction, result.counter) &&
+        atomic_depth == 1 && atomic_epoch == 1 &&
+        counter_write == program.instructions.end())
+      {
+        result.writes.insert(&*instruction);
+        counter_write = instruction;
+        continue;
+      }
+      irep_idt base;
+      const symbolt *counter_symbol = lookup(result.counter, ns);
+      if(
+        guarded && counter_symbol != nullptr &&
+        base_pointer(instruction->assign_rhs(), base) &&
+        array_at(
+          instruction->assign_rhs(),
+          base,
+          symbol_exprt(result.counter, counter_symbol->type)) &&
+        atomic_depth == 1 && atomic_epoch == 1 &&
+        temporary_write == program.instructions.end())
+      {
+        result.temporary = lhs;
+        result.base = base;
+        result.writes.insert(&*instruction);
+        temporary_write = instruction;
+        continue;
+      }
+      reason = "hier_leaf_shared_write";
+      return false;
+    }
+    if(
+      in_loop &&
+      (instruction->is_assert() || instruction->is_start_thread() ||
+       instruction->is_end_thread() || instruction->is_throw() ||
+       instruction->is_catch()))
+    {
+      reason = "hier_leaf_effect";
+      return false;
+    }
+  }
+  if(
+    atomic_depth != 0 || atomic_begins != 2 || atomic_ends != 2 ||
+    gotos != 2 || !guarded ||
+    counter_write == program.instructions.end() ||
+    temporary_write == program.instructions.end() ||
+    accumulator_write == program.instructions.end() ||
+    counter_write->location_number >= temporary_write->location_number ||
+    temporary_write->location_number >= accumulator_write->location_number ||
+    !shared_signed(result.counter, ns) ||
+    !shared_signed(result.temporary, ns) ||
+    result.counter == result.temporary ||
+    result.counter == result.accumulator ||
+    result.temporary == result.accumulator)
+  {
+    reason = "hier_leaf_shape";
+    return false;
+  }
+
+  unsigned outside_atomic_depth = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(loop.contains(instruction))
+      continue;
+    if(instruction->is_atomic_begin())
+    {
+      if(outside_atomic_depth != 0)
+      {
+        reason = "hier_leaf_outside_atomic_nesting";
+        return false;
+      }
+      outside_atomic_depth = 1;
+      continue;
+    }
+    if(instruction->is_atomic_end())
+    {
+      if(outside_atomic_depth != 1)
+      {
+        reason = "hier_leaf_outside_atomic_balance";
+        return false;
+      }
+      outside_atomic_depth = 0;
+      continue;
+    }
+    if(instruction->is_assign())
+    {
+      irep_idt lhs;
+      if(!shared_symbol_lhs(*instruction, ns, lhs))
+        continue;
+      if(
+        value_is(instruction->assign_rhs(), 0) &&
+        instruction->location_number <
+          loops.loop_map.begin()->first->location_number &&
+        (lhs == result.counter || lhs == result.accumulator))
+      {
+        result.local_zero.insert(lhs);
+        result.writes.insert(&*instruction);
+        continue;
+      }
+      reason = "hier_leaf_outside_write";
+      return false;
+    }
+    if(
+      instruction->is_goto() || instruction->is_assert() ||
+      instruction->is_start_thread() || instruction->is_end_thread() ||
+      instruction->is_throw() || instruction->is_catch())
+    {
+      reason = "hier_leaf_outside_control";
+      return false;
+    }
+    irep_idt callee;
+    if(!call_id(*instruction, callee))
+      continue;
+    if(
+      is_assume(callee) &&
+      instruction->call_arguments().size() == 1 &&
+      instruction->location_number >
+        accumulator_write->location_number &&
+      hierarchical_terminal_guard(
+        instruction->call_arguments().front(),
+        result.counter,
+        result.bound))
+    {
+      result.terminal = true;
+      continue;
+    }
+    reason = "hier_leaf_outside_call";
+    return false;
+  }
+  if(outside_atomic_depth != 0)
+  {
+    reason = "hier_leaf_outside_atomic_balance";
+    return false;
+  }
+  result.worker = worker;
+  return true;
+}
+
+struct hierarchical_roott
+{
+  irep_idt worker;
+  irep_idt root;
+  irep_idt counter;
+  irep_idt bound;
+  irep_idt base;
+  irep_idt operation;
+  std::set<irep_idt> accumulators;
+  std::set<irep_idt> temporaries;
+  std::set<irep_idt> required_main_zero;
+  std::set<const goto_programt::instructiont *> writes;
+};
+
+bool hierarchical_parent_terminal(
+  const goto_programt &program,
+  const irep_idt &counter,
+  const irep_idt &bound,
+  const goto_programt::instructiont *last_join)
+{
+  for(const auto &instruction : program.instructions)
+  {
+    irep_idt callee;
+    if(
+      call_id(instruction, callee) && is_assume(callee) &&
+      instruction.call_arguments().size() == 1 &&
+      last_join != nullptr &&
+      instruction.location_number > last_join->location_number &&
+      hierarchical_terminal_guard(
+        instruction.call_arguments().front(), counter, bound))
+      return true;
+  }
+  return false;
+}
+
+bool hierarchical_root(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  hierarchical_roott &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  natural_loopst own_loops;
+  own_loops(program);
+  if(own_loops.loop_map.size() == 1)
+  {
+    hierarchical_leaft leaf;
+    if(!hierarchical_leaf(model, ns, worker, leaf, reason))
+      return false;
+    if(
+      !leaf.terminal ||
+      leaf.local_zero.count(leaf.counter) == 0 ||
+      leaf.local_zero.count(leaf.accumulator) == 0)
+    {
+      reason = "hier_single_root_completion";
+      return false;
+    }
+    result.worker = worker;
+    result.root = leaf.accumulator;
+    result.counter = leaf.counter;
+    result.bound = leaf.bound;
+    result.base = leaf.base;
+    result.operation = leaf.operation;
+    result.accumulators.insert(leaf.accumulator);
+    result.temporaries.insert(leaf.temporary);
+    result.writes = leaf.writes;
+    return true;
+  }
+  if(!own_loops.loop_map.empty())
+  {
+    reason = "hier_parent_loop";
+    return false;
+  }
+
+  hierarchical_lifecyclet life;
+  if(!hierarchical_lifecycle(model, worker, life, reason))
+    return false;
+  std::vector<hierarchical_leaft> leaves;
+  for(const auto &child : life.workers)
+  {
+    hierarchical_leaft leaf;
+    if(!hierarchical_leaf(model, ns, child, leaf, reason))
+      return false;
+    leaves.push_back(leaf);
+  }
+  if(
+    leaves[0].counter != leaves[1].counter ||
+    leaves[0].bound != leaves[1].bound ||
+    leaves[0].base != leaves[1].base ||
+    leaves[0].operation != leaves[1].operation ||
+    leaves[0].temporary == leaves[1].temporary)
+  {
+    reason = "hier_leaf_signature";
+    return false;
+  }
+  result.worker = worker;
+  result.counter = leaves[0].counter;
+  result.bound = leaves[0].bound;
+  result.base = leaves[0].base;
+  result.operation = leaves[0].operation;
+  for(const auto &leaf : leaves)
+  {
+    result.accumulators.insert(leaf.accumulator);
+    result.temporaries.insert(leaf.temporary);
+    result.writes.insert(leaf.writes.begin(), leaf.writes.end());
+  }
+
+  std::set<irep_idt> parent_zero;
+  const goto_programt::instructiont *combine = nullptr;
+  irep_idt combine_lhs;
+  irep_idt combine_left;
+  irep_idt combine_right;
+  unsigned atomic_depth = 0;
+  for(const auto &instruction : program.instructions)
+  {
+    if(instruction.is_atomic_begin())
+    {
+      if(atomic_depth != 0)
+      {
+        reason = "hier_parent_atomic_nesting";
+        return false;
+      }
+      atomic_depth = 1;
+      continue;
+    }
+    if(instruction.is_atomic_end())
+    {
+      if(atomic_depth != 1)
+      {
+        reason = "hier_parent_atomic_balance";
+        return false;
+      }
+      atomic_depth = 0;
+      continue;
+    }
+    if(instruction.is_assign())
+    {
+      irep_idt lhs;
+      if(!shared_symbol_lhs(instruction, ns, lhs))
+        continue;
+      if(
+        atomic_depth == 1 && value_is(instruction.assign_rhs(), 0) &&
+        instruction.location_number < life.first_create->location_number)
+      {
+        parent_zero.insert(lhs);
+        result.writes.insert(&instruction);
+        continue;
+      }
+      reason = "hier_parent_shared_write";
+      return false;
+    }
+    if(
+      instruction.is_goto() || instruction.is_assert() ||
+      instruction.is_start_thread() || instruction.is_end_thread() ||
+      instruction.is_throw() || instruction.is_catch())
+    {
+      reason = "hier_parent_control";
+      return false;
+    }
+    irep_idt callee;
+    if(!call_id(instruction, callee))
+      continue;
+    if(is_create(callee) || is_join(callee) || is_assume(callee))
+      continue;
+    irep_idt lhs;
+    irep_idt left;
+    irep_idt right;
+    if(
+      atomic_depth == 1 &&
+      instruction.location_number > life.last_join->location_number &&
+      !instruction.call_lhs().is_nil() &&
+      instruction.call_arguments().size() == 2 &&
+      symbol_id(instruction.call_lhs(), lhs) &&
+      symbol_id(instruction.call_arguments()[0], left) &&
+      symbol_id(instruction.call_arguments()[1], right) &&
+      result.accumulators.count(left) != 0 &&
+      result.accumulators.count(right) != 0 &&
+      left != right && combine == nullptr)
+    {
+      combine = &instruction;
+      combine_lhs = lhs;
+      combine_left = left;
+      combine_right = right;
+      if(callee != result.operation)
+      {
+        reason = "hier_parent_operation";
+        return false;
+      }
+      result.writes.insert(&instruction);
+      continue;
+    }
+    reason = "hier_parent_call";
+    return false;
+  }
+  if(atomic_depth != 0)
+  {
+    reason = "hier_parent_atomic_balance";
+    return false;
+  }
+
+  const bool parent_terminal =
+    hierarchical_parent_terminal(
+      program, result.counter, result.bound, life.last_join);
+  if(result.accumulators.size() == 1)
+  {
+    const irep_idt accumulator = *result.accumulators.begin();
+    if(
+      combine != nullptr ||
+      parent_zero.count(result.counter) == 0 ||
+      parent_zero.count(accumulator) == 0 ||
+      (!parent_terminal && (!leaves[0].terminal || !leaves[1].terminal)))
+    {
+      reason = "hier_shared_root";
+      return false;
+    }
+    result.root = accumulator;
+  }
+  else if(result.accumulators.size() == 2)
+  {
+    if(
+      combine == nullptr || !parent_terminal ||
+      result.accumulators.count(combine_left) == 0 ||
+      result.accumulators.count(combine_right) == 0 ||
+      !shared_signed(combine_lhs, ns) ||
+      result.accumulators.count(combine_lhs) != 0 ||
+      result.temporaries.count(combine_lhs) != 0 ||
+      combine_lhs == result.counter || combine_lhs == result.bound ||
+      combine_lhs == result.base)
+    {
+      reason = "hier_partial_root";
+      return false;
+    }
+    result.root = combine_lhs;
+    for(const auto &symbol : result.accumulators)
+    {
+      if(parent_zero.count(symbol) == 0)
+        result.required_main_zero.insert(symbol);
+    }
+    if(parent_zero.count(result.counter) == 0)
+      result.required_main_zero.insert(result.counter);
+  }
+  else
+  {
+    reason = "hier_accumulator_count";
+    return false;
+  }
+  return true;
+}
+
+bool hierarchical_initial_relation(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const std::set<irep_idt> &required,
+  const goto_programt::instructiont *&assumption)
+{
+  if(required.empty())
+    return true;
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr &&
+      instruction.location_number >= life.first_create->location_number)
+      break;
+    irep_idt callee;
+    if(
+      call_id(instruction, callee) && is_assume(callee) &&
+      instruction.call_arguments().size() == 1 &&
+      zero_equivalence_constraint(
+        instruction.call_arguments().front(), required))
+    {
+      assumption = &instruction;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool hierarchical_main_prefix_control(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr &&
+      instruction.location_number >= life.first_create->location_number)
+      break;
+    if(
+      instruction.is_goto() || instruction.is_assert() ||
+      instruction.is_start_thread() || instruction.is_end_thread() ||
+      instruction.is_throw() || instruction.is_catch())
+    {
+      reason = "hier_main_prefix_control";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool hierarchical_global_obligations(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const flow_equality_propertyt &property,
+  const std::vector<hierarchical_roott> &roots,
+  const goto_programt::instructiont *initial_relation,
+  std::string &reason)
+{
+  std::set<irep_idt> protected_symbols = {
+    property.left, property.right};
+  std::set<const goto_programt::instructiont *> allowed;
+  const irep_idt base = roots.front().base;
+  for(const auto &root : roots)
+  {
+    protected_symbols.insert(root.counter);
+    protected_symbols.insert(root.bound);
+    protected_symbols.insert(root.base);
+    protected_symbols.insert(
+      root.accumulators.begin(), root.accumulators.end());
+    protected_symbols.insert(
+      root.temporaries.begin(), root.temporaries.end());
+    allowed.insert(root.writes.begin(), root.writes.end());
+  }
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      const exprt *lhs = nullptr;
+      if(instruction.is_assign())
+        lhs = &instruction.assign_lhs();
+      else if(
+        instruction.is_function_call() &&
+        !instruction.call_lhs().is_nil())
+        lhs = &instruction.call_lhs();
+      if(lhs == nullptr)
+        continue;
+      irep_idt direct;
+      irep_idt pointer;
+      const bool protected_write =
+        (symbol_id(*lhs, direct) &&
+         protected_symbols.count(direct) != 0) ||
+        (base_pointer(*lhs, pointer) && pointer == base);
+      if(!protected_write)
+        continue;
+      if(
+        is_start_function(entry.first) && instruction.is_assign() &&
+        value_is(instruction.assign_rhs(), 0))
+        continue;
+      if(
+        entry.first == ID_main && life.first_create != nullptr &&
+        instruction.location_number < life.first_create->location_number)
+        continue;
+      if(allowed.count(&instruction) == 0)
+      {
+        reason = "hier_external_writer";
+        return false;
+      }
+    }
+  }
+  std::set<irep_idt> initial_symbols;
+  for(const auto &root : roots)
+  {
+    initial_symbols.insert(
+      root.required_main_zero.begin(),
+      root.required_main_zero.end());
+  }
+  return
+    hierarchical_main_prefix_control(model, life, reason) &&
+    no_main_symbol_writes_before_create(
+      model, life, initial_symbols, initial_relation, reason) &&
+    flow_alias_free(model, base, reason) &&
+    no_addresses(model, protected_symbols, reason) &&
+    flow_main_control(model, life, property, reason);
+}
+
+bool find_hierarchical_property(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const lifecyclet &life,
+  flow_equality_propertyt &property,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::size_t matches = 0;
+  std::size_t errors = 0;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(call_id(instruction, callee) && is_reach_error(callee))
+      {
+        ++errors;
+        if(entry.first != ID_main)
+        {
+          reason = "hier_error_function";
+          return false;
+        }
+        property.error = &instruction;
+      }
+    }
+  }
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.last_join == nullptr ||
+      instruction.location_number <= life.last_join->location_number)
+      continue;
+    irep_idt callee;
+    if(
+      !call_id(instruction, callee) || !is_assume(callee) ||
+      instruction.call_arguments().size() != 1)
+      continue;
+    irep_idt left;
+    irep_idt right;
+    if(
+      (!unequal_symbols(
+         instruction.call_arguments().front(), left, right) &&
+       !negated_equal_symbols(
+         instruction.call_arguments().front(), left, right)) ||
+      !shared_signed(left, ns) || !shared_signed(right, ns))
+      continue;
+    ++matches;
+    property.left = left;
+    property.right = right;
+    property.assumption = &instruction;
+  }
+  if(
+    matches != 1 || errors != 1 || property.assumption == nullptr ||
+    property.error == nullptr ||
+    property.assumption->location_number >= property.error->location_number)
+  {
+    reason =
+      matches == 0 ? "hier_property" : "hier_property_ambiguous";
+    return false;
+  }
+  return true;
+}
+
+bool hierarchical_fold_proof_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &reason)
+{
+  hierarchical_lifecyclet top;
+  if(!hierarchical_lifecycle(model, ID_main, top, reason))
+    return false;
+  lifecyclet main_life;
+  main_life.first_create = top.first_create;
+  main_life.last_join = top.last_join;
+  main_life.handles = top.handles;
+  main_life.joins = top.joins;
+  main_life.workers.insert(top.workers.begin(), top.workers.end());
+
+  flow_equality_propertyt property;
+  if(
+    !find_hierarchical_property(
+      model, ns, main_life, property, reason))
+    return false;
+
+  std::vector<hierarchical_roott> roots;
+  for(const auto &worker : top.workers)
+  {
+    hierarchical_roott root;
+    if(!hierarchical_root(model, ns, worker, root, reason))
+      return false;
+    roots.push_back(root);
+  }
+  if(
+    roots[0].root == roots[1].root ||
+    roots[0].bound != roots[1].bound ||
+    roots[0].base != roots[1].base ||
+    roots[0].operation != roots[1].operation ||
+    roots[0].counter == roots[1].counter ||
+    !signed_addition_helper(
+      model, ns, roots[0].operation, reason))
+  {
+    if(reason.empty())
+      reason = "hier_root_signature";
+    return false;
+  }
+  std::set<irep_idt> left_owned = roots[0].accumulators;
+  left_owned.insert(
+    roots[0].temporaries.begin(), roots[0].temporaries.end());
+  left_owned.insert(roots[0].counter);
+  left_owned.insert(roots[0].root);
+  std::set<irep_idt> right_owned = roots[1].accumulators;
+  right_owned.insert(
+    roots[1].temporaries.begin(), roots[1].temporaries.end());
+  right_owned.insert(roots[1].counter);
+  right_owned.insert(roots[1].root);
+  std::vector<irep_idt> ownership_overlap;
+  std::set_intersection(
+    left_owned.begin(),
+    left_owned.end(),
+    right_owned.begin(),
+    right_owned.end(),
+    std::back_inserter(ownership_overlap));
+  if(!ownership_overlap.empty())
+  {
+    reason = "hier_root_ownership";
+    return false;
+  }
+  const std::set<irep_idt> expected_roots = {
+    property.left, property.right};
+  const std::set<irep_idt> actual_roots = {
+    roots[0].root, roots[1].root};
+  if(actual_roots != expected_roots)
+  {
+    reason = "hier_property_roots";
+    return false;
+  }
+
+  std::set<irep_idt> required;
+  for(const auto &root : roots)
+  {
+    required.insert(
+      root.required_main_zero.begin(),
+      root.required_main_zero.end());
+  }
+  const goto_programt::instructiont *initial_relation = nullptr;
+  if(
+    !hierarchical_initial_relation(
+      model, main_life, required, initial_relation))
+  {
+    reason = "hier_initial_relation";
+    return false;
+  }
+  if(
+    !hierarchical_global_obligations(
+      model,
+      main_life,
+      property,
+      roots,
+      initial_relation,
+      reason))
+    return false;
+
+  std::cout << "NATIVE_HIERARCHICAL_FOLD applied=1"
+            << " left=" << property.left
+            << " right=" << property.right << '\n';
   return true;
 }
 
@@ -7035,6 +7988,11 @@ bool extremum_cone_proof(
   (void)message_handler;
   const namespacet ns(goto_model.symbol_table);
   std::string reason;
+  if(hierarchical_fold_proof_impl(goto_model, ns, reason))
+    return true;
+  std::cout << "NATIVE_HIERARCHICAL_FOLD applied=0 reason="
+            << reason << '\n';
+  reason.clear();
   if(equivalent_static_partition_proof_impl(goto_model, ns, reason))
     return true;
   std::cout << "NATIVE_RELATIONAL_FLOW applied=0 reason="
