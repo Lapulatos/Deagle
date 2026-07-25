@@ -556,6 +556,20 @@ int cbmc_parse_optionst::doit()
     segmented_fold_conservation_audit(
       goto_model, ui_message_handler);
 
+  if(cmdline.isset("native-nested-iteration-audit"))
+    nested_iteration_homomorphism_audit(
+      goto_model, ui_message_handler);
+
+  if(
+    cmdline.isset("native-jces") &&
+    !cmdline.isset("unwind-suggest") &&
+    nested_iteration_homomorphism_proof(
+      goto_model, ui_message_handler))
+  {
+    std::cout << "VERIFICATION SUCCESSFUL\n";
+    return CPROVER_EXIT_SUCCESS;
+  }
+
   if(
     cmdline.isset("native-jces") &&
     !cmdline.isset("unwind-suggest") &&

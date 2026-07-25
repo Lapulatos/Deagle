@@ -5974,6 +5974,7 @@ bool segmented_fold_initialization(
     main != model.goto_functions.function_map.end(),
     "segmented lifecycle found main");
   bool proved = false;
+  std::set<irep_idt> last_zero;
   for(auto instruction = main->second.body.instructions.begin();
       instruction != first_create; ++instruction)
   {
@@ -6012,17 +6013,29 @@ bool segmented_fold_initialization(
             work.push_back(neighbour);
         }
       }
-      proved = std::all_of(
+      const bool current_proof = std::all_of(
         required.begin(),
         required.end(),
         [&](const irep_idt &symbol) {
           return zero.count(symbol) != 0;
         });
+      if(current_proof)
+      {
+        proved = true;
+        last_zero = std::move(zero);
+      }
+      else if(!proved)
+        last_zero = std::move(zero);
     }
   }
   if(!proved)
   {
     reason = "segmented_initial_relation";
+    for(const auto &symbol : required)
+    {
+      if(last_zero.count(symbol) == 0)
+        reason += "_missing_" + id2string(symbol);
+    }
     return false;
   }
   return true;
@@ -6345,7 +6358,756 @@ bool segmented_fold_conservation_audit_impl(
   }
   return true;
 }
+
+struct nested_iteration_workert
+{
+  irep_idt worker;
+  irep_idt outer;
+  irep_idt outer_bound;
+  irep_idt accumulator;
+  irep_idt inner;
+  irep_idt inner_bound;
+};
+
+std::vector<goto_programt::const_targett>
+nested_iteration_instructions(
+  const goto_programt &program)
+{
+  std::vector<goto_programt::const_targett> result;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(
+      segmented_fold_ignored(*instruction) ||
+      instruction->is_set_return_value() ||
+      instruction->is_end_function())
+      continue;
+    result.push_back(instruction);
+  }
+  return result;
+}
+
+bool nested_iteration_unsigned_add_one(
+  const goto_programt::instructiont &instruction,
+  const namespacet &ns,
+  irep_idt &accumulator)
+{
+  if(
+    !instruction.is_assign() ||
+    !direct_symbol(instruction.assign_lhs(), accumulator))
+    return false;
+  const symbolt *symbol = nullptr;
+  if(
+    ns.lookup(accumulator, symbol) ||
+    !symbol->is_static_lifetime ||
+    symbol->type.id() != ID_unsignedbv)
+    return false;
+  const exprt &rhs = without_cast(instruction.assign_rhs());
+  if(rhs.id() != ID_plus || rhs.operands().size() != 2)
+    return false;
+  mp_integer constant;
+  irep_idt state;
+  return
+    ((direct_symbol(rhs.op0(), state) &&
+      state == accumulator &&
+      constant_eval(rhs.op1(), {}, constant)) ||
+     (direct_symbol(rhs.op1(), state) &&
+      state == accumulator &&
+      constant_eval(rhs.op0(), {}, constant))) &&
+    constant == 1 && rhs.type() == symbol->type;
+}
+
+bool nested_iteration_worker(
+  const irep_idt &worker,
+  const irep_idt &expected_accumulator,
+  const goto_modelt &model,
+  const namespacet &ns,
+  nested_iteration_workert &summary,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(worker);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "nested_missing_worker";
+    return false;
+  }
+  const auto &program = function->second.body;
+  const auto instructions =
+    nested_iteration_instructions(program);
+  if(instructions.size() != 8)
+  {
+    reason =
+      "nested_instruction_count_" +
+      std::to_string(instructions.size());
+    return false;
+  }
+
+  exprt outer_bound;
+  if(
+    !parse_exit_guard(
+      *instructions[0], summary.outer, outer_bound) ||
+    !direct_symbol(outer_bound, summary.outer_bound))
+  {
+    reason = "nested_outer_guard";
+    return false;
+  }
+  const symbolt *outer_symbol = nullptr;
+  const symbolt *outer_bound_symbol = nullptr;
+  if(
+    ns.lookup(summary.outer, outer_symbol) ||
+    ns.lookup(summary.outer_bound, outer_bound_symbol) ||
+    !outer_symbol->is_static_lifetime ||
+    !outer_bound_symbol->is_static_lifetime ||
+    outer_symbol->type.id() != ID_signedbv ||
+    outer_symbol->type != outer_bound_symbol->type)
+  {
+    reason = "nested_outer_type";
+    return false;
+  }
+  if(
+    !instructions[1]->is_assign() ||
+    !direct_symbol(
+      instructions[1]->assign_lhs(), summary.inner) ||
+    !group_action_constant_zero(
+      instructions[1]->assign_rhs()))
+  {
+    reason = "nested_inner_reset";
+    return false;
+  }
+  exprt inner_bound;
+  irep_idt parsed_inner;
+  if(
+    !parse_exit_guard(
+      *instructions[2], parsed_inner, inner_bound) ||
+    parsed_inner != summary.inner ||
+    !direct_symbol(inner_bound, summary.inner_bound))
+  {
+    reason = "nested_inner_guard";
+    return false;
+  }
+  const symbolt *inner_symbol = nullptr;
+  const symbolt *inner_bound_symbol = nullptr;
+  if(
+    ns.lookup(summary.inner, inner_symbol) ||
+    ns.lookup(summary.inner_bound, inner_bound_symbol) ||
+    !inner_symbol->is_static_lifetime ||
+    !inner_bound_symbol->is_static_lifetime ||
+    inner_symbol->type.id() != ID_signedbv ||
+    inner_symbol->type != inner_bound_symbol->type)
+  {
+    reason = "nested_inner_type";
+    return false;
+  }
+  if(
+    !nested_iteration_unsigned_add_one(
+      *instructions[3], ns, summary.accumulator) ||
+    summary.accumulator != expected_accumulator)
+  {
+    reason = "nested_unit_action";
+    return false;
+  }
+  irep_idt incremented;
+  if(
+    !parse_unit_increment(*instructions[4], incremented) ||
+    incremented != summary.inner ||
+    !instructions[5]->is_goto() ||
+    !instructions[5]->condition().is_true() ||
+    instructions[5]->targets.size() != 1 ||
+    instructions[5]->get_target() != instructions[2] ||
+    instructions[2]->get_target() != instructions[6])
+  {
+    reason = "nested_inner_control";
+    return false;
+  }
+  if(
+    !parse_unit_increment(*instructions[6], incremented) ||
+    incremented != summary.outer ||
+    !instructions[7]->is_goto() ||
+    !instructions[7]->condition().is_true() ||
+    instructions[7]->targets.size() != 1 ||
+    instructions[7]->get_target() != instructions[0] ||
+    instructions[0]->get_target()->location_number <=
+      instructions[7]->location_number)
+  {
+    reason = "nested_outer_control";
+    return false;
+  }
+  summary.worker = worker;
+  return true;
+}
+
+bool nested_iteration_aggregated_action(
+  const goto_programt::instructiont &instruction,
+  const irep_idt &expected_accumulator,
+  const typet &accumulator_type,
+  irep_idt &inner_bound)
+{
+  irep_idt lhs;
+  if(
+    !instruction.is_assign() ||
+    !direct_symbol(instruction.assign_lhs(), lhs) ||
+    lhs != expected_accumulator)
+    return false;
+  const exprt &rhs = without_cast(instruction.assign_rhs());
+  if(
+    rhs.id() != ID_plus || rhs.operands().size() != 2 ||
+    rhs.type() != accumulator_type)
+    return false;
+  const exprt *amount = nullptr;
+  irep_idt state;
+  if(
+    direct_symbol(rhs.op0(), state) &&
+    state == expected_accumulator)
+    amount = &rhs.op1();
+  else if(
+    direct_symbol(rhs.op1(), state) &&
+    state == expected_accumulator)
+    amount = &rhs.op0();
+  else
+    return false;
+  return
+    amount->type() == accumulator_type &&
+    direct_symbol(*amount, inner_bound);
+}
+
+bool nested_iteration_aggregated_worker(
+  const irep_idt &worker,
+  const irep_idt &expected_accumulator,
+  const goto_modelt &model,
+  const namespacet &ns,
+  nested_iteration_workert &summary,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(worker);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "aggregate_missing_worker";
+    return false;
+  }
+  const auto instructions =
+    nested_iteration_instructions(function->second.body);
+  if(instructions.size() != 4)
+  {
+    reason =
+      "aggregate_instruction_count_" +
+      std::to_string(instructions.size());
+    return false;
+  }
+  exprt bound;
+  if(
+    !parse_exit_guard(
+      *instructions[0], summary.outer, bound) ||
+    !direct_symbol(bound, summary.outer_bound))
+  {
+    reason = "aggregate_outer_guard";
+    return false;
+  }
+  const symbolt *outer_symbol = nullptr;
+  const symbolt *bound_symbol = nullptr;
+  const symbolt *accumulator_symbol = nullptr;
+  if(
+    ns.lookup(summary.outer, outer_symbol) ||
+    ns.lookup(summary.outer_bound, bound_symbol) ||
+    ns.lookup(expected_accumulator, accumulator_symbol) ||
+    !outer_symbol->is_static_lifetime ||
+    !bound_symbol->is_static_lifetime ||
+    !accumulator_symbol->is_static_lifetime ||
+    outer_symbol->type.id() != ID_signedbv ||
+    outer_symbol->type != bound_symbol->type ||
+    accumulator_symbol->type.id() != ID_unsignedbv)
+  {
+    reason = "aggregate_state_type";
+    return false;
+  }
+  if(
+    !nested_iteration_aggregated_action(
+      *instructions[1],
+      expected_accumulator,
+      accumulator_symbol->type,
+      summary.inner_bound))
+  {
+    reason = "aggregate_action";
+    return false;
+  }
+  const symbolt *inner_bound_symbol = nullptr;
+  if(
+    ns.lookup(summary.inner_bound, inner_bound_symbol) ||
+    !inner_bound_symbol->is_static_lifetime ||
+    inner_bound_symbol->type.id() != ID_signedbv)
+  {
+    reason = "aggregate_inner_bound_type";
+    return false;
+  }
+  irep_idt incremented;
+  if(
+    !parse_unit_increment(*instructions[2], incremented) ||
+    incremented != summary.outer ||
+    !instructions[3]->is_goto() ||
+    !instructions[3]->condition().is_true() ||
+    instructions[3]->targets.size() != 1 ||
+    instructions[3]->get_target() != instructions[0] ||
+    instructions[0]->get_target()->location_number <=
+      instructions[3]->location_number)
+  {
+    reason = "aggregate_outer_control";
+    return false;
+  }
+  summary.worker = worker;
+  summary.accumulator = expected_accumulator;
+  return true;
+}
+
+bool nested_iteration_nonnegative_bound(
+  const goto_modelt &model,
+  const goto_programt::targett &first_create,
+  const irep_idt &bound,
+  std::string &reason)
+{
+  const auto main = model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != model.goto_functions.function_map.end(),
+    "nested lifecycle found main");
+  bool proved = false;
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != first_create; ++instruction)
+  {
+    irep_idt written;
+    if(
+      (instruction->is_assign() &&
+       direct_symbol(instruction->assign_lhs(), written)) ||
+      (instruction->is_function_call() &&
+       !instruction->call_lhs().is_nil() &&
+       direct_symbol(instruction->call_lhs(), written)))
+    {
+      if(written == bound)
+        proved = false;
+    }
+    irep_idt callee;
+    if(
+      !instruction->is_function_call() ||
+      !instruction->call_lhs().is_nil() ||
+      !direct_call_identifier(*instruction, callee) ||
+      instruction->call_arguments().size() != 1 ||
+      !group_action_assume_semantics(callee, model))
+      continue;
+    const exprt &condition =
+      without_cast(instruction->call_arguments().front());
+    if(condition.operands().size() != 2)
+      continue;
+    irep_idt candidate;
+    if(
+      condition.id() == ID_ge &&
+      direct_symbol(condition.op0(), candidate) &&
+      candidate == bound &&
+      group_action_constant_zero(condition.op1()))
+      proved = true;
+    else if(
+      condition.id() == ID_le &&
+      group_action_constant_zero(condition.op0()) &&
+      direct_symbol(condition.op1(), candidate) &&
+      candidate == bound)
+      proved = true;
+  }
+  if(!proved)
+  {
+    reason = "nested_nonnegative_bound";
+    return false;
+  }
+  return true;
+}
+
+bool nested_iteration_protected_accesses(
+  const goto_modelt &model,
+  const std::vector<create_recordt> &creates,
+  const nested_iteration_workert &nested,
+  const nested_iteration_workert &aggregate,
+  std::string &reason)
+{
+  std::set<irep_idt> proof{
+    nested.outer,
+    nested.inner,
+    nested.accumulator,
+    aggregate.outer,
+    aggregate.accumulator};
+  std::set<irep_idt> stable{
+    nested.outer_bound, nested.inner_bound};
+  std::set<irep_idt> protected_symbols = proof;
+  protected_symbols.insert(stable.begin(), stable.end());
+  const std::set<irep_idt> worker_ids{
+    creates[0].worker, creates[1].worker};
+
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(
+        contains_address_of_symbol(
+          instruction.code(), protected_symbols) ||
+        (instruction.has_condition() &&
+         contains_address_of_symbol(
+           instruction.condition(), protected_symbols)))
+      {
+        reason = "nested_address_escape";
+        return false;
+      }
+      if(
+        entry.first != "main" &&
+        entry.first != "__CPROVER_initialize" &&
+        worker_ids.count(entry.first) == 0 &&
+        instruction_mentions_any(
+          instruction, protected_symbols))
+      {
+        reason = "nested_foreign_access";
+        return false;
+      }
+    }
+  }
+
+  const std::set<irep_idt> nested_foreign{
+    aggregate.outer, aggregate.accumulator};
+  const std::set<irep_idt> aggregate_foreign{
+    nested.outer, nested.inner, nested.accumulator};
+  for(std::size_t index = 0; index < 2; ++index)
+  {
+    const auto function = model.goto_functions.function_map.find(
+      index == 0 ? nested.worker : aggregate.worker);
+    const auto &foreign =
+      index == 0 ? nested_foreign : aggregate_foreign;
+    for(const auto &instruction :
+        function->second.body.instructions)
+    {
+      if(instruction_mentions_any(instruction, foreign))
+      {
+        reason = "nested_cross_worker_access";
+        return false;
+      }
+    }
+  }
+
+  const auto main = model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != model.goto_functions.function_map.end(),
+    "nested lifecycle found main");
+  bool create_seen = false;
+  for(const auto &instruction : main->second.body.instructions)
+  {
+    irep_idt callee;
+    if(
+      direct_call_identifier(instruction, callee) &&
+      callee == "pthread_create")
+      create_seen = true;
+    if(!create_seen)
+      continue;
+    if(
+      instruction.is_assign() &&
+      contains_symbol(instruction.assign_lhs(), stable))
+    {
+      reason = "nested_late_parameter_write";
+      return false;
+    }
+    irep_idt written;
+    const bool writes =
+      (instruction.is_assign() &&
+       direct_symbol(instruction.assign_lhs(), written)) ||
+      (instruction.is_function_call() &&
+       !instruction.call_lhs().is_nil() &&
+       direct_symbol(instruction.call_lhs(), written));
+    if(writes && protected_symbols.count(written) != 0)
+    {
+      reason = "nested_late_write";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool nested_iteration_property(
+  const goto_modelt &model,
+  const std::vector<goto_programt::targett> &joins,
+  irep_idt &first,
+  irep_idt &second,
+  std::string &reason)
+{
+  const auto main = model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != model.goto_functions.function_map.end(),
+    "nested lifecycle found main");
+  std::vector<goto_programt::const_targett> calls;
+  bool after_join = false;
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != main->second.body.instructions.end(); ++instruction)
+  {
+    if(instruction == joins.back())
+    {
+      after_join = true;
+      continue;
+    }
+    if(!after_join)
+      continue;
+    if(instruction->is_function_call())
+      calls.push_back(instruction);
+    else if(
+      instruction->is_assign() || instruction->is_goto() ||
+      instruction->is_assume() || instruction->is_assert() ||
+      instruction->is_start_thread() || instruction->is_end_thread() ||
+      instruction->is_atomic_begin() || instruction->is_atomic_end())
+    {
+      reason = "nested_post_join_effect";
+      return false;
+    }
+  }
+  if(calls.size() != 2)
+  {
+    reason = "nested_property_calls";
+    return false;
+  }
+  irep_idt restriction;
+  irep_idt error;
+  if(
+    !direct_call_identifier(*calls[0], restriction) ||
+    calls[0]->call_arguments().size() != 1 ||
+    !group_action_assume_semantics(restriction, model) ||
+    !direct_call_identifier(*calls[1], error) ||
+    !calls[1]->call_arguments().empty() ||
+    !transition_word_error_function(error, model))
+  {
+    reason = "nested_property_shape";
+    return false;
+  }
+  const exprt &bad =
+    without_cast(calls[0]->call_arguments().front());
+  const exprt *left = nullptr;
+  const exprt *right = nullptr;
+  if(bad.id() == ID_notequal && bad.operands().size() == 2)
+  {
+    left = &bad.op0();
+    right = &bad.op1();
+  }
+  else if(
+    bad.id() == ID_not && bad.operands().size() == 1)
+  {
+    const exprt &equality = without_cast(bad.op0());
+    if(
+      equality.id() == ID_equal &&
+      equality.operands().size() == 2)
+    {
+      left = &equality.op0();
+      right = &equality.op1();
+    }
+  }
+  if(
+    left == nullptr || right == nullptr ||
+    !direct_symbol(*left, first) ||
+    !direct_symbol(*right, second) ||
+    first == second)
+  {
+    reason = "nested_property_relation";
+    return false;
+  }
+  std::size_t assertions = 0;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+      assertions += instruction.is_assert();
+  }
+  if(assertions != 1)
+  {
+    reason = "nested_property_count";
+    return false;
+  }
+  return true;
+}
+
+bool nested_iteration_homomorphism_audit_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &reason)
+{
+  goto_modelt &mutable_model = const_cast<goto_modelt &>(model);
+  std::vector<create_recordt> creates;
+  std::vector<goto_programt::targett> joins;
+  if(
+    !collect_lifecycle(
+      mutable_model, ns, creates, joins, reason) ||
+    creates.size() != 2 ||
+    !validate_main_region(
+      mutable_model, ns, creates, joins, reason))
+  {
+    if(reason.empty())
+      reason = "nested_lifecycle";
+    return false;
+  }
+  irep_idt first_accumulator;
+  irep_idt second_accumulator;
+  if(
+    !nested_iteration_property(
+      model,
+      joins,
+      first_accumulator,
+      second_accumulator,
+      reason))
+    return false;
+
+  nested_iteration_workert nested;
+  nested_iteration_workert aggregate;
+  bool summarized = false;
+  std::vector<std::string> candidate_reasons;
+  for(std::size_t permutation = 0; permutation < 2; ++permutation)
+  {
+    nested_iteration_workert candidate_nested;
+    nested_iteration_workert candidate_aggregate;
+    std::string candidate_reason;
+    const irep_idt &left =
+      permutation == 0 ? first_accumulator : second_accumulator;
+    const irep_idt &right =
+      permutation == 0 ? second_accumulator : first_accumulator;
+    if(
+      nested_iteration_worker(
+        creates[0].worker,
+        left,
+        model,
+        ns,
+        candidate_nested,
+        candidate_reason) &&
+      nested_iteration_aggregated_worker(
+        creates[1].worker,
+        right,
+        model,
+        ns,
+        candidate_aggregate,
+        candidate_reason))
+    {
+      nested = std::move(candidate_nested);
+      aggregate = std::move(candidate_aggregate);
+      summarized = true;
+      break;
+    }
+    candidate_reasons.push_back(candidate_reason);
+    if(
+      nested_iteration_worker(
+        creates[1].worker,
+        right,
+        model,
+        ns,
+        candidate_nested,
+        candidate_reason) &&
+      nested_iteration_aggregated_worker(
+        creates[0].worker,
+        left,
+        model,
+        ns,
+        candidate_aggregate,
+        candidate_reason))
+    {
+      nested = std::move(candidate_nested);
+      aggregate = std::move(candidate_aggregate);
+      summarized = true;
+      break;
+    }
+    candidate_reasons.push_back(candidate_reason);
+    reason = candidate_reason;
+  }
+  if(!summarized)
+  {
+    reason = "nested_candidates";
+    for(const auto &candidate_reason : candidate_reasons)
+      reason += "_" + candidate_reason;
+    return false;
+  }
+
+  const auto nested_accumulator =
+    model.symbol_table.symbols.find(nested.accumulator);
+  const auto aggregate_accumulator =
+    model.symbol_table.symbols.find(aggregate.accumulator);
+  const auto inner_bound =
+    model.symbol_table.symbols.find(nested.inner_bound);
+  if(
+    nested_accumulator == model.symbol_table.symbols.end() ||
+    aggregate_accumulator == model.symbol_table.symbols.end() ||
+    inner_bound == model.symbol_table.symbols.end() ||
+    nested_accumulator->second.type !=
+      aggregate_accumulator->second.type ||
+    nested.inner_bound != aggregate.inner_bound ||
+    nested.outer_bound != aggregate.outer_bound ||
+    inner_bound->second.type !=
+      model.symbol_table.symbols.at(nested.inner).type)
+  {
+    reason = "nested_cross_worker_alignment";
+    return false;
+  }
+  const std::set<irep_idt> initial{
+    nested.outer,
+    nested.accumulator,
+    aggregate.outer,
+    aggregate.accumulator};
+  if(
+    initial.size() != 4 ||
+    !segmented_fold_initialization(
+      model,
+      creates.front().instruction,
+      initial,
+      reason) ||
+    !nested_iteration_nonnegative_bound(
+      model,
+      creates.front().instruction,
+      nested.inner_bound,
+      reason) ||
+    !nested_iteration_protected_accesses(
+      model, creates, nested, aggregate, reason))
+    return false;
+  return true;
+}
 } // namespace
+
+void nested_iteration_homomorphism_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  const namespacet ns(goto_model.symbol_table);
+  std::string reason;
+  const bool candidate =
+    nested_iteration_homomorphism_audit_impl(
+      goto_model, ns, reason);
+  std::cout
+    << "NATIVE_NESTED_ITERATION_AUDIT candidate="
+    << (candidate ? 1 : 0);
+  if(!candidate)
+    std::cout << " reason=" << reason;
+  std::cout << '\n';
+}
+
+bool nested_iteration_homomorphism_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  const namespacet ns(goto_model.symbol_table);
+  std::string reason;
+  if(
+    nested_iteration_homomorphism_audit_impl(
+      goto_model, ns, reason))
+  {
+    std::cout
+      << "NATIVE_NESTED_ITERATION applied=1"
+      << " rule=repeat_add_one\n";
+    return true;
+  }
+  std::cout
+    << "NATIVE_NESTED_ITERATION applied=0 reason="
+    << reason << '\n';
+  return false;
+}
 
 void segmented_fold_conservation_audit(
   const goto_modelt &goto_model,

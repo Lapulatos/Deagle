@@ -10,6 +10,18 @@ Module: Join-Scoped Compositional Effect Summary
 class goto_modelt;
 class message_handlert;
 
+/// Audit whether a joined nested loop of unit additions is equivalent to a
+/// joined loop that adds the runtime inner iteration count once.
+void nested_iteration_homomorphism_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// Prove equality of joined accumulators using a runtime nested-iteration
+/// homomorphism.
+bool nested_iteration_homomorphism_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 /// Audit whether two fully joined workers compute the same monoid fold using
 /// different segment boundaries and a conserved sum/bag projection.
 void segmented_fold_conservation_audit(
