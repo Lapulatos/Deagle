@@ -44,6 +44,7 @@ Author: Daniel Kroening, kroening@kroening.com
 #include <analyses/jces_analysis.h>
 #include <analyses/commuting_sequentialization.h>
 #include <analyses/extremum_cone_analysis.h>
+#include <analyses/property_directed_affine_analysis.h>
 #include <analyses/lock_ego_abstraction.h>
 #include <analyses/lock_relational_ai_analysis.h>
 #include <analyses/thread_local_cutoff_analysis.h>
@@ -550,6 +551,17 @@ int cbmc_parse_optionst::doit()
   if(cmdline.isset("native-prefix-affine-envelope"))
     prefix_affine_envelope_transform(goto_model, ui_message_handler);
 
+  if(cmdline.isset("native-property-affine-audit"))
+    property_directed_affine_audit(goto_model, ui_message_handler);
+
+  if(
+    cmdline.isset("native-property-affine-proof") &&
+    property_directed_affine_proof(goto_model, ui_message_handler))
+  {
+    std::cout << "VERIFICATION SUCCESSFUL\n";
+    return CPROVER_EXIT_SUCCESS;
+  }
+
   if(
     cmdline.isset("native-lock-ego-abstraction") &&
     !lock_boundary_ego_thread_abstraction_transform(
@@ -560,6 +572,11 @@ int cbmc_parse_optionst::doit()
     cmdline.isset("native-jces") &&
     !cmdline.isset("unwind-suggest"))
   {
+    if(property_directed_affine_proof(goto_model, ui_message_handler))
+    {
+      std::cout << "VERIFICATION SUCCESSFUL\n";
+      return CPROVER_EXIT_SUCCESS;
+    }
     if(relational_order_law_proof(goto_model, ui_message_handler))
     {
       std::cout << "VERIFICATION SUCCESSFUL\n";

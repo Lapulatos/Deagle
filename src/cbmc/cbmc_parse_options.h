@@ -39,7 +39,7 @@ class optionst;
   "(interference-predicate-fixedpoint)" \
   "(interference-predicate-recursive-worker-fixedpoint)" \
   "(native-lock-ego-abstraction)" \
-  "(native-jces)(native-prefix-affine-envelope)" \
+  "(native-jces)(native-prefix-affine-envelope)(native-property-affine-audit)(native-property-affine-proof)" \
   OPT_BMC \
   "(preprocess)(slice-by-trace):" \
   OPT_FUNCTIONS \
