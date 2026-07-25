@@ -1162,6 +1162,710 @@ struct lattice_audit_statst
   bool complete_coverage = false;
 };
 
+struct token_drain_audit_statst
+{
+  bool terminal_facts = false;
+  bool unsigned_domain = false;
+  bool closed_paths = false;
+  bool guarded_updates = false;
+  bool ordered_transfers = false;
+  bool global_snapshot = false;
+  bool property_discharged = false;
+  std::set<irep_idt> resources;
+  std::size_t token_paths = 0;
+  std::size_t snapshot_workers = 0;
+  std::size_t resource_updates = 0;
+  std::size_t atomic_updates = 0;
+  std::size_t negative_updates = 0;
+  std::size_t guarded_negative_updates = 0;
+  std::vector<mp_integer> property_multipliers;
+};
+
+bool unsigned_resource_domain(
+  const std::set<irep_idt> &resources,
+  const namespacet &ns)
+{
+  std::size_t width = 0;
+  for(const auto &resource : resources)
+  {
+    const symbolt *symbol = nullptr;
+    if(
+      ns.lookup(resource, symbol) || symbol == nullptr ||
+      !symbol->is_static_lifetime ||
+      symbol->type.id() != ID_unsignedbv ||
+      symbol->type.get_bool(ID_C_volatile))
+      return false;
+    const std::size_t current_width =
+      to_unsignedbv_type(symbol->type).get_width();
+    if(width == 0)
+      width = current_width;
+    else if(width != current_width)
+      return false;
+  }
+  return !resources.empty() && width != 0;
+}
+
+bool token_closed_paths(
+  const transition_systemt &system,
+  const std::set<irep_idt> &resources,
+  std::size_t &token_paths)
+{
+  for(const auto &path : system.paths)
+  {
+    std::size_t negative = 0;
+    std::size_t positive = 0;
+    for(const auto &resource : resources)
+    {
+      const auto found = path.find(resource);
+      const mp_integer delta =
+        found == path.end() ? mp_integer(0) : found->second;
+      if(delta == -1)
+        ++negative;
+      else if(delta == 1)
+        ++positive;
+      else if(delta != 0)
+        return false;
+    }
+    if(negative == 0 && positive == 0)
+      continue;
+    if(negative != 1 || positive > 1)
+      return false;
+    ++token_paths;
+  }
+  return token_paths > 0;
+}
+
+bool positive_resource_guard(
+  const exprt &src,
+  irep_idt &resource)
+{
+  const exprt &condition = strip_casts(src);
+  if(condition.id() != ID_not || condition.operands().size() != 1)
+    return false;
+  const exprt &guard = strip_casts(condition.op0());
+  if(guard.id() != ID_gt || guard.operands().size() != 2)
+    return false;
+  mp_integer zero;
+  return
+    symbol_identifier(guard.op0(), resource) &&
+    integer_constant(guard.op1(), zero) && zero == 0;
+}
+
+bool instruction_inside_atomic(
+  const goto_programt &program,
+  goto_programt::const_targett target)
+{
+  std::size_t depth = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction == target)
+      return depth > 0;
+    if(instruction->is_atomic_begin())
+      ++depth;
+    else if(instruction->is_atomic_end())
+    {
+      if(depth == 0)
+        return false;
+      --depth;
+    }
+  }
+  return false;
+}
+
+bool exclusive_source_snapshot_guard(
+  const goto_programt &program,
+  const natural_loopst &loops,
+  const natural_loopst::natural_loopt &loop,
+  goto_programt::const_targett assignment,
+  const irep_idt &resource,
+  const std::set<irep_idt> &resources,
+  const namespacet &ns);
+
+bool guarded_resource_updates(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const std::set<irep_idt> &workers,
+  const std::set<irep_idt> &resources,
+  token_drain_audit_statst &drain_stats)
+{
+  std::map<irep_idt, std::size_t> negative_sites;
+  for(const auto &worker : workers)
+  {
+    const auto found = model.goto_functions.function_map.find(worker);
+    if(found == model.goto_functions.function_map.end())
+      return false;
+    for(const auto &instruction : found->second.body.instructions)
+    {
+      if(!instruction.is_assign())
+        continue;
+      irep_idt lhs;
+      mp_integer delta;
+      if(
+        symbol_identifier(instruction.assign_lhs(), lhs) &&
+        resources.find(lhs) != resources.end() &&
+        translation_delta(instruction, ns, lhs, delta) &&
+        delta == -1)
+        ++negative_sites[lhs];
+    }
+  }
+
+  for(const auto &worker : workers)
+  {
+    const auto found = model.goto_functions.function_map.find(worker);
+    if(found == model.goto_functions.function_map.end())
+      return false;
+    const goto_programt &program = found->second.body;
+    natural_loopst loops;
+    loops(program);
+    for(auto assignment = program.instructions.begin();
+        assignment != program.instructions.end(); ++assignment)
+    {
+      if(!assignment->is_assign())
+        continue;
+      irep_idt lhs;
+      if(
+        !symbol_identifier(assignment->assign_lhs(), lhs) ||
+        resources.find(lhs) == resources.end())
+        continue;
+      ++drain_stats.resource_updates;
+      mp_integer delta;
+      if(
+        !translation_delta(*assignment, ns, lhs, delta) ||
+        (delta != -1 && delta != 1))
+        return false;
+      if(!instruction_inside_atomic(program, assignment))
+        return false;
+      ++drain_stats.atomic_updates;
+      if(delta == 1)
+        continue;
+      ++drain_stats.negative_updates;
+
+      const natural_loopst::natural_loopt *containing = nullptr;
+      for(const auto &entry : loops.loop_map)
+      {
+        if(entry.second.contains(assignment))
+        {
+          if(containing != nullptr)
+            return false;
+          containing = &entry.second;
+        }
+      }
+      if(containing == nullptr)
+        return false;
+
+      bool guarded = false;
+      for(const auto &candidate : *containing)
+      {
+        irep_idt guarded_resource;
+        if(
+          !candidate->is_goto() ||
+          !positive_resource_guard(
+            candidate->condition(), guarded_resource) ||
+          guarded_resource != lhs ||
+          candidate->get_target()->location_number <=
+            assignment->location_number)
+          continue;
+        if(
+          loops.get_dominator_info().dominates(
+            candidate, assignment))
+        {
+          guarded = true;
+          break;
+        }
+      }
+      if(
+        !guarded && negative_sites[lhs] == 1 &&
+        exclusive_source_snapshot_guard(
+          program,
+          loops,
+          *containing,
+          assignment,
+          lhs,
+          resources,
+          ns))
+        guarded = true;
+      if(!guarded)
+        return false;
+      ++drain_stats.guarded_negative_updates;
+    }
+  }
+  return true;
+}
+
+bool collect_positive_resources(
+  const exprt &src,
+  std::set<irep_idt> &resources)
+{
+  const exprt &expr = strip_casts(src);
+  if(expr.id() == ID_or && expr.operands().size() == 2)
+    return
+      collect_positive_resources(expr.op0(), resources) &&
+      collect_positive_resources(expr.op1(), resources);
+  if(expr.id() != ID_gt || expr.operands().size() != 2)
+    return false;
+  irep_idt resource;
+  mp_integer zero;
+  if(
+    !symbol_identifier(expr.op0(), resource) ||
+    !integer_constant(expr.op1(), zero) || zero != 0)
+    return false;
+  return resources.insert(resource).second;
+}
+
+bool same_atomic_region(
+  const goto_programt &program,
+  goto_programt::const_targett left,
+  goto_programt::const_targett right)
+{
+  std::size_t depth = 0;
+  std::size_t region = 0;
+  std::size_t left_region = 0;
+  std::size_t right_region = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_atomic_begin())
+    {
+      if(depth == 0)
+        ++region;
+      ++depth;
+    }
+    if(instruction == left && depth > 0)
+      left_region = region;
+    if(instruction == right && depth > 0)
+      right_region = region;
+    if(instruction->is_atomic_end())
+    {
+      if(depth == 0)
+        return false;
+      --depth;
+    }
+  }
+  return left_region != 0 && left_region == right_region;
+}
+
+bool ordered_resource_transfers(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const std::set<irep_idt> &workers,
+  const std::set<irep_idt> &resources)
+{
+  for(const auto &worker : workers)
+  {
+    const auto found = model.goto_functions.function_map.find(worker);
+    if(found == model.goto_functions.function_map.end())
+      return false;
+    const goto_programt &program = found->second.body;
+    natural_loopst loops;
+    loops(program);
+    for(const auto &entry : loops.loop_map)
+    {
+      std::map<irep_idt, std::size_t> assignments;
+      std::vector<goto_programt::const_targett> increments;
+      std::vector<goto_programt::const_targett> decrements;
+      for(const auto &instruction : entry.second)
+      {
+        if(!instruction->is_assign())
+          continue;
+        irep_idt lhs;
+        mp_integer delta;
+        if(
+          !symbol_identifier(instruction->assign_lhs(), lhs) ||
+          resources.find(lhs) == resources.end() ||
+          !translation_delta(*instruction, ns, lhs, delta))
+          continue;
+        if(++assignments[lhs] != 1)
+          return false;
+        if(delta == 1)
+          increments.push_back(instruction);
+        else if(delta == -1)
+          decrements.push_back(instruction);
+      }
+      if(increments.empty())
+        continue;
+      if(increments.size() != 1 || decrements.size() != 1)
+        return false;
+      if(
+        !same_atomic_region(
+          program, increments.front(), decrements.front()) &&
+        !loops.get_dominator_info().dominates(
+          increments.front(), decrements.front()))
+        return false;
+    }
+  }
+  return true;
+}
+
+bool loop_boolean_guard(
+  const exprt &src,
+  irep_idt &condition_symbol)
+{
+  const exprt &condition = strip_casts(src);
+  if(condition.id() != ID_not || condition.operands().size() != 1)
+    return false;
+  const exprt &truth = strip_casts(condition.op0());
+  if(truth.id() != ID_notequal || truth.operands().size() != 2)
+    return false;
+  mp_integer zero;
+  return
+    symbol_identifier(truth.op0(), condition_symbol) &&
+    integer_constant(truth.op1(), zero) && zero == 0;
+}
+
+bool clean_atomic_snapshot(
+  const goto_programt &program,
+  goto_programt::const_targett snapshot,
+  const std::set<irep_idt> &resources)
+{
+  std::size_t depth = 0;
+  std::size_t region = 0;
+  std::size_t snapshot_region = 0;
+  bool found = false;
+  bool resource_write_in_region = false;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_atomic_begin())
+    {
+      if(depth == 0)
+      {
+        ++region;
+        resource_write_in_region = false;
+      }
+      ++depth;
+    }
+    if(
+      depth > 0 && instruction != snapshot &&
+      instruction->is_assign())
+    {
+      irep_idt lhs;
+      if(
+        symbol_identifier(instruction->assign_lhs(), lhs) &&
+        resources.find(lhs) != resources.end())
+        resource_write_in_region = true;
+    }
+    if(instruction == snapshot)
+    {
+      if(depth == 0 || resource_write_in_region)
+        return false;
+      snapshot_region = region;
+      found = true;
+    }
+    if(instruction->is_atomic_end())
+    {
+      if(depth == 0)
+        return false;
+      --depth;
+      if(found && region == snapshot_region && depth == 0)
+        return !resource_write_in_region;
+    }
+  }
+  return false;
+}
+
+bool exclusive_source_snapshot_guard(
+  const goto_programt &program,
+  const natural_loopst &loops,
+  const natural_loopst::natural_loopt &loop,
+  goto_programt::const_targett assignment,
+  const irep_idt &resource,
+  const std::set<irep_idt> &resources,
+  const namespacet &ns)
+{
+  goto_programt::const_targett head = program.instructions.end();
+  for(const auto &entry : loops.loop_map)
+  {
+    if(&entry.second == &loop)
+    {
+      head = entry.first;
+      break;
+    }
+  }
+  if(
+    head == program.instructions.end() || !head->is_goto() ||
+    !loops.get_dominator_info().dominates(head, assignment))
+    return false;
+  irep_idt condition_symbol;
+  if(!loop_boolean_guard(head->condition(), condition_symbol))
+    return false;
+
+  std::set<irep_idt> singleton{resource};
+  std::vector<goto_programt::const_targett> snapshots;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(!instruction->is_assign())
+      continue;
+    irep_idt lhs;
+    if(
+      !symbol_identifier(instruction->assign_lhs(), lhs) ||
+      lhs != condition_symbol)
+      continue;
+    std::set<irep_idt> observed;
+    if(
+      !collect_positive_resources(
+        instruction->assign_rhs(), observed) ||
+      observed != singleton ||
+      !clean_atomic_snapshot(program, instruction, resources))
+      return false;
+    snapshots.push_back(instruction);
+  }
+  if(snapshots.size() != 2)
+    return false;
+
+  goto_programt::const_targett initial = program.instructions.end();
+  goto_programt::const_targett refresh = program.instructions.end();
+  for(const auto &snapshot : snapshots)
+  {
+    if(loop.contains(snapshot))
+      refresh = snapshot;
+    else if(snapshot->location_number < head->location_number)
+      initial = snapshot;
+  }
+  if(
+    initial == program.instructions.end() ||
+    refresh == program.instructions.end())
+    return false;
+  if(
+    !loops.get_dominator_info().dominates(
+      initial, head))
+    return false;
+  if(
+    !loops.get_dominator_info().dominates(
+      assignment, refresh))
+    return false;
+
+  std::vector<goto_programt::const_targett> destination_increments;
+  for(const auto &instruction : loop)
+  {
+    if(!instruction->is_assign())
+      continue;
+    irep_idt lhs;
+    mp_integer delta;
+    if(
+      !symbol_identifier(instruction->assign_lhs(), lhs) ||
+      resources.find(lhs) == resources.end() ||
+      lhs == resource ||
+      !translation_delta(*instruction, ns, lhs, delta))
+      continue;
+    if(delta == 1)
+      destination_increments.push_back(instruction);
+  }
+  if(destination_increments.size() > 1)
+    return false;
+  if(
+    destination_increments.size() == 1 &&
+    !loops.get_dominator_info().dominates(
+      destination_increments.front(), assignment))
+    return false;
+
+  for(const auto &instruction : loop)
+  {
+    if(
+      instruction->is_backwards_goto() &&
+      instruction->get_target() == head &&
+      !loops.get_dominator_info().dominates(
+        refresh, instruction))
+      return false;
+  }
+  return true;
+}
+
+bool global_drain_snapshot(
+  const goto_modelt &model,
+  const std::set<irep_idt> &workers,
+  const std::set<irep_idt> &resources,
+  std::size_t &snapshot_workers)
+{
+  for(const auto &worker : workers)
+  {
+    const auto found = model.goto_functions.function_map.find(worker);
+    if(found == model.goto_functions.function_map.end())
+      return false;
+    const goto_programt &program = found->second.body;
+    natural_loopst loops;
+    loops(program);
+    bool worker_snapshot = false;
+    for(const auto &entry : loops.loop_map)
+    {
+      irep_idt condition_symbol;
+      if(
+        !entry.first->is_goto() ||
+        !loop_boolean_guard(
+          entry.first->condition(), condition_symbol))
+        continue;
+      const auto exit = entry.first->get_target();
+      if(entry.second.contains(exit))
+        continue;
+
+      bool closed_body = true;
+      std::size_t exits = 0;
+      std::size_t backedges = 0;
+      for(const auto &instruction : entry.second)
+      {
+        for(const auto &successor : program.get_successors(instruction))
+        {
+          if(entry.second.contains(successor))
+            continue;
+          ++exits;
+          if(instruction != entry.first || successor != exit)
+            closed_body = false;
+        }
+        if(
+          instruction->is_backwards_goto() &&
+          instruction->get_target() == entry.first)
+          ++backedges;
+      }
+      if(!closed_body || exits != 1 || backedges == 0)
+        continue;
+
+      std::vector<goto_programt::const_targett> assignments;
+      for(auto instruction = program.instructions.begin();
+          instruction != program.instructions.end(); ++instruction)
+      {
+        if(!instruction->is_assign())
+          continue;
+        irep_idt lhs;
+        if(
+          symbol_identifier(instruction->assign_lhs(), lhs) &&
+          lhs == condition_symbol)
+          assignments.push_back(instruction);
+      }
+      if(assignments.size() != 2)
+        continue;
+
+      goto_programt::const_targett initial = program.instructions.end();
+      goto_programt::const_targett refresh = program.instructions.end();
+      for(const auto &assignment : assignments)
+      {
+        std::set<irep_idt> observed;
+        if(
+          !collect_positive_resources(
+            assignment->assign_rhs(), observed) ||
+          observed != resources ||
+          !clean_atomic_snapshot(
+            program, assignment, resources))
+        {
+          initial = program.instructions.end();
+          refresh = program.instructions.end();
+          break;
+        }
+        if(entry.second.contains(assignment))
+          refresh = assignment;
+        else if(
+          assignment->location_number <
+          entry.first->location_number)
+          initial = assignment;
+      }
+      if(
+        initial == program.instructions.end() ||
+        refresh == program.instructions.end())
+        continue;
+      if(
+        !loops.get_dominator_info().dominates(
+          initial, entry.first))
+        continue;
+
+      bool refreshes_all_backedges = true;
+      for(const auto &instruction : entry.second)
+      {
+        if(
+          instruction->is_backwards_goto() &&
+          instruction->get_target() == entry.first &&
+          !loops.get_dominator_info().dominates(
+            refresh, instruction))
+          refreshes_all_backedges = false;
+      }
+      if(!refreshes_all_backedges)
+        continue;
+      worker_snapshot = true;
+      break;
+    }
+    if(worker_snapshot)
+      ++snapshot_workers;
+  }
+  return snapshot_workers > 0;
+}
+
+bool token_drain_certificate(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const audit_statst &stats,
+  const goto_programt::instructiont *first_create,
+  const affine_formt &property,
+  const transition_systemt &transition_system,
+  const std::map<irep_idt, rationalt> &coefficients,
+  const std::vector<affine_formt> &initial_facts,
+  token_drain_audit_statst &drain_stats)
+{
+  affine_formt invariant;
+  if(
+    !rational_coefficients_to_affine(
+      coefficients, property.constant, invariant) ||
+    !integer_combination(initial_facts, invariant, nullptr) ||
+    !every_path_preserves(transition_system, invariant))
+    return false;
+
+  for(const auto &term : invariant.coefficients)
+  {
+    if(
+      property.coefficients.find(term.first) ==
+        property.coefficients.end() &&
+      transition_system.variables.find(term.first) !=
+        transition_system.variables.end())
+      drain_stats.resources.insert(term.first);
+  }
+  std::vector<affine_formt> join_facts{invariant};
+  for(const auto &resource : drain_stats.resources)
+  {
+    affine_formt zero;
+    zero.coefficients[resource] = 1;
+    join_facts.push_back(zero);
+  }
+  drain_stats.terminal_facts =
+    !drain_stats.resources.empty() &&
+    integer_combination(
+      join_facts,
+      property,
+      &drain_stats.property_multipliers);
+  drain_stats.unsigned_domain =
+    drain_stats.terminal_facts &&
+    unsigned_resource_domain(drain_stats.resources, ns);
+  drain_stats.closed_paths =
+    drain_stats.unsigned_domain &&
+    token_closed_paths(
+      transition_system,
+      drain_stats.resources,
+      drain_stats.token_paths);
+  drain_stats.guarded_updates =
+    drain_stats.closed_paths &&
+    guarded_resource_updates(
+      model,
+      ns,
+      stats.workers,
+      drain_stats.resources,
+      drain_stats);
+  drain_stats.ordered_transfers =
+    drain_stats.guarded_updates &&
+    ordered_resource_transfers(
+      model, ns, stats.workers, drain_stats.resources);
+  drain_stats.global_snapshot =
+    drain_stats.ordered_transfers &&
+    global_drain_snapshot(
+      model,
+      stats.workers,
+      drain_stats.resources,
+      drain_stats.snapshot_workers);
+
+  drain_stats.property_discharged =
+    drain_stats.global_snapshot &&
+    common_bitvector_domain(invariant, ns) &&
+    direct_certificate_coverage(
+      model, stats.workers, first_create, invariant);
+  return drain_stats.property_discharged;
+}
+
 std::string counted_loop_string(
   const std::vector<counted_loopt> &loops)
 {
@@ -1545,6 +2249,19 @@ void property_directed_affine_audit(
       transition_system,
       coefficients,
       initial_facts);
+  token_drain_audit_statst drain_stats;
+  const bool token_drain_discharged =
+    base &&
+    token_drain_certificate(
+      goto_model,
+      ns,
+      stats,
+      first_create,
+      bad_difference,
+      transition_system,
+      coefficients,
+      initial_facts,
+      drain_stats);
   std::cout << "NATIVE_PROPERTY_AFFINE_AUDIT candidate="
             << (syntactic_candidate ? 1 : 0)
             << " transitions=" << (transitions ? 1 : 0)
@@ -1563,6 +2280,32 @@ void property_directed_affine_audit(
             << " lattice_complete_coverage="
             << (lattice_stats.complete_coverage ? 1 : 0)
             << " direct_certificate=" << (direct_certificate ? 1 : 0)
+            << " drain_terminal_facts="
+            << (drain_stats.terminal_facts ? 1 : 0)
+            << " drain_unsigned_domain="
+            << (drain_stats.unsigned_domain ? 1 : 0)
+            << " drain_closed_paths="
+            << (drain_stats.closed_paths ? 1 : 0)
+            << " drain_guarded_updates="
+            << (drain_stats.guarded_updates ? 1 : 0)
+            << " drain_ordered_transfers="
+            << (drain_stats.ordered_transfers ? 1 : 0)
+            << " drain_global_snapshot="
+            << (drain_stats.global_snapshot ? 1 : 0)
+            << " drain_discharged="
+            << (token_drain_discharged ? 1 : 0)
+            << " drain_resources=" << drain_stats.resources.size()
+            << " drain_token_paths=" << drain_stats.token_paths
+            << " drain_snapshot_workers="
+            << drain_stats.snapshot_workers
+            << " drain_resource_updates="
+            << drain_stats.resource_updates
+            << " drain_atomic_updates="
+            << drain_stats.atomic_updates
+            << " drain_negative_updates="
+            << drain_stats.negative_updates
+            << " drain_guarded_negative_updates="
+            << drain_stats.guarded_negative_updates
             << " initial_facts=" << initial_facts.size()
             << " property_symbols=" << bad_difference.coefficients.size()
             << " workers=" << stats.workers.size()
@@ -1580,6 +2323,10 @@ void property_directed_affine_audit(
   if(!lattice_multipliers.empty())
     std::cout << " lattice_multipliers="
               << integer_multipliers_string(lattice_multipliers);
+  if(!drain_stats.property_multipliers.empty())
+    std::cout << " drain_multipliers="
+              << integer_multipliers_string(
+                   drain_stats.property_multipliers);
   if(!initial_facts.empty())
     std::cout << " initial_equalities="
               << affine_facts_string(initial_facts);
@@ -1658,11 +2405,29 @@ bool property_directed_affine_proof(
       equal_loop_pairs,
       lattice_multipliers,
       lattice_stats);
-  if(!direct_certificate && !lattice_certificate)
+  token_drain_audit_statst drain_stats;
+  const bool drain_certificate =
+    !direct_certificate && !lattice_certificate &&
+    token_drain_certificate(
+      goto_model,
+      ns,
+      stats,
+      first_create,
+      bad_difference,
+      transition_system,
+      coefficients,
+      initial_facts,
+      drain_stats);
+  if(
+    !direct_certificate && !lattice_certificate &&
+    !drain_certificate)
     return false;
 
   std::cout << "NATIVE_PROPERTY_AFFINE_CERTIFICATE applied=1"
-            << " mode=" << (direct_certificate ? "direct" : "lattice")
+            << " mode="
+            << (direct_certificate
+                  ? "direct"
+                  : lattice_certificate ? "lattice" : "token-drain")
             << " workers=" << stats.workers.size()
             << " paths=" << transition_system.explored_paths
             << " relation=" << coefficient_string(coefficients);
@@ -1671,6 +2436,14 @@ bool property_directed_affine_proof(
               << " lattice_pairs=" << equal_loop_pairs
               << " lattice_multipliers="
               << integer_multipliers_string(lattice_multipliers);
+  if(drain_certificate)
+    std::cout << " drain_resources=" << drain_stats.resources.size()
+              << " drain_token_paths=" << drain_stats.token_paths
+              << " drain_snapshot_workers="
+              << drain_stats.snapshot_workers
+              << " drain_multipliers="
+              << integer_multipliers_string(
+                   drain_stats.property_multipliers);
   std::cout << '\n';
   return true;
 }
