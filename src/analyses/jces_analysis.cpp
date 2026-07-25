@@ -5649,7 +5649,743 @@ bool group_action_cancellation_audit_impl(
       "_inverse_" + inverse_reason;
   return false;
 }
+
+struct segmented_fold_workert
+{
+  irep_idt worker;
+  irep_idt sum;
+  irep_idt bag;
+  irep_idt induction;
+  irep_idt bound;
+  irep_idt input;
+  irep_idt helper;
+  exprt element;
+};
+
+bool segmented_fold_ignored(
+  const goto_programt::instructiont &instruction)
+{
+  return
+    instruction.is_skip() || instruction.is_location() ||
+    instruction.is_decl() || instruction.is_dead();
+}
+
+bool segmented_fold_call(
+  const goto_programt::instructiont &instruction,
+  const irep_idt &lhs,
+  const irep_idt &helper,
+  const exprt &first,
+  const exprt &second)
+{
+  irep_idt actual_lhs;
+  irep_idt actual_helper;
+  return
+    instruction.is_function_call() &&
+    direct_symbol(instruction.call_lhs(), actual_lhs) &&
+    actual_lhs == lhs &&
+    direct_call_identifier(instruction, actual_helper) &&
+    actual_helper == helper &&
+    instruction.call_arguments().size() == 2 &&
+    without_cast(instruction.call_arguments()[0]) ==
+      without_cast(first) &&
+    without_cast(instruction.call_arguments()[1]) ==
+      without_cast(second);
+}
+
+bool segmented_fold_worker(
+  const irep_idt &worker,
+  const irep_idt &expected_sum,
+  const goto_modelt &model,
+  const namespacet &ns,
+  segmented_fold_workert &summary,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(worker);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "segmented_missing_worker";
+    return false;
+  }
+  const auto &program = function->second.body;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : program.instructions)
+    positions.emplace(&instruction, position++);
+
+  auto loop_head = program.instructions.end();
+  auto backedge = program.instructions.end();
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(!instruction->is_goto())
+      continue;
+    if(instruction->targets.size() != 1)
+    {
+      reason = "segmented_multi_target";
+      return false;
+    }
+    if(
+      positions.at(&*instruction->get_target()) <
+      positions.at(&*instruction))
+    {
+      if(
+        !instruction->condition().is_true() ||
+        backedge != program.instructions.end())
+      {
+        reason = "segmented_backedge";
+        return false;
+      }
+      backedge = instruction;
+      loop_head = instruction->get_target();
+    }
+  }
+  if(backedge == program.instructions.end())
+  {
+    reason = "segmented_no_loop";
+    return false;
+  }
+
+  exprt bound;
+  if(!parse_exit_guard(*loop_head, summary.induction, bound))
+  {
+    reason = "segmented_loop_guard";
+    return false;
+  }
+  if(!direct_symbol(bound, summary.bound))
+  {
+    reason = "segmented_bound";
+    return false;
+  }
+  const symbolt *induction_symbol = nullptr;
+  const symbolt *bound_symbol = nullptr;
+  if(
+    ns.lookup(summary.induction, induction_symbol) ||
+    ns.lookup(summary.bound, bound_symbol) ||
+    !induction_symbol->is_static_lifetime ||
+    !bound_symbol->is_static_lifetime ||
+    induction_symbol->type != bound_symbol->type ||
+    (induction_symbol->type.id() != ID_signedbv &&
+     induction_symbol->type.id() != ID_unsignedbv))
+  {
+    reason = "segmented_induction_type";
+    return false;
+  }
+
+  for(auto instruction = program.instructions.begin();
+      instruction != loop_head; ++instruction)
+  {
+    if(!segmented_fold_ignored(*instruction))
+    {
+      reason = "segmented_prefix_effect";
+      return false;
+    }
+  }
+
+  std::vector<goto_programt::const_targett> body;
+  for(auto instruction = std::next(loop_head);
+      instruction != backedge; ++instruction)
+  {
+    if(!segmented_fold_ignored(*instruction))
+      body.push_back(instruction);
+  }
+  if(body.size() != 7)
+  {
+    reason = "segmented_body_size";
+    return false;
+  }
+
+  irep_idt preview;
+  if(
+    !body[0]->is_function_call() ||
+    !direct_symbol(body[0]->call_lhs(), preview) ||
+    !direct_call_identifier(*body[0], summary.helper) ||
+    body[0]->call_arguments().size() != 2 ||
+    !direct_symbol(body[0]->call_arguments()[0], summary.bag) ||
+    !group_action_array_application(
+      body[0]->call_arguments()[1],
+      summary.induction,
+      summary.input))
+  {
+    reason = "segmented_preview";
+    return false;
+  }
+  summary.element = body[0]->call_arguments()[1];
+  const symbolt *sum_symbol = nullptr;
+  const symbolt *bag_symbol = nullptr;
+  const symbolt *input_symbol = nullptr;
+  if(
+    ns.lookup(expected_sum, sum_symbol) ||
+    ns.lookup(summary.bag, bag_symbol) ||
+    ns.lookup(summary.input, input_symbol) ||
+    !sum_symbol->is_static_lifetime ||
+    !bag_symbol->is_static_lifetime ||
+    !input_symbol->is_static_lifetime ||
+    sum_symbol->type != bag_symbol->type ||
+    summary.element.type() != sum_symbol->type)
+  {
+    reason = "segmented_state_type";
+    return false;
+  }
+  summary.sum = expected_sum;
+
+  if(
+    !body[1]->is_goto() ||
+    body[1]->condition().is_true() ||
+    body[1]->targets.size() != 1 ||
+    body[1]->get_target() != body[4])
+  {
+    reason = "segmented_branch";
+    return false;
+  }
+  const symbol_exprt bag_expr(summary.bag, bag_symbol->type);
+  const symbol_exprt sum_expr(summary.sum, sum_symbol->type);
+  if(
+    !segmented_fold_call(
+      *body[2],
+      summary.bag,
+      summary.helper,
+      bag_expr,
+      summary.element))
+  {
+    reason = "segmented_accumulate";
+    return false;
+  }
+  if(
+    !body[3]->is_goto() ||
+    !body[3]->condition().is_true() ||
+    body[3]->targets.size() != 1 ||
+    body[3]->get_target() != body[6])
+  {
+    reason = "segmented_accumulate_exit";
+    return false;
+  }
+  if(
+    !segmented_fold_call(
+      *body[4],
+      summary.sum,
+      summary.helper,
+      sum_expr,
+      bag_expr))
+  {
+    reason = "segmented_flush_sum";
+    return false;
+  }
+  irep_idt assigned_bag;
+  if(
+    !body[5]->is_assign() ||
+    !direct_symbol(body[5]->assign_lhs(), assigned_bag) ||
+    assigned_bag != summary.bag ||
+    without_cast(body[5]->assign_rhs()) !=
+      without_cast(summary.element))
+  {
+    reason = "segmented_flush_bag";
+    return false;
+  }
+  irep_idt incremented;
+  if(
+    !parse_unit_increment(*body[6], incremented) ||
+    incremented != summary.induction)
+  {
+    reason = "segmented_increment";
+    return false;
+  }
+
+  std::vector<goto_programt::const_targett> suffix;
+  for(auto instruction = std::next(backedge);
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(
+      segmented_fold_ignored(*instruction) ||
+      instruction->is_set_return_value() ||
+      instruction->is_end_function())
+      continue;
+    suffix.push_back(instruction);
+  }
+  if(
+    suffix.size() != 1 ||
+    loop_head->get_target() != suffix.front() ||
+    !segmented_fold_call(
+      *suffix.front(),
+      summary.sum,
+      summary.helper,
+      sum_expr,
+      bag_expr))
+  {
+    reason = "segmented_finalize";
+    return false;
+  }
+
+  if(
+    !group_action_pure_arithmetic_helper(
+      summary.helper, ID_plus, model, ns))
+  {
+    reason = "segmented_helper";
+    return false;
+  }
+  summary.worker = worker;
+  return true;
+}
+
+void segmented_fold_relation_facts(
+  const exprt &src,
+  std::map<irep_idt, std::set<irep_idt>> &equal,
+  std::set<irep_idt> &zero)
+{
+  const exprt &expr = without_cast(src);
+  if(expr.id() == ID_and)
+  {
+    for(const auto &operand : expr.operands())
+      segmented_fold_relation_facts(operand, equal, zero);
+    return;
+  }
+  if(expr.id() != ID_equal || expr.operands().size() != 2)
+    return;
+  irep_idt first;
+  irep_idt second;
+  if(
+    direct_symbol(expr.op0(), first) &&
+    direct_symbol(expr.op1(), second))
+  {
+    equal[first].insert(second);
+    equal[second].insert(first);
+    return;
+  }
+  if(
+    direct_symbol(expr.op0(), first) &&
+    group_action_constant_zero(expr.op1()))
+    zero.insert(first);
+  else if(
+    direct_symbol(expr.op1(), first) &&
+    group_action_constant_zero(expr.op0()))
+    zero.insert(first);
+}
+
+bool segmented_fold_initialization(
+  const goto_modelt &model,
+  const goto_programt::targett &first_create,
+  const std::set<irep_idt> &required,
+  std::string &reason)
+{
+  const auto main = model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != model.goto_functions.function_map.end(),
+    "segmented lifecycle found main");
+  bool proved = false;
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != first_create; ++instruction)
+  {
+    irep_idt written;
+    if(
+      (instruction->is_assign() &&
+       direct_symbol(instruction->assign_lhs(), written)) ||
+      (instruction->is_function_call() &&
+       !instruction->call_lhs().is_nil() &&
+       direct_symbol(instruction->call_lhs(), written)))
+    {
+      if(required.count(written) != 0)
+        proved = false;
+    }
+    irep_idt callee;
+    if(
+      instruction->is_function_call() &&
+      instruction->call_lhs().is_nil() &&
+      direct_call_identifier(*instruction, callee) &&
+      instruction->call_arguments().size() == 1 &&
+      group_action_assume_semantics(callee, model))
+    {
+      std::map<irep_idt, std::set<irep_idt>> equal;
+      std::set<irep_idt> zero;
+      segmented_fold_relation_facts(
+        instruction->call_arguments().front(), equal, zero);
+      std::vector<irep_idt> work(zero.begin(), zero.end());
+      for(std::size_t index = 0; index < work.size(); ++index)
+      {
+        const auto neighbours = equal.find(work[index]);
+        if(neighbours == equal.end())
+          continue;
+        for(const auto &neighbour : neighbours->second)
+        {
+          if(zero.insert(neighbour).second)
+            work.push_back(neighbour);
+        }
+      }
+      proved = std::all_of(
+        required.begin(),
+        required.end(),
+        [&](const irep_idt &symbol) {
+          return zero.count(symbol) != 0;
+        });
+    }
+  }
+  if(!proved)
+  {
+    reason = "segmented_initial_relation";
+    return false;
+  }
+  return true;
+}
+
+bool segmented_fold_property(
+  const goto_modelt &model,
+  const std::vector<goto_programt::targett> &joins,
+  irep_idt &first,
+  irep_idt &second,
+  std::string &reason)
+{
+  const auto main = model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != model.goto_functions.function_map.end(),
+    "segmented lifecycle found main");
+  std::vector<goto_programt::const_targett> calls;
+  bool after_join = false;
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != main->second.body.instructions.end(); ++instruction)
+  {
+    if(instruction == joins.back())
+    {
+      after_join = true;
+      continue;
+    }
+    if(!after_join)
+      continue;
+    if(instruction->is_function_call())
+      calls.push_back(instruction);
+    else if(
+      instruction->is_assign() || instruction->is_goto() ||
+      instruction->is_assume() || instruction->is_assert() ||
+      instruction->is_start_thread() || instruction->is_end_thread() ||
+      instruction->is_atomic_begin() || instruction->is_atomic_end())
+    {
+      reason = "segmented_post_join_effect";
+      return false;
+    }
+  }
+  if(calls.size() != 2)
+  {
+    reason = "segmented_property_calls";
+    return false;
+  }
+  irep_idt restriction;
+  irep_idt error;
+  if(
+    !direct_call_identifier(*calls[0], restriction) ||
+    calls[0]->call_arguments().size() != 1 ||
+    !group_action_assume_semantics(restriction, model) ||
+    !direct_call_identifier(*calls[1], error) ||
+    !calls[1]->call_arguments().empty() ||
+    !transition_word_error_function(error, model))
+  {
+    reason = "segmented_property_shape";
+    return false;
+  }
+  const exprt &bad =
+    without_cast(calls[0]->call_arguments().front());
+  if(
+    bad.id() != ID_notequal || bad.operands().size() != 2 ||
+    !direct_symbol(bad.op0(), first) ||
+    !direct_symbol(bad.op1(), second) ||
+    first == second)
+  {
+    reason = "segmented_property_relation";
+    return false;
+  }
+  std::size_t assertions = 0;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+      assertions += instruction.is_assert();
+  }
+  if(assertions != 1)
+  {
+    reason = "segmented_property_count";
+    return false;
+  }
+  return true;
+}
+
+bool segmented_fold_protected_accesses(
+  const goto_modelt &model,
+  const std::vector<create_recordt> &creates,
+  const segmented_fold_workert workers[2],
+  std::string &reason)
+{
+  std::set<irep_idt> proof{
+    workers[0].sum,
+    workers[0].bag,
+    workers[0].induction,
+    workers[1].sum,
+    workers[1].bag,
+    workers[1].induction};
+  std::set<irep_idt> stable{
+    workers[0].bound, workers[0].input};
+  std::set<irep_idt> protected_symbols = proof;
+  protected_symbols.insert(stable.begin(), stable.end());
+  std::set<irep_idt> worker_ids{
+    creates[0].worker, creates[1].worker};
+
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(
+        contains_address_of_symbol(
+          instruction.code(), protected_symbols) ||
+        (instruction.has_condition() &&
+         contains_address_of_symbol(
+           instruction.condition(), protected_symbols)))
+      {
+        reason = "segmented_address_escape";
+        return false;
+      }
+      if(
+        entry.first != "main" &&
+        entry.first != "__CPROVER_initialize" &&
+        worker_ids.count(entry.first) == 0 &&
+        instruction_mentions_any(
+          instruction, protected_symbols))
+      {
+        reason = "segmented_foreign_access";
+        return false;
+      }
+      if(
+        worker_ids.count(entry.first) != 0 &&
+        instruction.is_assign())
+      {
+        const exprt &lhs = without_cast(instruction.assign_lhs());
+        if(lhs.id() == ID_dereference || lhs.id() == ID_index)
+        {
+          reason = "segmented_pointer_write";
+          return false;
+        }
+      }
+    }
+  }
+
+  const auto main = model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != model.goto_functions.function_map.end(),
+    "segmented lifecycle found main");
+  bool create_seen = false;
+  for(const auto &instruction : main->second.body.instructions)
+  {
+    irep_idt callee;
+    if(
+      direct_call_identifier(instruction, callee) &&
+      callee == "pthread_create")
+      create_seen = true;
+    if(!create_seen)
+      continue;
+    if(
+      instruction.is_assign() &&
+      contains_symbol(instruction.assign_lhs(), stable))
+    {
+      reason = "segmented_late_input_write";
+      return false;
+    }
+    irep_idt written;
+    const bool writes =
+      (instruction.is_assign() &&
+       direct_symbol(instruction.assign_lhs(), written)) ||
+      (instruction.is_function_call() &&
+       !instruction.call_lhs().is_nil() &&
+       direct_symbol(instruction.call_lhs(), written));
+    if(writes && protected_symbols.count(written) != 0)
+    {
+      reason = "segmented_late_write";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool segmented_fold_conservation_audit_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &reason)
+{
+  goto_modelt &mutable_model = const_cast<goto_modelt &>(model);
+  std::vector<create_recordt> creates;
+  std::vector<goto_programt::targett> joins;
+  if(
+    !collect_lifecycle(
+      mutable_model, ns, creates, joins, reason) ||
+    creates.size() != 2 ||
+    !validate_main_region(
+      mutable_model, ns, creates, joins, reason))
+  {
+    if(reason.empty())
+      reason = "segmented_lifecycle";
+    return false;
+  }
+
+  irep_idt first_sum;
+  irep_idt second_sum;
+  if(
+    !segmented_fold_property(
+      model, joins, first_sum, second_sum, reason))
+    return false;
+
+  segmented_fold_workert workers[2];
+  bool summarized = false;
+  for(std::size_t permutation = 0; permutation < 2; ++permutation)
+  {
+    segmented_fold_workert candidates[2];
+    std::string candidate_reason;
+    const irep_idt &left =
+      permutation == 0 ? first_sum : second_sum;
+    const irep_idt &right =
+      permutation == 0 ? second_sum : first_sum;
+    if(
+      segmented_fold_worker(
+        creates[0].worker,
+        left,
+        model,
+        ns,
+        candidates[0],
+        candidate_reason) &&
+      segmented_fold_worker(
+        creates[1].worker,
+        right,
+        model,
+        ns,
+        candidates[1],
+        candidate_reason))
+    {
+      workers[0] = std::move(candidates[0]);
+      workers[1] = std::move(candidates[1]);
+      summarized = true;
+      break;
+    }
+    reason = candidate_reason;
+  }
+  if(!summarized)
+    return false;
+
+  std::set<irep_idt> distinct{
+    workers[0].sum,
+    workers[0].bag,
+    workers[0].induction,
+    workers[1].sum,
+    workers[1].bag,
+    workers[1].induction};
+  if(distinct.size() != 6)
+  {
+    reason = "segmented_distinct_state";
+    return false;
+  }
+  const auto first_sum_symbol =
+    model.symbol_table.symbols.find(workers[0].sum);
+  const auto second_sum_symbol =
+    model.symbol_table.symbols.find(workers[1].sum);
+  if(
+    first_sum_symbol == model.symbol_table.symbols.end() ||
+    second_sum_symbol == model.symbol_table.symbols.end() ||
+    first_sum_symbol->second.type != second_sum_symbol->second.type ||
+    workers[0].helper != workers[1].helper ||
+    workers[0].input != workers[1].input ||
+    workers[0].bound != workers[1].bound)
+  {
+    reason = "segmented_cross_worker_state";
+    return false;
+  }
+  exprt right_element = workers[1].element;
+  group_action_replace_symbol(
+    right_element,
+    workers[1].induction,
+    workers[0].induction,
+    model);
+  exprt left_element = workers[0].element;
+  simplify_expr(left_element, ns);
+  simplify_expr(right_element, ns);
+  if(left_element != right_element)
+  {
+    reason = "segmented_input_alignment";
+    return false;
+  }
+  if(
+    !segmented_fold_initialization(
+      model,
+      creates.front().instruction,
+      distinct,
+      reason) ||
+    !segmented_fold_protected_accesses(
+      model, creates, workers, reason))
+    return false;
+
+  const std::set<irep_idt> left_foreign{
+    workers[1].sum,
+    workers[1].bag,
+    workers[1].induction};
+  const std::set<irep_idt> right_foreign{
+    workers[0].sum,
+    workers[0].bag,
+    workers[0].induction};
+  for(std::size_t index = 0; index < 2; ++index)
+  {
+    const auto function =
+      model.goto_functions.function_map.find(workers[index].worker);
+    const auto &foreign =
+      index == 0 ? left_foreign : right_foreign;
+    for(const auto &instruction :
+        function->second.body.instructions)
+    {
+      if(instruction_mentions_any(instruction, foreign))
+      {
+        reason = "segmented_foreign_state";
+        return false;
+      }
+    }
+  }
+  return true;
+}
 } // namespace
+
+void segmented_fold_conservation_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  const namespacet ns(goto_model.symbol_table);
+  std::string reason;
+  const bool candidate =
+    segmented_fold_conservation_audit_impl(
+      goto_model, ns, reason);
+  std::cout
+    << "NATIVE_SEGMENTED_FOLD_AUDIT candidate="
+    << (candidate ? 1 : 0);
+  if(!candidate)
+    std::cout << " reason=" << reason;
+  std::cout << '\n';
+}
+
+bool segmented_fold_conservation_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  const namespacet ns(goto_model.symbol_table);
+  std::string reason;
+  if(
+    segmented_fold_conservation_audit_impl(
+      goto_model, ns, reason))
+  {
+    std::cout
+      << "NATIVE_SEGMENTED_FOLD applied=1"
+      << " projection=sum_plus_bag\n";
+    return true;
+  }
+  std::cout
+    << "NATIVE_SEGMENTED_FOLD applied=0 reason="
+    << reason << '\n';
+  return false;
+}
 
 void group_action_cancellation_audit(
   const goto_modelt &goto_model,

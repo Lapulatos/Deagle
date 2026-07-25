@@ -69,6 +69,7 @@ def get_result(remove = True):
                 or line.startswith("NATIVE_PUBLICATION_FRONTIER ")
                 or line.startswith("NATIVE_RELATIONAL_BISIMULATION ")
                 or line.startswith("NATIVE_GROUP_ACTION_CANCELLATION ")
+                or line.startswith("NATIVE_SEGMENTED_FOLD ")
                 or line.startswith("COUNTERFACTUAL_UIP_PROFILE ")
                 or line.startswith("COUNTERFACTUAL_UIP_DOMAIN ")
                 or line.startswith("COUNTERFACTUAL_UIP_DOMAIN_SOURCE ")

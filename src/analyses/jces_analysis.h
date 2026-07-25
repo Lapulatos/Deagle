@@ -10,6 +10,18 @@ Module: Join-Scoped Compositional Effect Summary
 class goto_modelt;
 class message_handlert;
 
+/// Audit whether two fully joined workers compute the same monoid fold using
+/// different segment boundaries and a conserved sum/bag projection.
+void segmented_fold_conservation_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// Prove equality of two fully joined segmented folds by the invariant
+/// projection sum (+) bag.
+bool segmented_fold_conservation_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 /// Audit whether fully joined atomic worker loops form inverse group actions
 /// whose combined word restores one shared state to its identity.
 void group_action_cancellation_audit(
