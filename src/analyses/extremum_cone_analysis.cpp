@@ -17156,6 +17156,780 @@ bool publication_frontier_sequence_audit_impl(
     "array_" + array_reason + "_filter_" + reason;
   return false;
 }
+
+struct relational_bisimulation_mappingt
+{
+  std::map<irep_idt, irep_idt> forward;
+  std::map<irep_idt, irep_idt> reverse;
+};
+
+bool relational_bisimulation_contains_nondet(const exprt &expr)
+{
+  if(
+    expr.id() == ID_side_effect &&
+    to_side_effect_expr(expr).get_statement() == ID_nondet)
+    return true;
+  return std::any_of(
+    expr.operands().begin(),
+    expr.operands().end(),
+    relational_bisimulation_contains_nondet);
+}
+
+bool relational_bisimulation_bind(
+  const irep_idt &left,
+  const irep_idt &right,
+  const namespacet &ns,
+  relational_bisimulation_mappingt &mapping,
+  std::string &reason)
+{
+  const auto existing = mapping.forward.find(left);
+  if(existing != mapping.forward.end())
+  {
+    if(existing->second != right)
+    {
+      reason = "symbol_mapping_conflict";
+      return false;
+    }
+    return true;
+  }
+  const auto inverse = mapping.reverse.find(right);
+  if(inverse != mapping.reverse.end() && inverse->second != left)
+  {
+    reason = "symbol_mapping_noninjective";
+    return false;
+  }
+  const symbolt *left_symbol = lookup(left, ns);
+  const symbolt *right_symbol = lookup(right, ns);
+  if(
+    left_symbol == nullptr || right_symbol == nullptr ||
+    left_symbol->type != right_symbol->type ||
+    left_symbol->is_static_lifetime != right_symbol->is_static_lifetime ||
+    left_symbol->is_type != right_symbol->is_type)
+  {
+    reason = "symbol_type";
+    return false;
+  }
+  if(
+    left_symbol->type.id() == ID_code &&
+    left != right)
+  {
+    reason = "callee_mapping";
+    return false;
+  }
+  mapping.forward.emplace(left, right);
+  mapping.reverse.emplace(right, left);
+  return true;
+}
+
+bool relational_bisimulation_expression(
+  const exprt &left,
+  const exprt &right,
+  const namespacet &ns,
+  relational_bisimulation_mappingt &mapping,
+  std::string &reason)
+{
+  if(
+    left.id() != right.id() ||
+    left.type() != right.type() ||
+    left.operands().size() != right.operands().size())
+  {
+    reason = "expression_shape";
+    return false;
+  }
+  if(relational_bisimulation_contains_nondet(left))
+  {
+    reason = "worker_nondeterminism";
+    return false;
+  }
+  if(left.id() == ID_symbol)
+  {
+    return relational_bisimulation_bind(
+      to_symbol_expr(left).get_identifier(),
+      to_symbol_expr(right).get_identifier(),
+      ns,
+      mapping,
+      reason);
+  }
+  if(
+    (left.id() == ID_constant &&
+     left.get(ID_value) != right.get(ID_value)) ||
+    left.get(ID_statement) != right.get(ID_statement) ||
+    left.get(ID_component_name) != right.get(ID_component_name))
+  {
+    reason = "expression_value";
+    return false;
+  }
+  for(std::size_t index = 0; index < left.operands().size(); ++index)
+  {
+    if(
+      !relational_bisimulation_expression(
+        left.operands()[index],
+        right.operands()[index],
+        ns,
+        mapping,
+        reason))
+      return false;
+  }
+  return true;
+}
+
+bool relational_bisimulation_programs(
+  const goto_programt &left,
+  const goto_programt &right,
+  const namespacet &ns,
+  relational_bisimulation_mappingt &mapping,
+  std::string &reason)
+{
+  if(left.instructions.size() != right.instructions.size())
+  {
+    reason = "cfg_size";
+    return false;
+  }
+  std::map<const goto_programt::instructiont *, std::size_t> left_indices;
+  std::map<const goto_programt::instructiont *, std::size_t> right_indices;
+  std::size_t ordinal = 0;
+  for(const auto &instruction : left.instructions)
+    left_indices.emplace(&instruction, ordinal++);
+  ordinal = 0;
+  for(const auto &instruction : right.instructions)
+    right_indices.emplace(&instruction, ordinal++);
+
+  auto left_instruction = left.instructions.begin();
+  auto right_instruction = right.instructions.begin();
+  for(;
+      left_instruction != left.instructions.end();
+      ++left_instruction, ++right_instruction)
+  {
+    if(
+      left_instruction->type() != right_instruction->type() ||
+      left_instruction->targets.size() !=
+        right_instruction->targets.size())
+    {
+      reason = "cfg_instruction";
+      return false;
+    }
+    auto left_target = left_instruction->targets.begin();
+    auto right_target = right_instruction->targets.begin();
+    for(;
+        left_target != left_instruction->targets.end();
+        ++left_target, ++right_target)
+    {
+      if(
+        left_indices.at(&**left_target) !=
+        right_indices.at(&**right_target))
+      {
+        reason = "cfg_edge";
+        return false;
+      }
+    }
+    if(
+      left_instruction->has_condition() !=
+        right_instruction->has_condition())
+    {
+      reason = "cfg_condition";
+      return false;
+    }
+    if(
+      (left_instruction->has_condition() &&
+       !relational_bisimulation_expression(
+         left_instruction->condition(),
+         right_instruction->condition(),
+         ns,
+         mapping,
+         reason)) ||
+      !relational_bisimulation_expression(
+        left_instruction->code(),
+        right_instruction->code(),
+        ns,
+        mapping,
+        reason))
+      return false;
+  }
+  return true;
+}
+
+bool relational_bisimulation_function_effects(
+  const goto_modelt &model,
+  const irep_idt &function,
+  const namespacet &ns,
+  std::set<irep_idt> &visiting,
+  std::set<irep_idt> &reads,
+  std::set<irep_idt> &writes,
+  std::string &reason)
+{
+  if(!visiting.insert(function).second)
+  {
+    reason = "recursive_helper";
+    return false;
+  }
+  const auto found =
+    model.goto_functions.function_map.find(function);
+  if(
+    found == model.goto_functions.function_map.end() ||
+    !found->second.body_available())
+  {
+    reason = "helper_body";
+    visiting.erase(function);
+    return false;
+  }
+  const goto_programt &program = found->second.body;
+  for(const auto &instruction : program.instructions)
+  {
+    if(
+      (instruction.has_condition() &&
+       relational_bisimulation_contains_nondet(
+         instruction.condition())) ||
+      relational_bisimulation_contains_nondet(instruction.code()))
+      {
+        reason = "worker_nondeterminism";
+        visiting.erase(function);
+        return false;
+      }
+    if(
+      instruction.is_atomic_begin() || instruction.is_atomic_end() ||
+      instruction.is_start_thread() || instruction.is_end_thread() ||
+      instruction.is_assert() || instruction.is_other())
+    {
+      reason = "worker_effect";
+      visiting.erase(function);
+      return false;
+    }
+    if(instruction.is_assign())
+    {
+      irep_idt lhs;
+      if(!symbol_id(instruction.assign_lhs(), lhs))
+      {
+        reason = "worker_pointer_write";
+        visiting.erase(function);
+        return false;
+      }
+      const symbolt *symbol = lookup(lhs, ns);
+      if(
+        symbol != nullptr && symbol->is_static_lifetime &&
+        !symbol->is_type)
+        writes.insert(lhs);
+      collect_static_symbols(instruction.assign_rhs(), ns, reads);
+      continue;
+    }
+    if(instruction.is_function_call())
+    {
+      irep_idt callee;
+      if(
+        !call_id(instruction, callee) ||
+        is_create(callee) || is_join(callee) ||
+        is_atomic_marker(callee) ||
+        id2string(callee).find("pthread_") == 0 ||
+        id2string(callee).find("__atomic_") == 0 ||
+        id2string(callee).find("__sync_") == 0 ||
+        is_named(callee, "malloc") ||
+        is_named(callee, "calloc") ||
+        is_named(callee, "realloc") ||
+        is_named(callee, "free"))
+      {
+        reason = "worker_call";
+        visiting.erase(function);
+        return false;
+      }
+      for(const auto &argument : instruction.call_arguments())
+        collect_static_symbols(argument, ns, reads);
+      if(!instruction.call_lhs().is_nil())
+      {
+        irep_idt lhs;
+        if(!symbol_id(instruction.call_lhs(), lhs))
+        {
+          reason = "worker_call_lhs";
+          visiting.erase(function);
+          return false;
+        }
+        const symbolt *symbol = lookup(lhs, ns);
+        if(
+          symbol != nullptr && symbol->is_static_lifetime &&
+          !symbol->is_type)
+          writes.insert(lhs);
+      }
+      if(
+        !is_named(callee, "__CPROVER_assume") &&
+        !relational_bisimulation_function_effects(
+          model,
+          callee,
+          ns,
+          visiting,
+          reads,
+          writes,
+          reason))
+      {
+        visiting.erase(function);
+        return false;
+      }
+      continue;
+    }
+    if(instruction.has_condition())
+      collect_static_symbols(instruction.condition(), ns, reads);
+    if(instruction.is_set_return_value())
+      collect_static_symbols(instruction.return_value(), ns, reads);
+  }
+  visiting.erase(function);
+  return true;
+}
+
+bool relational_bisimulation_main_regions(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const goto_programt::instructiont *property,
+  const goto_programt::instructiont *error,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  bool in_concurrent_region = false;
+  bool after_join = false;
+  for(const auto &instruction : main.instructions)
+  {
+    if(&instruction == life.first_create)
+      in_concurrent_region = true;
+    if(in_concurrent_region)
+    {
+      irep_idt callee;
+      if(instruction.is_function_call())
+      {
+        if(
+          !call_id(instruction, callee) ||
+          (!is_create(callee) && !is_join(callee)))
+        {
+          reason = "main_concurrent_effect";
+          return false;
+        }
+      }
+      else if(
+        !instruction.is_skip() &&
+        !instruction.is_location() &&
+        !instruction.is_decl() &&
+        !instruction.is_dead())
+      {
+        reason = "main_concurrent_effect";
+        return false;
+      }
+    }
+    if(&instruction == life.last_join)
+    {
+      in_concurrent_region = false;
+      after_join = true;
+      continue;
+    }
+    if(!after_join || &instruction == property || &instruction == error)
+      continue;
+    if(
+      instruction.is_skip() || instruction.is_location() ||
+      instruction.is_dead() || instruction.is_end_function() ||
+      instruction.is_set_return_value())
+      continue;
+    reason = "postjoin_effect";
+    return false;
+  }
+  return true;
+}
+
+bool relational_bisimulation_stable_symbols(
+  const std::set<irep_idt> &symbols,
+  const namespacet &ns,
+  std::string &reason)
+{
+  for(const auto &identifier : symbols)
+  {
+    const symbolt *symbol = lookup(identifier, ns);
+    if(
+      symbol != nullptr &&
+      (symbol->type.get_bool(ID_C_volatile) ||
+       atomic_type(symbol->type)))
+    {
+      reason = "volatile_or_atomic_state";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool relational_bisimulation_equality_term(
+  const exprt &src,
+  const irep_idt &left,
+  const irep_idt &right)
+{
+  std::vector<exprt> terms;
+  flatten_and(src, terms);
+  for(const auto &term_src : terms)
+  {
+    const exprt &term = strip(term_src);
+    if(term.id() != ID_equal || term.operands().size() != 2)
+      continue;
+    irep_idt first;
+    irep_idt second;
+    if(
+      symbol_id(term.op0(), first) &&
+      symbol_id(term.op1(), second) &&
+      ((first == left && second == right) ||
+       (first == right && second == left)))
+      return true;
+  }
+  return false;
+}
+
+bool relational_bisimulation_parameter_truth(
+  const exprt &src,
+  const irep_idt &parameter)
+{
+  const exprt &expr = strip(src);
+  irep_idt identifier;
+  if(symbol_id(expr, identifier))
+    return identifier == parameter;
+  if(
+    expr.id() != ID_notequal ||
+    expr.operands().size() != 2)
+    return false;
+  return
+    (symbol_id(expr.op0(), identifier) &&
+     identifier == parameter && value_is(expr.op1(), 0)) ||
+    (symbol_id(expr.op1(), identifier) &&
+     identifier == parameter && value_is(expr.op0(), 0));
+}
+
+bool relational_bisimulation_abort_sink(
+  const irep_idt &callee,
+  const goto_modelt &model)
+{
+  const auto function =
+    model.goto_functions.function_map.find(callee);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+    return false;
+  std::size_t false_assumptions = 0;
+  for(const auto &instruction : function->second.body.instructions)
+  {
+    if(instruction.is_assume())
+    {
+      const exprt &condition = strip(instruction.condition());
+      mp_integer left;
+      mp_integer right;
+      const bool false_condition =
+        condition.is_false() ||
+        (condition.id() == ID_notequal &&
+         condition.operands().size() == 2 &&
+         integer_constant(condition.op0(), left) &&
+         integer_constant(condition.op1(), right) &&
+         left == right);
+      if(false_condition)
+        ++false_assumptions;
+      else
+        return false;
+    }
+    else if(
+      !instruction.is_end_function() &&
+      !instruction.is_skip() &&
+      !instruction.is_location())
+      return false;
+  }
+  return false_assumptions == 1;
+}
+
+bool relational_bisimulation_assume_semantics(
+  const irep_idt &callee,
+  const goto_modelt &model,
+  const namespacet &ns)
+{
+  if(is_named(callee, "__CPROVER_assume"))
+    return true;
+  const symbolt *symbol = lookup(callee, ns);
+  const auto function =
+    model.goto_functions.function_map.find(callee);
+  if(
+    symbol == nullptr || symbol->type.id() != ID_code ||
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+    return false;
+  const auto &parameters =
+    to_code_type(symbol->type).parameters();
+  if(
+    parameters.size() != 1 ||
+    parameters.front().get_identifier().empty())
+    return false;
+  const irep_idt parameter =
+    parameters.front().get_identifier();
+  const goto_programt::instructiont *guard = nullptr;
+  const goto_programt::instructiont *abort_call = nullptr;
+  irep_idt abort_callee;
+  for(const auto &instruction : function->second.body.instructions)
+  {
+    if(instruction.is_goto())
+    {
+      if(
+        guard != nullptr ||
+        instruction.targets.size() != 1 ||
+        !relational_bisimulation_parameter_truth(
+          instruction.condition(), parameter))
+        return false;
+      guard = &instruction;
+      continue;
+    }
+    if(instruction.is_function_call())
+    {
+      if(
+        abort_call != nullptr ||
+        !call_id(instruction, abort_callee) ||
+        !is_named(abort_callee, "abort"))
+        return false;
+      abort_call = &instruction;
+      continue;
+    }
+    if(
+      !instruction.is_end_function() &&
+      !instruction.is_skip() &&
+      !instruction.is_location())
+      return false;
+  }
+  return
+    guard != nullptr && abort_call != nullptr &&
+    guard->get_target()->location_number >
+      abort_call->location_number &&
+    guard->location_number < abort_call->location_number &&
+    relational_bisimulation_abort_sink(
+      abort_callee, model);
+}
+
+bool relational_bisimulation_verified_assume(
+  const goto_programt::instructiont &instruction,
+  const goto_modelt &model,
+  const namespacet &ns)
+{
+  irep_idt callee;
+  return
+    call_id(instruction, callee) &&
+    is_assume(callee) &&
+    instruction.call_arguments().size() == 1 &&
+    relational_bisimulation_assume_semantics(
+      callee, model, ns);
+}
+
+bool relational_bisimulation_exact_error_sink(
+  const goto_modelt &model)
+{
+  std::size_t assertions = 0;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(!instruction.is_assert())
+        continue;
+      ++assertions;
+      if(!instruction.condition().is_false())
+        return false;
+    }
+  }
+  return assertions == 1;
+}
+
+bool relational_bisimulation_initial_relation(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const std::set<irep_idt> &left_reads,
+  const relational_bisimulation_mappingt &mapping,
+  const namespacet &ns,
+  std::size_t &pairs,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::map<irep_idt, unsigned> last_writes;
+  std::vector<const goto_programt::instructiont *> assumptions;
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr &&
+      instruction.location_number >=
+        life.first_create->location_number)
+      break;
+    if(instruction.is_assign())
+    {
+      irep_idt lhs;
+      if(symbol_id(instruction.assign_lhs(), lhs))
+        last_writes[lhs] = instruction.location_number;
+    }
+    irep_idt callee;
+    if(
+      call_id(instruction, callee) && is_assume(callee) &&
+      relational_bisimulation_verified_assume(
+        instruction, model, ns))
+      assumptions.push_back(&instruction);
+  }
+
+  for(const auto &entry : mapping.forward)
+  {
+    if(entry.first == entry.second ||
+       left_reads.count(entry.first) == 0)
+      continue;
+    const symbolt *left_symbol = lookup(entry.first, ns);
+    const symbolt *right_symbol = lookup(entry.second, ns);
+    if(
+      left_symbol == nullptr || right_symbol == nullptr ||
+      !left_symbol->is_static_lifetime ||
+      !right_symbol->is_static_lifetime)
+      continue;
+    bool established = false;
+    for(const auto *assumption : assumptions)
+    {
+      if(assumption->call_arguments().size() != 1)
+        continue;
+      const auto left_write = last_writes.find(entry.first);
+      const auto right_write = last_writes.find(entry.second);
+      if(
+        left_write == last_writes.end() ||
+        right_write == last_writes.end() ||
+        left_write->second >= assumption->location_number ||
+        right_write->second >= assumption->location_number)
+        continue;
+      if(
+        relational_bisimulation_equality_term(
+          assumption->call_arguments().front(),
+          entry.first,
+          entry.second))
+      {
+        established = true;
+        break;
+      }
+    }
+    if(!established)
+    {
+      reason = "initial_relation";
+      return false;
+    }
+    ++pairs;
+  }
+  if(pairs == 0)
+  {
+    reason = "initial_relation_empty";
+    return false;
+  }
+  return true;
+}
+
+bool relational_bisimulation_audit_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::size_t &pairs,
+  std::string &reason)
+{
+  lifecyclet life;
+  std::vector<irep_idt> workers;
+  if(
+    !stream_refine_lifecycle(model, life, workers, reason) ||
+    workers.size() != 2)
+  {
+    if(reason.empty())
+      reason = "lifecycle";
+    return false;
+  }
+  const auto &left =
+    model.goto_functions.function_map.at(workers[0]).body;
+  const auto &right =
+    model.goto_functions.function_map.at(workers[1]).body;
+  relational_bisimulation_mappingt mapping;
+  if(
+    !relational_bisimulation_programs(
+      left, right, ns, mapping, reason))
+    return false;
+
+  std::set<irep_idt> left_reads;
+  std::set<irep_idt> left_writes;
+  std::set<irep_idt> right_reads;
+  std::set<irep_idt> right_writes;
+  std::set<irep_idt> left_visiting;
+  std::set<irep_idt> right_visiting;
+  if(
+    !relational_bisimulation_function_effects(
+      model,
+      workers[0],
+      ns,
+      left_visiting,
+      left_reads,
+      left_writes,
+      reason) ||
+    !relational_bisimulation_function_effects(
+      model,
+      workers[1],
+      ns,
+      right_visiting,
+      right_reads,
+      right_writes,
+      reason))
+    return false;
+  std::set<irep_idt> all_effects = left_reads;
+  all_effects.insert(left_writes.begin(), left_writes.end());
+  all_effects.insert(right_reads.begin(), right_reads.end());
+  all_effects.insert(right_writes.begin(), right_writes.end());
+  if(!relational_bisimulation_stable_symbols(
+       all_effects, ns, reason))
+    return false;
+  std::vector<irep_idt> overlap;
+  std::set_intersection(
+    left_writes.begin(),
+    left_writes.end(),
+    right_writes.begin(),
+    right_writes.end(),
+    std::back_inserter(overlap));
+  std::set_intersection(
+    left_writes.begin(),
+    left_writes.end(),
+    right_reads.begin(),
+    right_reads.end(),
+    std::back_inserter(overlap));
+  std::set_intersection(
+    right_writes.begin(),
+    right_writes.end(),
+    left_reads.begin(),
+    left_reads.end(),
+    std::back_inserter(overlap));
+  if(!overlap.empty())
+  {
+    reason = "worker_interference";
+    return false;
+  }
+
+  flow_equality_propertyt property;
+  if(!find_flow_equality_property(model, ns, life, property, reason))
+    return false;
+  if(
+    property.assumption == nullptr ||
+    !relational_bisimulation_verified_assume(
+      *property.assumption, model, ns) ||
+    !relational_bisimulation_exact_error_sink(model))
+  {
+    reason = "property_semantics";
+    return false;
+  }
+  if(
+    !relational_bisimulation_main_regions(
+      model,
+      life,
+      property.assumption,
+      property.error,
+      reason))
+    return false;
+  const auto mapped = mapping.forward.find(property.left);
+  const auto reverse = mapping.forward.find(property.right);
+  if(
+    (mapped == mapping.forward.end() ||
+     mapped->second != property.right) &&
+    (reverse == mapping.forward.end() ||
+     reverse->second != property.left))
+  {
+    reason = "property_mapping";
+    return false;
+  }
+  if(
+    !relational_bisimulation_initial_relation(
+      model, life, left_reads, mapping, ns, pairs, reason))
+    return false;
+  return true;
+}
 } // namespace
 
 void role_split_affine_stream_audit(
@@ -17202,6 +17976,25 @@ void publication_frontier_sequence_audit(
   if(candidate)
     std::cout << " mode=" << mode;
   else
+    std::cout << " reason=" << reason;
+  std::cout << '\n';
+}
+
+void relational_bisimulation_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  const namespacet ns(goto_model.symbol_table);
+  std::size_t pairs = 0;
+  std::string reason;
+  const bool candidate =
+    relational_bisimulation_audit_impl(
+      goto_model, ns, pairs, reason);
+  std::cout << "NATIVE_RELATIONAL_BISIMULATION_AUDIT candidate="
+            << (candidate ? 1 : 0)
+            << " pairs=" << pairs;
+  if(!candidate)
     std::cout << " reason=" << reason;
   std::cout << '\n';
 }
@@ -17283,6 +18076,18 @@ bool extremum_cone_proof(
   if(extremum_homomorphism_proof_impl(goto_model, ns, reason))
     return true;
   std::cout << "NATIVE_EXTREMUM_HOMOMORPHISM applied=0 reason="
+            << reason << '\n';
+  reason.clear();
+  std::size_t relational_pairs = 0;
+  if(
+    relational_bisimulation_audit_impl(
+      goto_model, ns, relational_pairs, reason))
+  {
+    std::cout << "NATIVE_RELATIONAL_BISIMULATION applied=1 pairs="
+              << relational_pairs << '\n';
+    return true;
+  }
+  std::cout << "NATIVE_RELATIONAL_BISIMULATION applied=0 reason="
             << reason << '\n';
   reason.clear();
   std::size_t source_roles = 0;

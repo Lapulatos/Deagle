@@ -22,4 +22,8 @@ void publication_frontier_sequence_audit(
   const goto_modelt &goto_model,
   message_handlert &message_handler);
 
+void relational_bisimulation_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 #endif

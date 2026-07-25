@@ -39,7 +39,7 @@ class optionst;
   "(interference-predicate-fixedpoint)" \
   "(interference-predicate-recursive-worker-fixedpoint)" \
   "(native-lock-ego-abstraction)" \
-  "(native-jces)(native-prefix-affine-envelope)(native-property-affine-audit)(native-property-affine-proof)(native-role-split-stream-audit)(native-publication-frontier-audit)" \
+  "(native-jces)(native-prefix-affine-envelope)(native-property-affine-audit)(native-property-affine-proof)(native-role-split-stream-audit)(native-publication-frontier-audit)(native-relational-bisimulation-audit)" \
   OPT_BMC \
   "(preprocess)(slice-by-trace):" \
   OPT_FUNCTIONS \
