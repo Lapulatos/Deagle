@@ -72,6 +72,9 @@ def get_result(remove = True):
                 or line.startswith("NATIVE_SEGMENTED_FOLD ")
                 or line.startswith("NATIVE_NESTED_ITERATION ")
                 or line.startswith("NATIVE_LOCAL_LOOP_ACCEL ")
+                or line.startswith(
+                    "NATIVE_ALTERNATING_PHASE_RECURRENCE "
+                )
                 or line.startswith("COUNTERFACTUAL_UIP_PROFILE ")
                 or line.startswith("COUNTERFACTUAL_UIP_DOMAIN ")
                 or line.startswith("COUNTERFACTUAL_UIP_DOMAIN_SOURCE ")
@@ -629,6 +632,9 @@ elif force_experiment_direct:
             if shallow_bound == 1:
                 prepass_args.append(
                     "--native-homogeneous-spawn-witness"
+                )
+                prepass_args.append(
+                    "--native-alternating-phase-recurrence"
                 )
             try:
                 with open("deagle_tmp_output", "w") as prepass_output:

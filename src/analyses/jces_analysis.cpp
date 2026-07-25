@@ -7508,7 +7508,661 @@ bool homogeneous_spawn_loop(
     summary.increment,
     reason);
 }
+
+struct alternating_phase_workert
+{
+  irep_idt function;
+  irep_idt induction;
+  exprt bound;
+  irep_idt mutex;
+  irep_idt waited_condition;
+  irep_idt signalled_condition;
+  irep_idt token;
+  irep_idt accumulator;
+  irep_idt completion;
+  bool producer = false;
+};
+
+bool parse_condition_call(
+  const goto_programt::instructiont &instruction,
+  const irep_idt &callee,
+  irep_idt &condition,
+  irep_idt *mutex)
+{
+  irep_idt actual;
+  if(
+    !direct_call_identifier(instruction, actual) || actual != callee ||
+    instruction.call_arguments().empty() ||
+    !addressed_symbol(instruction.call_arguments()[0], condition))
+    return false;
+  if(mutex == nullptr)
+    return instruction.call_arguments().size() == 1;
+  return
+    instruction.call_arguments().size() == 2 &&
+    addressed_symbol(instruction.call_arguments()[1], *mutex);
+}
+
+bool parse_token_guard(
+  const goto_programt::instructiont &instruction,
+  const bool producer,
+  irep_idt &token)
+{
+  if(!instruction.is_goto() || instruction.targets.size() != 1)
+    return false;
+  const exprt &condition = instruction.condition();
+  if(condition.id() != ID_not || condition.operands().size() != 1)
+    return false;
+  const exprt &relation = without_cast(condition.op0());
+  const irep_idt expected = producer ? ID_gt : ID_equal;
+  if(
+    relation.id() != expected || relation.operands().size() != 2 ||
+    !direct_symbol(relation.op0(), token))
+    return false;
+  mp_integer zero;
+  return
+    constant_eval(relation.op1(), {}, zero) && zero == 0;
+}
+
+bool parse_unit_token_update(
+  const goto_programt::instructiont &instruction,
+  const bool producer,
+  irep_idt &token)
+{
+  if(!instruction.is_assign() ||
+     !direct_symbol(instruction.assign_lhs(), token))
+    return false;
+  const exprt &rhs = without_cast(instruction.assign_rhs());
+  if(
+    rhs.id() != (producer ? ID_plus : ID_minus) ||
+    rhs.operands().size() != 2)
+    return false;
+  irep_idt source;
+  mp_integer one;
+  return
+    direct_symbol(rhs.op0(), source) && source == token &&
+    constant_eval(rhs.op1(), {}, one) && one == 1;
+}
+
+bool parse_accumulator_add(
+  const goto_programt::instructiont &instruction,
+  const irep_idt &induction,
+  irep_idt &accumulator)
+{
+  if(
+    !instruction.is_assign() ||
+    !direct_symbol(instruction.assign_lhs(), accumulator))
+    return false;
+  const exprt &rhs = without_cast(instruction.assign_rhs());
+  if(rhs.id() != ID_plus || rhs.operands().size() != 2)
+    return false;
+  irep_idt lhs;
+  irep_idt added;
+  return
+    direct_symbol(rhs.op0(), lhs) && lhs == accumulator &&
+    direct_symbol(rhs.op1(), added) && added == induction;
+}
+
+bool parse_one_assignment(
+  const goto_programt::instructiont &instruction,
+  irep_idt &identifier)
+{
+  if(
+    !instruction.is_assign() ||
+    !direct_symbol(instruction.assign_lhs(), identifier))
+    return false;
+  mp_integer one;
+  return constant_eval(instruction.assign_rhs(), {}, one) && one == 1;
+}
+
+std::vector<goto_programt::const_targett> semantic_instructions(
+  const goto_programt &program)
+{
+  std::vector<goto_programt::const_targett> result;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(
+      instruction->is_skip() || instruction->is_location() ||
+      instruction->is_decl() || instruction->is_dead() ||
+      instruction->is_set_return_value() ||
+      instruction->is_end_function())
+      continue;
+    result.push_back(instruction);
+  }
+  return result;
+}
+
+bool alternating_phase_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &function_id,
+  const bool producer,
+  alternating_phase_workert &summary,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "phase_missing_worker";
+    return false;
+  }
+  const auto semantic =
+    semantic_instructions(function->second.body);
+  const std::size_t expected = producer ? 11 : 14;
+  if(semantic.size() != expected)
+  {
+    reason =
+      "phase_worker_instruction_count_" +
+      std::to_string(semantic.size());
+    return false;
+  }
+
+  summary.function = function_id;
+  summary.producer = producer;
+  if(
+    !semantic[0]->is_assign() ||
+    !direct_symbol(
+      semantic[0]->assign_lhs(), summary.induction))
+  {
+    reason = "phase_loop_initialization";
+    return false;
+  }
+  if(
+    !parse_zero_initialization(
+      *semantic[0], summary.induction) ||
+    !parse_exit_guard(
+      *semantic[1], summary.induction, summary.bound))
+  {
+    reason = "phase_loop_header";
+    return false;
+  }
+  const symbolt *induction_symbol = nullptr;
+  if(
+    ns.lookup(summary.induction, induction_symbol) ||
+    induction_symbol->is_static_lifetime ||
+    (induction_symbol->type.id() != ID_signedbv &&
+     induction_symbol->type.id() != ID_unsignedbv))
+  {
+    reason = "phase_induction_type";
+    return false;
+  }
+  if(
+    contains_side_effect(summary.bound) ||
+    contains_symbol(summary.bound, {summary.induction}))
+  {
+    reason = "phase_bound_expression";
+    return false;
+  }
+
+  irep_idt wait_mutex;
+  irep_idt incremented;
+  if(
+    !parse_mutex_call(
+      *semantic[2], "pthread_mutex_lock", summary.mutex) ||
+    !parse_token_guard(*semantic[3], producer, summary.token) ||
+    !parse_condition_call(
+      *semantic[4],
+      "pthread_cond_wait",
+      summary.waited_condition,
+      &wait_mutex) ||
+    wait_mutex != summary.mutex ||
+    !semantic[5]->is_goto() ||
+    !semantic[5]->condition().is_true() ||
+    semantic[5]->get_target() != semantic[3])
+  {
+    reason = "phase_wait_protocol";
+    return false;
+  }
+
+  const std::size_t token_index = producer ? 6 : 7;
+  const std::size_t unlock_index = producer ? 7 : 8;
+  const std::size_t signal_index = producer ? 8 : 9;
+  const std::size_t increment_index = producer ? 9 : 10;
+  const std::size_t backedge_index = producer ? 10 : 11;
+  if(
+    (!producer &&
+     !parse_accumulator_add(
+       *semantic[6], summary.induction, summary.accumulator)) ||
+    !parse_unit_token_update(
+      *semantic[token_index], producer, summary.token) ||
+    !parse_mutex_call(
+      *semantic[unlock_index],
+      "pthread_mutex_unlock",
+      wait_mutex) ||
+    wait_mutex != summary.mutex ||
+    !parse_condition_call(
+      *semantic[signal_index],
+      "pthread_cond_signal",
+      summary.signalled_condition,
+      nullptr) ||
+    !parse_unit_increment(
+      *semantic[increment_index], incremented) ||
+    incremented != summary.induction ||
+    !semantic[backedge_index]->is_goto() ||
+    !semantic[backedge_index]->condition().is_true() ||
+    semantic[backedge_index]->get_target() != semantic[1])
+  {
+    reason = "phase_loop_body";
+    return false;
+  }
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : function->second.body.instructions)
+    positions.emplace(&instruction, position++);
+  if(
+    (producer &&
+     positions.at(&*semantic[1]->get_target()) <=
+       positions.at(&*semantic[10])) ||
+    (!producer && semantic[1]->get_target() != semantic[12]))
+  {
+    reason = "phase_loop_exit";
+    return false;
+  }
+  if(
+    !producer &&
+    (!parse_accumulator_add(
+       *semantic[12], summary.induction, summary.accumulator) ||
+     !parse_one_assignment(*semantic[13], summary.completion)))
+  {
+    reason = "phase_consumer_tail";
+    return false;
+  }
+
+  const symbolt *token_symbol = nullptr;
+  if(
+    ns.lookup(summary.token, token_symbol) ||
+    !token_symbol->is_static_lifetime ||
+    (token_symbol->type.id() != ID_signedbv &&
+     token_symbol->type.id() != ID_unsignedbv))
+  {
+    reason = "phase_token_type";
+    return false;
+  }
+  if(!producer)
+  {
+    const symbolt *accumulator_symbol = nullptr;
+    const symbolt *completion_symbol = nullptr;
+    if(
+      ns.lookup(summary.accumulator, accumulator_symbol) ||
+      ns.lookup(summary.completion, completion_symbol) ||
+      !accumulator_symbol->is_static_lifetime ||
+      accumulator_symbol->type.id() != ID_unsignedbv ||
+      !completion_symbol->is_static_lifetime ||
+      (completion_symbol->type.id() != ID_signedbv &&
+       completion_symbol->type.id() != ID_unsignedbv))
+    {
+      reason = "phase_output_type";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool alternating_phase_main(
+  const goto_modelt &model,
+  const std::vector<create_recordt> &creates,
+  const std::vector<goto_programt::targett> &joins,
+  const alternating_phase_workert &producer,
+  const alternating_phase_workert &consumer,
+  std::string &reason)
+{
+  const auto main =
+    model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != model.goto_functions.function_map.end() &&
+    main->second.body_available(),
+    "alternating phase lifecycle has main");
+  bool before_create = true;
+  bool token_zero = false;
+  bool accumulator_zero = false;
+  const std::set<irep_idt> state{
+    producer.token, consumer.accumulator};
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != main->second.body.instructions.end(); ++instruction)
+  {
+    if(instruction == creates.front().instruction)
+      before_create = false;
+    if(
+      contains_address_of_symbol(instruction->code(), state) ||
+      (instruction->has_condition() &&
+       contains_address_of_symbol(instruction->condition(), state)))
+    {
+      reason = "phase_state_escape";
+      return false;
+    }
+    if(!instruction->is_assign())
+    {
+      irep_idt callee;
+      if(
+        before_create &&
+        direct_call_identifier(*instruction, callee) &&
+        callee != "pthread_mutex_init" &&
+        callee != "pthread_cond_init")
+      {
+        reason = "phase_main_precreate_call";
+        return false;
+      }
+      continue;
+    }
+    irep_idt written;
+    if(!direct_symbol(instruction->assign_lhs(), written) ||
+       state.count(written) == 0)
+      continue;
+    if(!before_create)
+    {
+      reason = "phase_main_late_write";
+      return false;
+    }
+    if(written == producer.token)
+      token_zero =
+        parse_zero_initialization(*instruction, producer.token);
+    else
+      accumulator_zero =
+        parse_zero_initialization(
+          *instruction, consumer.accumulator);
+  }
+  if(!token_zero || !accumulator_zero)
+  {
+    reason = "phase_initial_state";
+    return false;
+  }
+  const namespacet ns(model.symbol_table);
+  return
+    validate_main_region(
+      model, ns, creates, joins, reason);
+}
+
+bool alternating_phase_stable_bound(
+  const exprt &bound,
+  const goto_modelt &model,
+  const std::vector<create_recordt> &creates,
+  const namespacet &ns,
+  std::string &reason)
+{
+  std::set<irep_idt> symbols;
+  std::vector<const exprt *> pending{&bound};
+  while(!pending.empty())
+  {
+    const exprt &current = *pending.back();
+    pending.pop_back();
+    if(
+      current.id() == ID_side_effect ||
+      current.id() == ID_dereference ||
+      current.id() == ID_address_of)
+    {
+      reason = "phase_bound_expression";
+      return false;
+    }
+    if(current.id() == ID_symbol)
+    {
+      const auto identifier =
+        to_symbol_expr(current).get_identifier();
+      const symbolt *symbol = nullptr;
+      if(
+        ns.lookup(identifier, symbol) || symbol->is_type ||
+        !symbol->is_static_lifetime ||
+        (symbol->type.id() != ID_signedbv &&
+         symbol->type.id() != ID_unsignedbv) ||
+        symbol->type.get_bool(ID_C_volatile))
+      {
+        reason = "phase_bound_symbol";
+        return false;
+      }
+      symbols.insert(identifier);
+    }
+    for(const auto &operand : current.operands())
+      pending.push_back(&operand);
+  }
+
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    bool before_create = entry.first == "main";
+    for(auto instruction = entry.second.body.instructions.begin();
+        instruction != entry.second.body.instructions.end(); ++instruction)
+    {
+      if(
+        entry.first == "main" &&
+        instruction == creates.front().instruction)
+        before_create = false;
+      if(
+        contains_address_of_symbol(instruction->code(), symbols) ||
+        (instruction->has_condition() &&
+         contains_address_of_symbol(
+           instruction->condition(), symbols)))
+      {
+        reason = "phase_bound_escape";
+        return false;
+      }
+      irep_idt written;
+      const bool writes =
+        (instruction->is_assign() &&
+         direct_symbol(instruction->assign_lhs(), written)) ||
+        (instruction->is_function_call() &&
+         !instruction->call_lhs().is_nil() &&
+         direct_symbol(instruction->call_lhs(), written));
+      if(
+        writes && symbols.count(written) != 0 &&
+        entry.first != "__CPROVER_initialize" &&
+        (entry.first != "main" || !before_create))
+      {
+        reason = "phase_bound_late_write";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool alternating_phase_pair(
+  goto_modelt &model,
+  const namespacet &ns,
+  std::vector<create_recordt> &creates,
+  std::vector<goto_programt::targett> &joins,
+  alternating_phase_workert &producer,
+  alternating_phase_workert &consumer,
+  std::string &reason)
+{
+  if(
+    !collect_lifecycle(model, ns, creates, joins, reason) ||
+    creates.size() != 2)
+  {
+    if(reason.empty())
+      reason = "phase_lifecycle_count";
+    return false;
+  }
+
+  bool matched =
+    alternating_phase_worker(
+      model, ns, creates[0].worker, true, producer, reason) &&
+    alternating_phase_worker(
+      model, ns, creates[1].worker, false, consumer, reason);
+  if(!matched)
+  {
+    reason.clear();
+    matched =
+      alternating_phase_worker(
+        model, ns, creates[1].worker, true, producer, reason) &&
+      alternating_phase_worker(
+        model, ns, creates[0].worker, false, consumer, reason);
+  }
+  if(
+    !matched || producer.bound != consumer.bound ||
+    producer.mutex != consumer.mutex ||
+    producer.token != consumer.token ||
+    producer.waited_condition != consumer.signalled_condition ||
+    producer.signalled_condition != consumer.waited_condition)
+  {
+    if(reason.empty())
+      reason = "phase_pair_mismatch";
+    return false;
+  }
+  const symbolt *induction_symbol = nullptr;
+  const symbolt *consumer_induction_symbol = nullptr;
+  const symbolt *accumulator_symbol = nullptr;
+  if(
+    ns.lookup(producer.induction, induction_symbol) ||
+    ns.lookup(consumer.induction, consumer_induction_symbol) ||
+    ns.lookup(consumer.accumulator, accumulator_symbol) ||
+    induction_symbol->type != consumer_induction_symbol->type ||
+    to_bitvector_type(accumulator_symbol->type).get_width() <
+      to_bitvector_type(induction_symbol->type).get_width() ||
+    !alternating_phase_stable_bound(
+      producer.bound, model, creates, ns, reason))
+  {
+    if(reason.empty())
+      reason = "phase_recurrence_width";
+    return false;
+  }
+  return alternating_phase_main(
+    model, creates, joins, producer, consumer, reason);
+}
 } // namespace
+
+bool alternating_phase_recurrence_audit(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  std::vector<create_recordt> creates;
+  std::vector<goto_programt::targett> joins;
+  std::string reason;
+  alternating_phase_workert first;
+  alternating_phase_workert second;
+  const bool matched = alternating_phase_pair(
+    goto_model,
+    ns,
+    creates,
+    joins,
+    first,
+    second,
+    reason);
+  std::cout
+    << "NATIVE_ALTERNATING_PHASE_AUDIT applicable="
+    << (matched ? 1 : 0);
+  if(matched)
+  {
+    std::cout
+      << " producer=" << first.function
+      << " consumer=" << second.function
+      << " token=" << first.token
+      << " accumulator=" << second.accumulator;
+  }
+  else
+    std::cout << " reason="
+              << (reason.empty() ? "phase_pair_mismatch" : reason);
+  std::cout << '\n';
+  (void)message_handler;
+  return matched;
+}
+
+bool alternating_phase_recurrence_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  std::vector<create_recordt> creates;
+  std::vector<goto_programt::targett> joins;
+  alternating_phase_workert producer;
+  alternating_phase_workert consumer;
+  std::string reason;
+  if(
+    !alternating_phase_pair(
+      goto_model,
+      ns,
+      creates,
+      joins,
+      producer,
+      consumer,
+      reason))
+  {
+    std::cout
+      << "NATIVE_ALTERNATING_PHASE_RECURRENCE applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+
+  const symbolt *induction_symbol = nullptr;
+  const symbolt *token_symbol = nullptr;
+  const symbolt *accumulator_symbol = nullptr;
+  const symbolt *completion_symbol = nullptr;
+  INVARIANT(
+    !ns.lookup(producer.induction, induction_symbol) &&
+    !ns.lookup(producer.token, token_symbol) &&
+    !ns.lookup(consumer.accumulator, accumulator_symbol) &&
+    !ns.lookup(consumer.completion, completion_symbol),
+    "accepted alternating phase symbols exist");
+
+  exprt count =
+    exact_count(producer.bound, induction_symbol->type);
+  count = cast_if_needed(count, accumulator_symbol->type);
+  const exprt one =
+    from_integer(1, accumulator_symbol->type);
+  const exprt two =
+    from_integer(2, accumulator_symbol->type);
+  const exprt successor = plus_exprt(count, one);
+  const exprt product = mult_exprt(count, successor);
+  const exprt triangular = div_exprt(product, two);
+  symbol_exprt accumulator(
+    consumer.accumulator, accumulator_symbol->type);
+  symbol_exprt token(producer.token, token_symbol->type);
+  symbol_exprt completion(
+    consumer.completion, completion_symbol->type);
+
+  auto main =
+    goto_model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != goto_model.goto_functions.function_map.end() &&
+    main->second.body_available(),
+    "accepted alternating phase model has main");
+  auto &program = main->second.body;
+  const auto insertion = creates.front().instruction;
+  const auto location = insertion->source_location();
+  program.insert_before(
+    insertion,
+    goto_programt::make_assumption(
+      not_exprt(plus_overflow_exprt(count, one)),
+      location));
+  program.insert_before(
+    insertion,
+    goto_programt::make_assumption(
+      not_exprt(mult_overflow_exprt(count, successor)),
+      location));
+  program.insert_before(
+    insertion,
+    goto_programt::make_assignment(
+      accumulator, triangular, location));
+  program.insert_before(
+    insertion,
+    goto_programt::make_assignment(
+      token,
+      from_integer(0, token_symbol->type),
+      location));
+  program.insert_before(
+    insertion,
+    goto_programt::make_assignment(
+      completion,
+      from_integer(1, completion_symbol->type),
+      location));
+  for(const auto &create : creates)
+    create.instruction->turn_into_skip();
+  for(const auto &join : joins)
+    join->turn_into_skip();
+  goto_model.goto_functions.update();
+  std::cout
+    << "NATIVE_ALTERNATING_PHASE_RECURRENCE applied=1"
+    << " producer=" << producer.function
+    << " consumer=" << consumer.function
+    << " token=" << producer.token
+    << " accumulator=" << consumer.accumulator
+    << '\n';
+  (void)message_handler;
+  return true;
+}
 
 bool homogeneous_spawn_witness_audit(
   const goto_modelt &goto_model,

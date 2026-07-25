@@ -10,6 +10,20 @@ Module: Join-Scoped Compositional Effect Summary
 class goto_modelt;
 class message_handlert;
 
+/// Audit two finite, fully joined producer/consumer loops whose condition
+/// variables enforce a one-token alternating execution. This does not mutate
+/// the GOTO model.
+bool alternating_phase_recurrence_audit(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// In a counterexample-only model, select the legal alternating execution of
+/// an admitted producer/consumer pair and replace it by its exact triangular
+/// state recurrence. Unsupported models are unchanged.
+bool alternating_phase_recurrence_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 /// Audit finite homogeneous spawn loops whose worker has one composable
 /// affine scalar effect. This does not mutate the GOTO model.
 bool homogeneous_spawn_witness_audit(

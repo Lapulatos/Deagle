@@ -568,6 +568,14 @@ int cbmc_parse_optionst::doit()
     homogeneous_spawn_witness_audit(
       goto_model, ui_message_handler);
 
+  if(cmdline.isset("native-alternating-phase-audit"))
+    alternating_phase_recurrence_audit(
+      goto_model, ui_message_handler);
+
+  if(cmdline.isset("native-alternating-phase-recurrence"))
+    alternating_phase_recurrence_transform(
+      goto_model, ui_message_handler);
+
   if(cmdline.isset("native-homogeneous-spawn-witness"))
     homogeneous_spawn_witness_transform(
       goto_model, ui_message_handler);
