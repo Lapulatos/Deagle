@@ -8221,6 +8221,3155 @@ bool stream_refine_global(
     flow_main_control(model, life, control, reason);
 }
 
+struct prefix_channel_last_consumert
+{
+  irep_idt worker;
+  stream_refine_consumet consume;
+  irep_idt sink;
+  std::set<const goto_programt::instructiont *> writes;
+};
+
+bool prefix_channel_last_consume_region(
+  const std::vector<const goto_programt::instructiont *> &region,
+  const namespacet &ns,
+  stream_refine_consumet &consume,
+  irep_idt &sink)
+{
+  std::vector<exprt> terms;
+  std::size_t assumes = 0;
+  std::size_t reads = 0;
+  std::size_t increments = 0;
+  const goto_programt::instructiont *last_assume = nullptr;
+  const goto_programt::instructiont *read = nullptr;
+  const goto_programt::instructiont *increment = nullptr;
+  irep_idt storage;
+  irep_idt front;
+  for(const auto *instruction : region)
+  {
+    irep_idt callee;
+    if(call_id(*instruction, callee))
+    {
+      if(
+        !is_assume(callee) ||
+        instruction->call_arguments().size() != 1)
+        return false;
+      ++assumes;
+      flatten_and(instruction->call_arguments().front(), terms);
+      last_assume = instruction;
+      continue;
+    }
+    if(instruction->is_assign())
+    {
+      irep_idt lhs;
+      irep_idt candidate_storage;
+      irep_idt candidate_front;
+      if(
+        symbol_id(instruction->assign_lhs(), lhs) &&
+        array_symbol_index(
+          instruction->assign_rhs(),
+          candidate_storage,
+          candidate_front))
+      {
+        if(
+          reads != 0 || !shared_signed(lhs, ns) ||
+          lhs == candidate_front || lhs == candidate_storage)
+          return false;
+        sink = lhs;
+        storage = candidate_storage;
+        front = candidate_front;
+        ++reads;
+        read = instruction;
+        consume.writes.insert(instruction);
+        continue;
+      }
+      if(
+        symbol_id(instruction->assign_lhs(), lhs) &&
+        unit_increment(*instruction, lhs))
+      {
+        if(!front.empty() && front != lhs)
+          return false;
+        front = lhs;
+        ++increments;
+        increment = instruction;
+        consume.writes.insert(instruction);
+        continue;
+      }
+      return false;
+    }
+    if(
+      instruction->is_decl() || instruction->is_dead() ||
+      instruction->is_location() || instruction->is_skip())
+      continue;
+    return false;
+  }
+  irep_idt back;
+  irep_idt bound;
+  if(
+    assumes != 1 || reads != 1 || increments != 1 ||
+    last_assume == nullptr || read == nullptr || increment == nullptr ||
+    last_assume->location_number >= read->location_number ||
+    read->location_number >= increment->location_number ||
+    !stream_refine_consume_guard(terms, front, back, bound) ||
+    !shared_signed(front, ns) || !shared_signed(back, ns) ||
+    !shared_signed(bound, ns))
+    return false;
+  consume.channel.storage = storage;
+  consume.channel.front = front;
+  consume.channel.back = back;
+  consume.channel.bound = bound;
+  consume.first_location =
+    region.empty() ? 0 : region.front()->location_number;
+  consume.last_location =
+    region.empty() ? 0 : region.back()->location_number;
+  return true;
+}
+
+bool prefix_channel_last_consumer(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  prefix_channel_last_consumert &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  for(const auto &instruction : program.instructions)
+  {
+    if(!instruction.is_function_call())
+      continue;
+    irep_idt callee;
+    if(!call_id(instruction, callee) || !is_assume(callee))
+    {
+      reason = "prefix_last_external_call";
+      return false;
+    }
+  }
+  natural_loopst loops;
+  loops(program);
+  if(loops.loop_map.size() != 1)
+  {
+    reason = "prefix_last_loop_count";
+    return false;
+  }
+  const auto &loop = loops.loop_map.begin()->second;
+  bool in_atomic = false;
+  bool region_in_loop = false;
+  std::vector<const goto_programt::instructiont *> region;
+  std::size_t matches = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_atomic_begin())
+    {
+      if(in_atomic)
+      {
+        reason = "prefix_last_atomic_nesting";
+        return false;
+      }
+      in_atomic = true;
+      region_in_loop = loop.contains(instruction);
+      region.clear();
+      continue;
+    }
+    if(instruction->is_atomic_end())
+    {
+      if(!in_atomic || !region_in_loop || !loop.contains(instruction))
+      {
+        reason = "prefix_last_atomic_balance";
+        return false;
+      }
+      stream_refine_consumet consume;
+      irep_idt sink;
+      if(!prefix_channel_last_consume_region(region, ns, consume, sink))
+      {
+        reason = "prefix_last_atomic_transaction";
+        return false;
+      }
+      result.consume = consume;
+      result.sink = sink;
+      result.writes.insert(
+        consume.writes.begin(), consume.writes.end());
+      ++matches;
+      in_atomic = false;
+      region.clear();
+      continue;
+    }
+    if(in_atomic)
+      region.push_back(&*instruction);
+  }
+  if(in_atomic || matches != 1)
+  {
+    reason = "prefix_last_consume_count";
+    return false;
+  }
+  result.worker = worker;
+  return true;
+}
+
+bool prefix_channel_constant_publisher(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  stream_refine_publisht &publish,
+  std::set<const goto_programt::instructiont *> &writes,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  for(const auto &instruction : program.instructions)
+  {
+    if(!instruction.is_function_call())
+      continue;
+    irep_idt callee;
+    if(!call_id(instruction, callee) || !is_assume(callee))
+    {
+      reason = "prefix_publish_external_call";
+      return false;
+    }
+  }
+  natural_loopst loops;
+  loops(program);
+  if(loops.loop_map.size() != 1)
+  {
+    reason = "prefix_publish_loop_count";
+    return false;
+  }
+  const auto &loop = loops.loop_map.begin()->second;
+  std::vector<stream_refine_publisht> publishes;
+  std::vector<stream_refine_consumet> consumes;
+  if(
+    !stream_refine_transactions(
+      program, loop, ns, publishes, consumes, reason) ||
+    publishes.size() != 1 || !consumes.empty() ||
+    !publishes.front().in_loop)
+  {
+    if(reason.empty())
+      reason = "prefix_publish_transactions";
+    return false;
+  }
+  mp_integer token;
+  if(!integer_constant(publishes.front().token, token))
+  {
+    reason = "prefix_publish_nonconstant";
+    return false;
+  }
+  publish = publishes.front();
+  writes = publish.writes;
+  return true;
+}
+
+bool prefix_channel_last_property(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const irep_idt &sink,
+  const exprt &token,
+  const goto_programt::instructiont *&assumption,
+  const goto_programt::instructiont *&error,
+  std::string &reason)
+{
+  std::size_t errors = 0;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(call_id(instruction, callee) && is_reach_error(callee))
+      {
+        ++errors;
+        if(entry.first != ID_main)
+        {
+          reason = "prefix_last_error_function";
+          return false;
+        }
+        error = &instruction;
+      }
+    }
+  }
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::size_t matches = 0;
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.last_join == nullptr ||
+      instruction.location_number <= life.last_join->location_number)
+      continue;
+    irep_idt callee;
+    if(
+      !call_id(instruction, callee) || !is_assume(callee) ||
+      instruction.call_arguments().size() != 1)
+      continue;
+    const exprt &condition =
+      strip(instruction.call_arguments().front());
+    if(
+      condition.id() != ID_notequal ||
+      condition.operands().size() != 2)
+      continue;
+    irep_idt candidate;
+    const bool matching =
+      (symbol_id(condition.op0(), candidate) && candidate == sink &&
+       strip(condition.op1()) == strip(token)) ||
+      (symbol_id(condition.op1(), candidate) && candidate == sink &&
+       strip(condition.op0()) == strip(token));
+    if(matching)
+    {
+      assumption = &instruction;
+      ++matches;
+    }
+  }
+  if(
+    errors != 1 || matches != 1 || assumption == nullptr ||
+    error == nullptr ||
+    assumption->location_number >= error->location_number)
+  {
+    reason = "prefix_last_property";
+    return false;
+  }
+  return true;
+}
+
+bool prefix_channel_initial_value(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const irep_idt &symbol,
+  const exprt &value)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  const goto_programt::instructiont *last = nullptr;
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr &&
+      instruction.location_number >=
+        life.first_create->location_number)
+      break;
+    irep_idt lhs;
+    if(
+      instruction.is_assign() &&
+      symbol_id(instruction.assign_lhs(), lhs) &&
+      lhs == symbol)
+      last = &instruction;
+  }
+  return
+    last != nullptr &&
+    (strip(last->assign_rhs()) == strip(value) ||
+     (value_is(last->assign_rhs(), 1) &&
+      (value_is(value, 1) || strip(value).is_true())));
+}
+
+bool prefix_channel_last_value_proof_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &reason)
+{
+  lifecyclet life;
+  std::vector<irep_idt> workers;
+  if(!stream_refine_lifecycle(model, life, workers, reason))
+    return false;
+
+  stream_refine_publisht publish;
+  std::set<const goto_programt::instructiont *> publish_writes;
+  prefix_channel_last_consumert consumer;
+  for(const auto &worker : workers)
+  {
+    stream_refine_publisht candidate_publish;
+    std::set<const goto_programt::instructiont *> candidate_writes;
+    std::string publish_reason;
+    if(
+      prefix_channel_constant_publisher(
+        model,
+        ns,
+        worker,
+        candidate_publish,
+        candidate_writes,
+        publish_reason))
+    {
+      if(!publish.channel.storage.empty())
+      {
+        reason = "prefix_last_multiple_publishers";
+        return false;
+      }
+      publish = candidate_publish;
+      publish_writes = candidate_writes;
+      continue;
+    }
+    prefix_channel_last_consumert candidate_consumer;
+    std::string consume_reason;
+    if(
+      prefix_channel_last_consumer(
+        model, ns, worker, candidate_consumer, consume_reason))
+    {
+      if(!consumer.worker.empty())
+      {
+        reason = "prefix_last_multiple_consumers";
+        return false;
+      }
+      consumer = candidate_consumer;
+      continue;
+    }
+    reason =
+      "prefix_last_worker_publish_" + publish_reason +
+      "_consume_" + consume_reason;
+    return false;
+  }
+  if(
+    publish.channel.storage.empty() || consumer.worker.empty() ||
+    publish.channel.storage != consumer.consume.channel.storage ||
+    publish.channel.back != consumer.consume.channel.back ||
+    publish.channel.bound != consumer.consume.channel.bound)
+  {
+    reason = "prefix_last_channel_signature";
+    return false;
+  }
+  stream_refine_channelt channel = publish.channel;
+  channel.front = consumer.consume.channel.front;
+  if(
+    !stream_refine_initial_channel(model, life, channel) ||
+    !prefix_channel_initial_value(
+      model, life, consumer.sink, publish.token))
+  {
+    reason = "prefix_last_initial_state";
+    return false;
+  }
+
+  const goto_programt::instructiont *property_assumption = nullptr;
+  const goto_programt::instructiont *error = nullptr;
+  if(
+    !prefix_channel_last_property(
+      model,
+      life,
+      consumer.sink,
+      publish.token,
+      property_assumption,
+      error,
+      reason))
+    return false;
+
+  const std::set<irep_idt> queues = {channel.storage};
+  const std::set<irep_idt> protected_symbols = {
+    channel.storage,
+    channel.front,
+    channel.back,
+    channel.bound,
+    consumer.sink};
+  std::set<const goto_programt::instructiont *> allowed =
+    publish_writes;
+  allowed.insert(
+    consumer.writes.begin(), consumer.writes.end());
+  stream_refine_sourcet unused_source;
+  std::vector<stream_refine_staget> unused_stages;
+  if(
+    !stream_refine_fresh_queues(
+      model, ns, life, queues, reason) ||
+    !stream_refine_global(
+      model,
+      ns,
+      life,
+      unused_source,
+      unused_stages,
+      queues,
+      protected_symbols,
+      allowed,
+      property_assumption,
+      error,
+      reason))
+    return false;
+
+  std::cout << "NATIVE_PREFIX_CHANNEL applied=1"
+            << " rule=constant_last"
+            << " storage=" << channel.storage
+            << " sink=" << consumer.sink << '\n';
+  return true;
+}
+
+struct prefix_channel_alternating_publishert
+{
+  irep_idt worker;
+  stream_refine_channelt channel;
+  irep_idt state;
+  mp_integer positive;
+  std::set<const goto_programt::instructiont *> writes;
+
+  prefix_channel_alternating_publishert() : positive(0)
+  {
+  }
+};
+
+struct prefix_channel_sum_consumert
+{
+  irep_idt worker;
+  stream_refine_channelt channel;
+  irep_idt sum;
+  irep_idt temporary;
+  std::set<const goto_programt::instructiont *> writes;
+};
+
+bool prefix_channel_loop_contains(
+  const goto_programt &program,
+  const natural_loopst::natural_loopt &loop,
+  const goto_programt::instructiont *instruction)
+{
+  for(auto current = program.instructions.begin();
+      current != program.instructions.end(); ++current)
+  {
+    if(&*current == instruction)
+      return loop.contains(current);
+  }
+  return false;
+}
+
+bool prefix_channel_false_test(
+  const exprt &src,
+  const irep_idt &symbol)
+{
+  const exprt &outer = strip(src);
+  if(outer.id() != ID_not || outer.operands().size() != 1)
+    return false;
+  const exprt &truth = strip(outer.op0());
+  if(truth.id() != ID_notequal || truth.operands().size() != 2)
+    return false;
+  irep_idt candidate;
+  return
+    (symbol_id(truth.op0(), candidate) && candidate == symbol &&
+     value_is(truth.op1(), 0)) ||
+    (symbol_id(truth.op1(), candidate) && candidate == symbol &&
+     value_is(truth.op0(), 0));
+}
+
+bool prefix_channel_true_test(
+  const exprt &src,
+  const irep_idt &symbol)
+{
+  const exprt &truth = strip(src);
+  if(truth.id() != ID_notequal || truth.operands().size() != 2)
+    return false;
+  irep_idt candidate;
+  return
+    (symbol_id(truth.op0(), candidate) && candidate == symbol &&
+     value_is(truth.op1(), 0)) ||
+    (symbol_id(truth.op1(), candidate) && candidate == symbol &&
+     value_is(truth.op0(), 0));
+}
+
+bool prefix_channel_toggle(
+  const exprt &src,
+  const irep_idt &symbol)
+{
+  return prefix_channel_false_test(src, symbol);
+}
+
+bool prefix_channel_availability(
+  const exprt &src,
+  irep_idt &front,
+  irep_idt &back)
+{
+  const exprt &relation = strip(src);
+  irep_idt lhs;
+  irep_idt rhs;
+  if(
+    relation.id() == ID_gt && relation.operands().size() == 2 &&
+    symbol_id(relation.op0(), lhs) &&
+    symbol_id(relation.op1(), rhs))
+  {
+    back = lhs;
+    front = rhs;
+    return true;
+  }
+  if(
+    relation.id() == ID_lt && relation.operands().size() == 2 &&
+    symbol_id(relation.op0(), lhs) &&
+    symbol_id(relation.op1(), rhs))
+  {
+    front = lhs;
+    back = rhs;
+    return true;
+  }
+  return false;
+}
+
+bool prefix_channel_negated_availability(
+  const exprt &src,
+  irep_idt &front,
+  irep_idt &back)
+{
+  const exprt &outer = strip(src);
+  return
+    outer.id() == ID_not && outer.operands().size() == 1 &&
+    prefix_channel_availability(outer.op0(), front, back);
+}
+
+bool prefix_channel_assumption_terms(
+  const goto_programt::instructiont &instruction,
+  std::vector<exprt> &terms)
+{
+  if(instruction.is_assume())
+  {
+    flatten_and(instruction.condition(), terms);
+    return true;
+  }
+  irep_idt callee;
+  if(
+    call_id(instruction, callee) && is_assume(callee) &&
+    instruction.call_arguments().size() == 1)
+  {
+    flatten_and(instruction.call_arguments().front(), terms);
+    return true;
+  }
+  return false;
+}
+
+bool prefix_channel_array_index(
+  const exprt &src,
+  irep_idt &base,
+  irep_idt &index)
+{
+  if(array_symbol_index(src, base, index))
+    return true;
+  const exprt &expr = strip(src);
+  if(expr.id() != ID_index || expr.operands().size() != 2)
+    return false;
+  irep_idt candidate_base;
+  irep_idt candidate_index;
+  if(
+    symbol_id(expr.op0(), candidate_base) &&
+    symbol_id(expr.op1(), candidate_index) &&
+    candidate_base != candidate_index)
+  {
+    base = candidate_base;
+    index = candidate_index;
+    return true;
+  }
+  return false;
+}
+
+bool prefix_channel_array_equality(
+  const exprt &src,
+  irep_idt &base,
+  irep_idt &index,
+  exprt &value)
+{
+  const exprt &relation = strip(src);
+  if(relation.id() != ID_equal || relation.operands().size() != 2)
+    return false;
+  if(prefix_channel_array_index(relation.op0(), base, index))
+  {
+    value = strip(relation.op1());
+    return true;
+  }
+  if(prefix_channel_array_index(relation.op1(), base, index))
+  {
+    value = strip(relation.op0());
+    return true;
+  }
+  return false;
+}
+
+bool prefix_channel_bounds_excluding(
+  const std::vector<exprt> &terms,
+  const irep_idt &index,
+  const irep_idt &excluded,
+  irep_idt &bound)
+{
+  bool nonnegative = false;
+  bool upper = false;
+  for(const auto &term : terms)
+  {
+    if(stream_refine_symbol_zero_relation(term, index, ID_ge))
+      nonnegative = true;
+    const exprt &relation = strip(term);
+    irep_idt lhs;
+    irep_idt rhs;
+    if(
+      relation.id() == ID_lt &&
+      relation.operands().size() == 2 &&
+      symbol_id(relation.op0(), lhs) && lhs == index &&
+      symbol_id(relation.op1(), rhs) && rhs != excluded)
+    {
+      if(upper && bound != rhs)
+        return false;
+      bound = rhs;
+      upper = true;
+    }
+  }
+  return nonnegative && upper;
+}
+
+bool prefix_channel_alternating_publisher(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  prefix_channel_alternating_publishert &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  natural_loopst loops;
+  loops(program);
+  if(loops.loop_map.size() != 1)
+  {
+    reason = "prefix_alt_publish_loop_count";
+    return false;
+  }
+  const auto &loop = loops.loop_map.begin()->second;
+
+  std::vector<const goto_programt::instructiont *> order;
+  std::vector<exprt> terms;
+  for(const auto &instruction : program.instructions)
+  {
+    order.push_back(&instruction);
+    std::vector<exprt> current;
+    if(prefix_channel_assumption_terms(instruction, current))
+    {
+      terms.insert(terms.end(), current.begin(), current.end());
+      continue;
+    }
+    if(!instruction.is_function_call())
+      continue;
+    irep_idt callee;
+    if(!call_id(instruction, callee))
+    {
+      reason = "prefix_alt_publish_call";
+      return false;
+    }
+    reason = "prefix_alt_publish_call";
+    return false;
+  }
+
+  struct located_publicationt
+  {
+    stream_refine_publisht publish;
+    std::size_t assume_index;
+    std::size_t increment_index;
+  };
+  std::vector<located_publicationt> publications;
+  std::size_t equality_terms = 0;
+  std::size_t indexed_equalities = 0;
+  std::set<irep_idt> observed_term_ids;
+  for(std::size_t index = 0; index < order.size(); ++index)
+  {
+    const auto *instruction = order[index];
+    std::vector<exprt> current;
+    prefix_channel_assumption_terms(*instruction, current);
+    irep_idt assigned_storage;
+    irep_idt assigned_index;
+    const bool storage_assignment =
+      instruction->is_assign() &&
+      prefix_channel_array_index(
+        instruction->assign_lhs(),
+        assigned_storage,
+        assigned_index);
+    if(storage_assignment)
+    {
+      current.push_back(
+        equal_exprt(
+          instruction->assign_lhs(),
+          instruction->assign_rhs()));
+    }
+    if(current.empty())
+      continue;
+    for(const auto &term : current)
+    {
+      const exprt &candidate_relation = strip(term);
+      observed_term_ids.insert(candidate_relation.id());
+      if(
+        candidate_relation.id() == ID_equal &&
+        candidate_relation.operands().size() == 2)
+        ++equality_terms;
+      irep_idt storage;
+      irep_idt back;
+      exprt token;
+      if(!prefix_channel_array_equality(term, storage, back, token))
+        continue;
+      ++indexed_equalities;
+      const goto_programt::instructiont *increment = nullptr;
+      std::size_t increment_index = 0;
+      for(std::size_t next = index + 1; next < order.size(); ++next)
+      {
+        if(!prefix_channel_loop_contains(
+             program, loop, order[next]))
+          break;
+        irep_idt lhs;
+        if(
+          order[next]->is_assign() &&
+          symbol_id(order[next]->assign_lhs(), lhs) &&
+          lhs == back)
+        {
+          if(unit_increment(*order[next], back))
+          {
+            increment = order[next];
+            increment_index = next;
+          }
+          break;
+        }
+      }
+      irep_idt bound;
+      if(
+        increment == nullptr ||
+        !stream_refine_bounds(terms, back, bound) ||
+        !shared_signed(back, ns) || !shared_signed(bound, ns))
+      {
+        reason = "prefix_alt_publish_transaction";
+        return false;
+      }
+      const symbolt *queue = lookup(storage, ns);
+      if(
+        queue == nullptr || !queue->is_static_lifetime ||
+        queue->type.id() != ID_pointer ||
+        to_pointer_type(queue->type).base_type().id() != ID_signedbv)
+      {
+        reason = "prefix_alt_publish_storage";
+        return false;
+      }
+      located_publicationt located;
+      located.publish.channel.storage = storage;
+      located.publish.channel.back = back;
+      located.publish.channel.bound = bound;
+      located.publish.token = strip(token);
+      located.publish.in_loop =
+        prefix_channel_loop_contains(program, loop, instruction);
+      located.publish.first_location = instruction->location_number;
+      located.publish.last_location = increment->location_number;
+      located.publish.writes.insert(increment);
+      if(storage_assignment)
+        located.publish.writes.insert(instruction);
+      located.assume_index = index;
+      located.increment_index = increment_index;
+      publications.push_back(located);
+    }
+  }
+  if(publications.size() != 2)
+  {
+    reason =
+      "prefix_alt_publish_count_" +
+      std::to_string(publications.size()) + "_equal_" +
+      std::to_string(equality_terms) + "_indexed_" +
+      std::to_string(indexed_equalities);
+    for(const auto &id : observed_term_ids)
+      reason += "_id_" + id2string(id);
+    return false;
+  }
+  for(const auto &publication : publications)
+  {
+    if(
+      !publication.publish.in_loop ||
+      publication.publish.channel.storage !=
+        publications.front().publish.channel.storage ||
+      publication.publish.channel.back !=
+        publications.front().publish.channel.back ||
+      publication.publish.channel.bound !=
+        publications.front().publish.channel.bound)
+    {
+      reason = "prefix_alt_publish_channel";
+      return false;
+    }
+  }
+
+  std::size_t positive_index = 0;
+  std::size_t negative_index = 0;
+  mp_integer first;
+  mp_integer second;
+  if(
+    !integer_constant(publications[0].publish.token, first) ||
+    !integer_constant(publications[1].publish.token, second) ||
+    first == 0 || second == 0 || first != -second)
+  {
+    reason = "prefix_alt_publish_tokens";
+    return false;
+  }
+  if(first > 0)
+  {
+    result.positive = first;
+    positive_index = 0;
+    negative_index = 1;
+  }
+  else
+  {
+    result.positive = second;
+    positive_index = 1;
+    negative_index = 0;
+  }
+
+  const goto_programt::instructiont *toggle = nullptr;
+  const goto_programt::instructiont *initialization = nullptr;
+  irep_idt state;
+  mp_integer initial_state;
+  std::size_t state_assignments = 0;
+  for(const auto *instruction : order)
+  {
+    if(!instruction->is_assign())
+      continue;
+    irep_idt lhs;
+    if(
+      !symbol_id(instruction->assign_lhs(), lhs) ||
+      !local_boolean(lhs, ns))
+      continue;
+    if(prefix_channel_toggle(instruction->assign_rhs(), lhs))
+    {
+      if(
+        toggle != nullptr ||
+        !prefix_channel_loop_contains(program, loop, instruction))
+      {
+        reason = "prefix_alt_toggle_count";
+        return false;
+      }
+      toggle = instruction;
+      state = lhs;
+    }
+  }
+  if(toggle == nullptr || state.empty())
+  {
+    reason = "prefix_alt_toggle";
+    return false;
+  }
+  for(const auto *instruction : order)
+  {
+    if(!instruction->is_assign())
+      continue;
+    irep_idt lhs;
+    if(!symbol_id(instruction->assign_lhs(), lhs) || lhs != state)
+      continue;
+    ++state_assignments;
+    if(!prefix_channel_loop_contains(program, loop, instruction))
+    {
+      mp_integer candidate;
+      if(
+        integer_constant(instruction->assign_rhs(), candidate) &&
+        (candidate == 0 || candidate == 1))
+      {
+        initialization = instruction;
+        initial_state = candidate;
+      }
+    }
+  }
+  if(
+    state_assignments != 2 || initialization == nullptr ||
+    initialization->location_number >=
+      publications[positive_index].publish.first_location ||
+    toggle->location_number <=
+      publications[negative_index].publish.last_location)
+  {
+    reason = "prefix_alt_state_updates";
+    return false;
+  }
+
+  const auto &positive = publications[positive_index];
+  const auto &negative = publications[negative_index];
+  std::size_t branch_matches = 0;
+  std::size_t skip_matches = 0;
+  for(const auto *instruction : order)
+  {
+    if(
+      !instruction->is_goto() || instruction->targets.size() != 1 ||
+      !prefix_channel_loop_contains(program, loop, instruction))
+      continue;
+    const unsigned target =
+      instruction->get_target()->location_number;
+    const bool skips_initial_positive =
+      (initial_state == 1 &&
+       prefix_channel_false_test(instruction->condition(), state)) ||
+      (initial_state == 0 &&
+       prefix_channel_true_test(instruction->condition(), state));
+    if(
+      skips_initial_positive &&
+      instruction->location_number <
+        positive.publish.first_location &&
+      positive.publish.last_location < target &&
+      target <= negative.publish.first_location)
+      ++branch_matches;
+    if(
+      instruction->condition().is_true() &&
+      positive.publish.last_location <
+        instruction->location_number &&
+      instruction->location_number <
+        negative.publish.first_location &&
+      target > negative.publish.last_location &&
+      target <= toggle->location_number)
+      ++skip_matches;
+  }
+  if(branch_matches != 1 || skip_matches != 1)
+  {
+    reason = "prefix_alt_branch_control";
+    return false;
+  }
+
+  result.worker = worker;
+  result.channel = positive.publish.channel;
+  result.state = state;
+  result.writes.insert(
+    positive.publish.writes.begin(), positive.publish.writes.end());
+  result.writes.insert(
+    negative.publish.writes.begin(), negative.publish.writes.end());
+  return true;
+}
+
+bool prefix_channel_sum_consumer(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  prefix_channel_sum_consumert &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  natural_loopst loops;
+  loops(program);
+  if(loops.loop_map.size() != 1)
+  {
+    reason = "prefix_sum_loop_count";
+    return false;
+  }
+  const auto &loop = loops.loop_map.begin()->second;
+  std::vector<exprt> terms;
+  const goto_programt::instructiont *read = nullptr;
+  const goto_programt::instructiont *increment = nullptr;
+  const goto_programt::instructiont *addition = nullptr;
+  irep_idt storage;
+  irep_idt front;
+  irep_idt temporary;
+  irep_idt sum;
+  std::vector<std::pair<irep_idt, irep_idt>> availability_candidates;
+  for(auto target = program.instructions.begin();
+      target != program.instructions.end(); ++target)
+  {
+    const auto &instruction = *target;
+    std::vector<exprt> current;
+    if(prefix_channel_assumption_terms(instruction, current))
+    {
+      for(const auto &term : current)
+      {
+        irep_idt candidate_front;
+        irep_idt candidate_back;
+        if(
+          prefix_channel_availability(
+            term, candidate_front, candidate_back))
+        {
+          availability_candidates.emplace_back(
+            candidate_front, candidate_back);
+        }
+      }
+      terms.insert(terms.end(), current.begin(), current.end());
+      continue;
+    }
+    if(instruction.is_function_call())
+    {
+      reason = "prefix_sum_call";
+      return false;
+    }
+    if(
+      instruction.is_goto() && loop.contains(target) &&
+      instruction.targets.size() == 1 &&
+      !loop.contains(instruction.get_target()))
+    {
+      irep_idt candidate_front;
+      irep_idt candidate_back;
+      if(
+        prefix_channel_negated_availability(
+          instruction.condition(),
+          candidate_front,
+          candidate_back))
+      {
+        availability_candidates.emplace_back(
+          candidate_front, candidate_back);
+      }
+    }
+    if(!instruction.is_assign() || !loop.contains(target))
+      continue;
+    irep_idt lhs;
+    irep_idt candidate_storage;
+    irep_idt candidate_front;
+    if(
+      symbol_id(instruction.assign_lhs(), lhs) &&
+      prefix_channel_array_index(
+        instruction.assign_rhs(),
+        candidate_storage,
+        candidate_front))
+    {
+      if(read != nullptr)
+      {
+        reason = "prefix_sum_read_count";
+        return false;
+      }
+      read = &instruction;
+      temporary = lhs;
+      storage = candidate_storage;
+      front = candidate_front;
+      result.writes.insert(&instruction);
+      continue;
+    }
+    exprt delta;
+    if(stream_refine_addition(instruction, lhs, delta))
+    {
+      bool fold_candidate = false;
+      irep_idt direct_storage;
+      irep_idt direct_front;
+      if(
+        prefix_channel_array_index(
+          delta, direct_storage, direct_front))
+      {
+        fold_candidate = true;
+        if(read != nullptr)
+        {
+          reason = "prefix_sum_read_count";
+          return false;
+        }
+        read = &instruction;
+        storage = direct_storage;
+        front = direct_front;
+      }
+      else
+      {
+        irep_idt delta_symbol;
+        if(
+          symbol_id(delta, delta_symbol) &&
+          (temporary.empty() || delta_symbol == temporary))
+        {
+          fold_candidate = true;
+          temporary = delta_symbol;
+        }
+      }
+      if(fold_candidate)
+      {
+        if(addition != nullptr || !shared_signed(lhs, ns))
+        {
+          reason = "prefix_sum_addition_count";
+          return false;
+        }
+        addition = &instruction;
+        sum = lhs;
+        result.writes.insert(&instruction);
+        continue;
+      }
+    }
+    if(
+      symbol_id(instruction.assign_lhs(), lhs) &&
+      unit_increment(instruction, lhs))
+    {
+      if(increment != nullptr)
+      {
+        reason = "prefix_sum_increment_count";
+        return false;
+      }
+      increment = &instruction;
+      if(front.empty())
+        front = lhs;
+      else if(front != lhs)
+      {
+        reason = "prefix_sum_front_mismatch";
+        return false;
+      }
+      result.writes.insert(&instruction);
+    }
+  }
+  std::size_t availability = 0;
+  irep_idt available_back;
+  for(const auto &candidate : availability_candidates)
+  {
+    if(
+      candidate.first == front &&
+      available_back.empty())
+    {
+      available_back = candidate.second;
+      ++availability;
+    }
+  }
+  irep_idt bound;
+  if(
+    availability == 0 ||
+    !prefix_channel_bounds_excluding(
+      terms, front, available_back, bound))
+  {
+    reason = "prefix_sum_bounds";
+    return false;
+  }
+  if(
+    read == nullptr || increment == nullptr || addition == nullptr ||
+    availability != 1 ||
+    read->location_number >= increment->location_number ||
+    addition->location_number < read->location_number ||
+    !shared_signed(front, ns) ||
+    !shared_signed(available_back, ns) ||
+    !shared_signed(bound, ns))
+  {
+    reason = "prefix_sum_signature";
+    return false;
+  }
+  if(
+    !temporary.empty() &&
+    addition != read)
+  {
+    irep_idt delta_symbol;
+    exprt delta;
+    irep_idt ignored;
+    if(
+      !stream_refine_addition(*addition, ignored, delta) ||
+      !symbol_id(delta, delta_symbol) ||
+      delta_symbol != temporary)
+    {
+      reason = "prefix_sum_temporary_flow";
+      return false;
+    }
+  }
+  const symbolt *queue = lookup(storage, ns);
+  if(
+    queue == nullptr || !queue->is_static_lifetime ||
+    queue->type.id() != ID_pointer ||
+    to_pointer_type(queue->type).base_type().id() != ID_signedbv)
+  {
+    reason = "prefix_sum_storage";
+    return false;
+  }
+  result.worker = worker;
+  result.channel.storage = storage;
+  result.channel.front = front;
+  result.channel.back = available_back;
+  result.channel.bound = bound;
+  result.sum = sum;
+  result.temporary = temporary;
+  return true;
+}
+
+bool prefix_channel_sum_property(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const irep_idt &sum,
+  const mp_integer &upper,
+  const goto_programt::instructiont *&assumption,
+  const goto_programt::instructiont *&error,
+  std::string &reason)
+{
+  std::size_t errors = 0;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(call_id(instruction, callee) && is_reach_error(callee))
+      {
+        ++errors;
+        if(entry.first != ID_main)
+        {
+          reason = "prefix_sum_error_function";
+          return false;
+        }
+        error = &instruction;
+      }
+    }
+  }
+  std::size_t matches = 0;
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.last_join == nullptr ||
+      instruction.location_number <= life.last_join->location_number)
+      continue;
+    irep_idt callee;
+    if(
+      !call_id(instruction, callee) || !is_assume(callee) ||
+      instruction.call_arguments().size() != 1)
+      continue;
+    std::vector<exprt> disjuncts;
+    flatten_or(instruction.call_arguments().front(), disjuncts);
+    if(disjuncts.size() != 2)
+      continue;
+    bool lower = false;
+    bool greater = false;
+    for(const auto &term : disjuncts)
+    {
+      const exprt &relation = strip(term);
+      if(relation.operands().size() != 2)
+        continue;
+      irep_idt candidate;
+      if(
+        relation.id() == ID_lt &&
+        symbol_id(relation.op0(), candidate) && candidate == sum &&
+        value_is(relation.op1(), 0))
+        lower = true;
+      if(
+        relation.id() == ID_gt &&
+        symbol_id(relation.op1(), candidate) && candidate == sum &&
+        value_is(relation.op0(), 0))
+        lower = true;
+      mp_integer bound;
+      if(
+        relation.id() == ID_gt &&
+        symbol_id(relation.op0(), candidate) && candidate == sum &&
+        integer_constant(relation.op1(), bound) && bound == upper)
+        greater = true;
+      if(
+        relation.id() == ID_lt &&
+        symbol_id(relation.op1(), candidate) && candidate == sum &&
+        integer_constant(relation.op0(), bound) && bound == upper)
+        greater = true;
+    }
+    if(lower && greater)
+    {
+      assumption = &instruction;
+      ++matches;
+    }
+  }
+  if(
+    errors != 1 || matches != 1 || assumption == nullptr ||
+    error == nullptr ||
+    assumption->location_number >= error->location_number)
+  {
+    reason = "prefix_sum_property";
+    return false;
+  }
+  return true;
+}
+
+bool prefix_channel_alternating_sum_proof_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &reason)
+{
+  lifecyclet life;
+  std::vector<irep_idt> workers;
+  if(!stream_refine_lifecycle(model, life, workers, reason))
+    return false;
+
+  prefix_channel_alternating_publishert publisher;
+  prefix_channel_sum_consumert consumer;
+  for(const auto &worker : workers)
+  {
+    prefix_channel_alternating_publishert candidate_publisher;
+    std::string publisher_reason;
+    if(
+      prefix_channel_alternating_publisher(
+        model, ns, worker, candidate_publisher, publisher_reason))
+    {
+      if(!publisher.worker.empty())
+      {
+        reason = "prefix_alt_multiple_publishers";
+        return false;
+      }
+      publisher = candidate_publisher;
+      continue;
+    }
+    prefix_channel_sum_consumert candidate_consumer;
+    std::string consumer_reason;
+    if(
+      prefix_channel_sum_consumer(
+        model, ns, worker, candidate_consumer, consumer_reason))
+    {
+      if(!consumer.worker.empty())
+      {
+        reason = "prefix_alt_multiple_consumers";
+        return false;
+      }
+      consumer = candidate_consumer;
+      continue;
+    }
+    reason =
+      "prefix_alt_worker_publish_" + publisher_reason +
+      "_consume_" + consumer_reason;
+    return false;
+  }
+  if(
+    publisher.worker.empty() || consumer.worker.empty() ||
+    publisher.channel.storage != consumer.channel.storage ||
+    publisher.channel.back != consumer.channel.back ||
+    publisher.channel.bound != consumer.channel.bound)
+  {
+    reason = "prefix_alt_channel_signature";
+    return false;
+  }
+  stream_refine_channelt channel = publisher.channel;
+  channel.front = consumer.channel.front;
+  if(!stream_refine_initial_channel(model, life, channel))
+  {
+    reason = "prefix_alt_initial_channel";
+    return false;
+  }
+
+  const goto_programt::instructiont *property_assumption = nullptr;
+  const goto_programt::instructiont *error = nullptr;
+  if(
+    !prefix_channel_sum_property(
+      model,
+      life,
+      consumer.sum,
+      publisher.positive,
+      property_assumption,
+      error,
+      reason))
+    return false;
+
+  const std::set<irep_idt> queues = {channel.storage};
+  std::set<irep_idt> protected_symbols = {
+    channel.storage,
+    channel.front,
+    channel.back,
+    channel.bound,
+    consumer.sum};
+  if(
+    !consumer.temporary.empty() &&
+    shared_signed(consumer.temporary, ns))
+    protected_symbols.insert(consumer.temporary);
+  std::set<const goto_programt::instructiont *> allowed =
+    publisher.writes;
+  allowed.insert(
+    consumer.writes.begin(), consumer.writes.end());
+  stream_refine_sourcet unused_source;
+  std::vector<stream_refine_staget> unused_stages;
+  if(
+    !stream_refine_fresh_queues(
+      model, ns, life, queues, reason) ||
+    !zero_initialized_symbols(
+      model, {consumer.sum}, allowed, reason) ||
+    !stream_refine_global(
+      model,
+      ns,
+      life,
+      unused_source,
+      unused_stages,
+      queues,
+      protected_symbols,
+      allowed,
+      property_assumption,
+      error,
+      reason))
+    return false;
+
+  std::cout << "NATIVE_PREFIX_CHANNEL applied=1"
+            << " rule=alternating_sum"
+            << " storage=" << channel.storage
+            << " sum=" << consumer.sum
+            << " token=" << publisher.positive << '\n';
+  return true;
+}
+
+struct prefix_channel_snapshot_monitort
+{
+  irep_idt worker;
+  irep_idt flag;
+  irep_idt sum;
+  mp_integer upper;
+  std::set<const goto_programt::instructiont *> writes;
+
+  prefix_channel_snapshot_monitort() : upper(0)
+  {
+  }
+};
+
+bool prefix_channel_safe_interval(
+  const exprt &src,
+  irep_idt &sum,
+  mp_integer &upper)
+{
+  std::vector<exprt> terms;
+  flatten_and(src, terms);
+  if(terms.size() != 2)
+    return false;
+  bool lower = false;
+  bool bounded = false;
+  irep_idt candidate_sum;
+  mp_integer candidate_upper;
+  for(const auto &term : terms)
+  {
+    const exprt &relation = strip(term);
+    if(relation.operands().size() != 2)
+      return false;
+    irep_idt candidate;
+    if(
+      relation.id() == ID_le &&
+      value_is(relation.op0(), 0) &&
+      symbol_id(relation.op1(), candidate))
+    {
+      if(!candidate_sum.empty() && candidate_sum != candidate)
+        return false;
+      candidate_sum = candidate;
+      lower = true;
+      continue;
+    }
+    if(
+      relation.id() == ID_ge &&
+      symbol_id(relation.op0(), candidate) &&
+      value_is(relation.op1(), 0))
+    {
+      if(!candidate_sum.empty() && candidate_sum != candidate)
+        return false;
+      candidate_sum = candidate;
+      lower = true;
+      continue;
+    }
+    mp_integer bound;
+    if(
+      relation.id() == ID_le &&
+      symbol_id(relation.op0(), candidate) &&
+      integer_constant(relation.op1(), bound))
+    {
+      if(!candidate_sum.empty() && candidate_sum != candidate)
+        return false;
+      candidate_sum = candidate;
+      candidate_upper = bound;
+      bounded = true;
+      continue;
+    }
+    if(
+      relation.id() == ID_ge &&
+      integer_constant(relation.op0(), bound) &&
+      symbol_id(relation.op1(), candidate))
+    {
+      if(!candidate_sum.empty() && candidate_sum != candidate)
+        return false;
+      candidate_sum = candidate;
+      candidate_upper = bound;
+      bounded = true;
+      continue;
+    }
+    return false;
+  }
+  if(!lower || !bounded || candidate_sum.empty())
+    return false;
+  sum = candidate_sum;
+  upper = candidate_upper;
+  return true;
+}
+
+bool prefix_channel_snapshot_monitor(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  prefix_channel_snapshot_monitort &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  natural_loopst loops;
+  loops(program);
+  if(!loops.loop_map.empty())
+  {
+    reason = "prefix_snapshot_loop";
+    return false;
+  }
+  unsigned depth = 0;
+  std::size_t begins = 0;
+  std::size_t ends = 0;
+  std::size_t assignments = 0;
+  for(const auto &instruction : program.instructions)
+  {
+    if(instruction.is_atomic_begin())
+    {
+      if(depth != 0)
+      {
+        reason = "prefix_snapshot_atomic_nesting";
+        return false;
+      }
+      depth = 1;
+      ++begins;
+      continue;
+    }
+    if(instruction.is_atomic_end())
+    {
+      if(depth != 1)
+      {
+        reason = "prefix_snapshot_atomic_balance";
+        return false;
+      }
+      depth = 0;
+      ++ends;
+      continue;
+    }
+    if(instruction.is_function_call())
+    {
+      reason = "prefix_snapshot_call";
+      return false;
+    }
+    if(!instruction.is_assign())
+      continue;
+    irep_idt flag;
+    irep_idt sum;
+    mp_integer upper;
+    if(
+      depth != 1 ||
+      !symbol_id(instruction.assign_lhs(), flag) ||
+      !shared_boolean(flag, ns) ||
+      !prefix_channel_safe_interval(
+        instruction.assign_rhs(), sum, upper) ||
+      !shared_signed(sum, ns) || upper <= 0)
+    {
+      reason = "prefix_snapshot_assignment";
+      return false;
+    }
+    ++assignments;
+    result.flag = flag;
+    result.sum = sum;
+    result.upper = upper;
+    result.writes.insert(&instruction);
+  }
+  if(
+    depth != 0 || begins != 1 || ends != 1 ||
+    assignments != 1)
+  {
+    reason = "prefix_snapshot_shape";
+    return false;
+  }
+  result.worker = worker;
+  return true;
+}
+
+bool prefix_channel_flag_controlled_loop(
+  const goto_modelt &model,
+  const irep_idt &worker,
+  const irep_idt &flag,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  natural_loopst loops;
+  loops(program);
+  if(loops.loop_map.size() != 1)
+  {
+    reason = "prefix_flag_loop_count";
+    return false;
+  }
+  const auto &loop = loops.loop_map.begin()->second;
+  std::map<irep_idt, std::vector<
+    const goto_programt::instructiont *>> copies;
+  for(const auto &instruction : program.instructions)
+  {
+    if(!instruction.is_assign())
+      continue;
+    irep_idt lhs;
+    irep_idt rhs;
+    if(
+      symbol_id(instruction.assign_lhs(), lhs) &&
+      symbol_id(instruction.assign_rhs(), rhs) &&
+      rhs == flag)
+      copies[lhs].push_back(&instruction);
+  }
+  irep_idt condition;
+  for(const auto &entry : copies)
+  {
+    if(entry.second.size() != 2)
+      continue;
+    std::size_t outside = 0;
+    std::size_t inside = 0;
+    for(const auto *copy : entry.second)
+    {
+      if(prefix_channel_loop_contains(program, loop, copy))
+        ++inside;
+      else
+        ++outside;
+    }
+    if(outside == 1 && inside == 1)
+    {
+      if(!condition.empty())
+      {
+        reason = "prefix_flag_copy_ambiguous";
+        return false;
+      }
+      condition = entry.first;
+    }
+  }
+  if(condition.empty())
+  {
+    reason = "prefix_flag_copy";
+    return false;
+  }
+  std::size_t condition_writes = 0;
+  std::size_t exits = 0;
+  std::size_t backedges = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_assign())
+    {
+      irep_idt lhs;
+      if(
+        symbol_id(instruction->assign_lhs(), lhs) &&
+        lhs == condition)
+        ++condition_writes;
+    }
+    if(
+      instruction->is_goto() && loop.contains(instruction) &&
+      instruction->targets.size() == 1)
+    {
+      if(
+        prefix_channel_false_test(
+          instruction->condition(), condition) &&
+        !loop.contains(instruction->get_target()))
+        ++exits;
+      if(
+        instruction->condition().is_true() &&
+        loop.contains(instruction->get_target()) &&
+        instruction->get_target()->location_number <=
+          instruction->location_number)
+        ++backedges;
+    }
+  }
+  if(condition_writes != 2 || exits != 1 || backedges != 1)
+  {
+    reason = "prefix_flag_control";
+    return false;
+  }
+  return true;
+}
+
+bool prefix_channel_unconditional_error(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const goto_programt::instructiont *&error,
+  std::string &reason)
+{
+  std::size_t errors = 0;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(call_id(instruction, callee) && is_reach_error(callee))
+      {
+        ++errors;
+        if(
+          entry.first != ID_main || life.last_join == nullptr ||
+          instruction.location_number <=
+            life.last_join->location_number)
+        {
+          reason = "prefix_snapshot_error_location";
+          return false;
+        }
+        error = &instruction;
+      }
+    }
+  }
+  if(errors != 1 || error == nullptr)
+  {
+    reason = "prefix_snapshot_error";
+    return false;
+  }
+  return true;
+}
+
+bool prefix_channel_alternating_snapshot_proof_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &reason)
+{
+  lifecyclet life;
+  std::vector<irep_idt> workers;
+  if(
+    !stream_refine_lifecycle(model, life, workers, reason) ||
+    workers.size() != 3)
+  {
+    if(reason.empty())
+      reason = "prefix_snapshot_lifecycle";
+    return false;
+  }
+
+  prefix_channel_alternating_publishert publisher;
+  prefix_channel_sum_consumert consumer;
+  prefix_channel_snapshot_monitort monitor;
+  for(const auto &worker : workers)
+  {
+    prefix_channel_alternating_publishert candidate_publisher;
+    std::string publisher_reason;
+    if(
+      prefix_channel_alternating_publisher(
+        model, ns, worker, candidate_publisher, publisher_reason))
+    {
+      if(!publisher.worker.empty())
+      {
+        reason = "prefix_snapshot_multiple_publishers";
+        return false;
+      }
+      publisher = candidate_publisher;
+      continue;
+    }
+    prefix_channel_sum_consumert candidate_consumer;
+    std::string consumer_reason;
+    if(
+      prefix_channel_sum_consumer(
+        model, ns, worker, candidate_consumer, consumer_reason))
+    {
+      if(!consumer.worker.empty())
+      {
+        reason = "prefix_snapshot_multiple_consumers";
+        return false;
+      }
+      consumer = candidate_consumer;
+      continue;
+    }
+    prefix_channel_snapshot_monitort candidate_monitor;
+    std::string monitor_reason;
+    if(
+      prefix_channel_snapshot_monitor(
+        model, ns, worker, candidate_monitor, monitor_reason))
+    {
+      if(!monitor.worker.empty())
+      {
+        reason = "prefix_snapshot_multiple_monitors";
+        return false;
+      }
+      monitor = candidate_monitor;
+      continue;
+    }
+    reason =
+      "prefix_snapshot_worker_publish_" + publisher_reason +
+      "_consume_" + consumer_reason +
+      "_monitor_" + monitor_reason;
+    return false;
+  }
+  if(
+    publisher.worker.empty() || consumer.worker.empty() ||
+    monitor.worker.empty() ||
+    publisher.channel.storage != consumer.channel.storage ||
+    publisher.channel.back != consumer.channel.back ||
+    publisher.channel.bound != consumer.channel.bound ||
+    monitor.sum != consumer.sum ||
+    monitor.upper != publisher.positive ||
+    !prefix_channel_flag_controlled_loop(
+      model, publisher.worker, monitor.flag, reason) ||
+    !prefix_channel_flag_controlled_loop(
+      model, consumer.worker, monitor.flag, reason))
+  {
+    if(reason.empty())
+      reason = "prefix_snapshot_signature";
+    return false;
+  }
+  stream_refine_channelt channel = publisher.channel;
+  channel.front = consumer.channel.front;
+  if(
+    !stream_refine_initial_channel(model, life, channel) ||
+    !prefix_channel_initial_value(
+      model,
+      life,
+      monitor.flag,
+      true_exprt()))
+  {
+    reason = "prefix_snapshot_initial_state";
+    return false;
+  }
+
+  const goto_programt::instructiont *error = nullptr;
+  if(!prefix_channel_unconditional_error(model, life, error, reason))
+    return false;
+  const std::set<irep_idt> queues = {channel.storage};
+  std::set<irep_idt> protected_symbols = {
+    channel.storage,
+    channel.front,
+    channel.back,
+    channel.bound,
+    consumer.sum,
+    monitor.flag};
+  if(
+    !consumer.temporary.empty() &&
+    shared_signed(consumer.temporary, ns))
+    protected_symbols.insert(consumer.temporary);
+  std::set<const goto_programt::instructiont *> allowed =
+    publisher.writes;
+  allowed.insert(
+    consumer.writes.begin(), consumer.writes.end());
+  allowed.insert(
+    monitor.writes.begin(), monitor.writes.end());
+  stream_refine_sourcet unused_source;
+  std::vector<stream_refine_staget> unused_stages;
+  if(
+    !stream_refine_fresh_queues(
+      model, ns, life, queues, reason) ||
+    !zero_initialized_symbols(
+      model, {consumer.sum}, allowed, reason) ||
+    !stream_refine_global(
+      model,
+      ns,
+      life,
+      unused_source,
+      unused_stages,
+      queues,
+      protected_symbols,
+      allowed,
+      nullptr,
+      error,
+      reason))
+    return false;
+
+  std::cout << "NATIVE_PREFIX_CHANNEL applied=1"
+            << " rule=alternating_snapshot"
+            << " storage=" << channel.storage
+            << " sum=" << consumer.sum
+            << " flag=" << monitor.flag << '\n';
+  return true;
+}
+
+struct prefix_channel_bounded_publishert
+{
+  irep_idt worker;
+  stream_refine_publisht publish;
+  irep_idt bound;
+  irep_idt flag;
+  std::set<const goto_programt::instructiont *> writes;
+};
+
+struct prefix_channel_bound_monitort
+{
+  irep_idt worker;
+  irep_idt flag;
+  irep_idt sum;
+  irep_idt bound;
+  std::set<const goto_programt::instructiont *> writes;
+};
+
+bool prefix_channel_snapshot_read_region(
+  const std::vector<const goto_programt::instructiont *> &region,
+  const namespacet &ns,
+  irep_idt &flag)
+{
+  std::size_t assignments = 0;
+  for(const auto *instruction : region)
+  {
+    if(instruction->is_assign())
+    {
+      irep_idt lhs;
+      irep_idt rhs;
+      const symbolt *local = nullptr;
+      if(
+        !symbol_id(instruction->assign_lhs(), lhs) ||
+        (local = lookup(lhs, ns)) == nullptr ||
+        local->is_static_lifetime || local->is_type ||
+        !symbol_id(instruction->assign_rhs(), rhs) ||
+        !shared_boolean(rhs, ns))
+        return false;
+      flag = rhs;
+      ++assignments;
+      continue;
+    }
+    if(
+      instruction->is_decl() || instruction->is_dead() ||
+      instruction->is_location() || instruction->is_skip())
+      continue;
+    return false;
+  }
+  return assignments == 1;
+}
+
+bool prefix_channel_countdown_guard(
+  const exprt &src,
+  const irep_idt &counter)
+{
+  if(prefix_channel_false_test(src, counter))
+    return true;
+  const exprt &outer = strip(src);
+  if(outer.id() != ID_not || outer.operands().size() != 1)
+    return false;
+  const exprt &relation = strip(outer.op0());
+  irep_idt lhs;
+  return
+    relation.id() == ID_gt && relation.operands().size() == 2 &&
+    symbol_id(relation.op0(), lhs) && lhs == counter &&
+    value_is(relation.op1(), 0);
+}
+
+bool prefix_channel_unit_decrement(
+  const goto_programt::instructiont &instruction,
+  const irep_idt &counter)
+{
+  if(!instruction.is_assign())
+    return false;
+  irep_idt lhs;
+  if(!symbol_id(instruction.assign_lhs(), lhs) || lhs != counter)
+    return false;
+  const exprt &rhs = strip(instruction.assign_rhs());
+  irep_idt operand;
+  return
+    rhs.id() == ID_minus && rhs.operands().size() == 2 &&
+    symbol_id(rhs.op0(), operand) && operand == counter &&
+    value_is(rhs.op1(), 1);
+}
+
+bool prefix_channel_bounded_publisher(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  prefix_channel_bounded_publishert &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  natural_loopst loops;
+  loops(program);
+  if(loops.loop_map.size() != 1)
+  {
+    reason = "prefix_bound_publish_loop_count";
+    return false;
+  }
+  const auto loop_head = loops.loop_map.begin()->first;
+  const auto &loop = loops.loop_map.begin()->second;
+
+  bool in_atomic = false;
+  bool region_in_loop = false;
+  std::vector<const goto_programt::instructiont *> region;
+  std::vector<stream_refine_publisht> publications;
+  std::set<irep_idt> flags;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_atomic_begin())
+    {
+      if(in_atomic)
+      {
+        reason = "prefix_bound_publish_atomic_nesting";
+        return false;
+      }
+      in_atomic = true;
+      region_in_loop = loop.contains(instruction);
+      region.clear();
+      continue;
+    }
+    if(instruction->is_atomic_end())
+    {
+      if(!in_atomic || loop.contains(instruction) != region_in_loop)
+      {
+        reason = "prefix_bound_publish_atomic_balance";
+        return false;
+      }
+      stream_refine_publisht publish;
+      irep_idt flag;
+      if(
+        stream_refine_publish_region(
+          region, ns, region_in_loop, publish))
+        publications.push_back(publish);
+      else if(prefix_channel_snapshot_read_region(region, ns, flag))
+        flags.insert(flag);
+      else
+      {
+        reason = "prefix_bound_publish_atomic_region";
+        return false;
+      }
+      in_atomic = false;
+      region.clear();
+      continue;
+    }
+    if(in_atomic)
+      region.push_back(&*instruction);
+  }
+  mp_integer token;
+  if(
+    in_atomic || publications.size() != 1 ||
+    !publications.front().in_loop || flags.size() != 1 ||
+    !integer_constant(publications.front().token, token) ||
+    token != 1)
+  {
+    reason = "prefix_bound_publish_transactions";
+    return false;
+  }
+
+  irep_idt counter;
+  irep_idt bound;
+  const goto_programt::instructiont *initialization = nullptr;
+  const goto_programt::instructiont *decrement = nullptr;
+  std::size_t local_candidate_writes = 0;
+  for(const auto &instruction : program.instructions)
+  {
+    if(!instruction.is_assign())
+      continue;
+    irep_idt lhs;
+    irep_idt rhs;
+    if(
+      !prefix_channel_loop_contains(
+        program, loop, &instruction) &&
+      symbol_id(instruction.assign_lhs(), lhs) &&
+      local_signed(lhs, ns) &&
+      symbol_id(instruction.assign_rhs(), rhs) &&
+      shared_signed(rhs, ns))
+    {
+      if(initialization != nullptr)
+      {
+        reason = "prefix_bound_publish_initialization";
+        return false;
+      }
+      initialization = &instruction;
+      counter = lhs;
+      bound = rhs;
+    }
+  }
+  if(initialization == nullptr)
+  {
+    reason = "prefix_bound_publish_initialization";
+    return false;
+  }
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(!instruction->is_assign())
+      continue;
+    irep_idt lhs;
+    if(
+      symbol_id(instruction->assign_lhs(), lhs) &&
+      lhs == counter)
+    {
+      ++local_candidate_writes;
+      if(
+        loop.contains(instruction) &&
+        prefix_channel_unit_decrement(*instruction, counter))
+        decrement = &*instruction;
+    }
+  }
+  if(
+    decrement == nullptr || local_candidate_writes != 2 ||
+    loop_head->targets.size() != 1 ||
+    !prefix_channel_countdown_guard(
+      loop_head->condition(), counter) ||
+    loop.contains(loop_head->get_target()))
+  {
+    reason = "prefix_bound_publish_countdown";
+    return false;
+  }
+  std::size_t backedges = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(
+      !instruction->is_goto() || !loop.contains(instruction) ||
+      instruction->targets.size() != 1)
+      continue;
+    if(
+      instruction->condition().is_true() &&
+      instruction->get_target() == loop_head)
+    {
+      ++backedges;
+      if(
+        decrement->location_number >=
+          instruction->location_number)
+      {
+        reason = "prefix_bound_publish_decrement_order";
+        return false;
+      }
+      continue;
+    }
+    if(
+      loop.contains(instruction->get_target()) &&
+      instruction->get_target()->location_number >
+        publications.front().first_location)
+    {
+      reason = "prefix_bound_publish_skip_decrement";
+      return false;
+    }
+  }
+  if(backedges != 1)
+  {
+    reason = "prefix_bound_publish_backedge";
+    return false;
+  }
+  for(const auto &instruction : program.instructions)
+  {
+    if(!instruction.is_function_call())
+      continue;
+    irep_idt callee;
+    if(!call_id(instruction, callee) || !is_assume(callee))
+    {
+      reason = "prefix_bound_publish_call";
+      return false;
+    }
+  }
+  result.worker = worker;
+  result.publish = publications.front();
+  result.bound = bound;
+  result.flag = *flags.begin();
+  result.writes = result.publish.writes;
+  return true;
+}
+
+bool prefix_channel_bound_monitor(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  prefix_channel_bound_monitort &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  natural_loopst loops;
+  loops(program);
+  if(!loops.loop_map.empty())
+  {
+    reason = "prefix_bound_monitor_loop";
+    return false;
+  }
+  unsigned depth = 0;
+  std::size_t assignments = 0;
+  for(const auto &instruction : program.instructions)
+  {
+    if(instruction.is_atomic_begin())
+    {
+      if(depth != 0)
+        return false;
+      depth = 1;
+      continue;
+    }
+    if(instruction.is_atomic_end())
+    {
+      if(depth != 1)
+        return false;
+      depth = 0;
+      continue;
+    }
+    if(instruction.is_function_call())
+    {
+      reason = "prefix_bound_monitor_call";
+      return false;
+    }
+    if(!instruction.is_assign())
+      continue;
+    irep_idt flag;
+    if(
+      depth != 1 ||
+      !symbol_id(instruction.assign_lhs(), flag) ||
+      !shared_boolean(flag, ns))
+    {
+      reason = "prefix_bound_monitor_assignment";
+      return false;
+    }
+    const exprt &relation = strip(instruction.assign_rhs());
+    irep_idt sum;
+    irep_idt bound;
+    if(
+      relation.id() != ID_le ||
+      relation.operands().size() != 2 ||
+      !symbol_id(relation.op0(), sum) ||
+      !symbol_id(relation.op1(), bound) ||
+      !shared_signed(sum, ns) ||
+      !shared_signed(bound, ns))
+    {
+      reason = "prefix_bound_monitor_relation";
+      return false;
+    }
+    result.flag = flag;
+    result.sum = sum;
+    result.bound = bound;
+    result.writes.insert(&instruction);
+    ++assignments;
+  }
+  if(depth != 0 || assignments != 1)
+  {
+    reason = "prefix_bound_monitor_shape";
+    return false;
+  }
+  result.worker = worker;
+  return true;
+}
+
+bool prefix_channel_false_flag_property(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const irep_idt &flag,
+  const goto_programt::instructiont *&assumption,
+  const goto_programt::instructiont *&error,
+  std::string &reason)
+{
+  std::size_t errors = 0;
+  std::size_t matches = 0;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(call_id(instruction, callee) && is_reach_error(callee))
+      {
+        ++errors;
+        if(entry.first != ID_main)
+          return false;
+        error = &instruction;
+      }
+    }
+  }
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.last_join == nullptr ||
+      instruction.location_number <=
+        life.last_join->location_number)
+      continue;
+    irep_idt callee;
+    if(
+      !call_id(instruction, callee) || !is_assume(callee) ||
+      instruction.call_arguments().size() != 1)
+      continue;
+    const exprt &condition =
+      strip(instruction.call_arguments().front());
+    if(prefix_channel_false_test(condition, flag))
+    {
+      assumption = &instruction;
+      ++matches;
+    }
+  }
+  if(
+    errors != 1 || matches != 1 || assumption == nullptr ||
+    error == nullptr ||
+    assumption->location_number >= error->location_number)
+  {
+    reason = "prefix_bound_property";
+    return false;
+  }
+  return true;
+}
+
+bool prefix_channel_bounded_sum_proof_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &reason)
+{
+  lifecyclet life;
+  std::vector<irep_idt> workers;
+  if(
+    !stream_refine_lifecycle(model, life, workers, reason) ||
+    workers.size() != 3)
+  {
+    if(reason.empty())
+      reason = "prefix_bound_lifecycle";
+    return false;
+  }
+  prefix_channel_bounded_publishert publisher;
+  prefix_channel_sum_consumert consumer;
+  prefix_channel_bound_monitort monitor;
+  for(const auto &worker : workers)
+  {
+    prefix_channel_bounded_publishert candidate_publisher;
+    std::string publisher_reason;
+    if(
+      prefix_channel_bounded_publisher(
+        model, ns, worker, candidate_publisher, publisher_reason))
+    {
+      if(!publisher.worker.empty())
+      {
+        reason = "prefix_bound_multiple_publishers";
+        return false;
+      }
+      publisher = candidate_publisher;
+      continue;
+    }
+    prefix_channel_sum_consumert candidate_consumer;
+    std::string consumer_reason;
+    if(
+      prefix_channel_sum_consumer(
+        model, ns, worker, candidate_consumer, consumer_reason))
+    {
+      if(!consumer.worker.empty())
+      {
+        reason = "prefix_bound_multiple_consumers";
+        return false;
+      }
+      consumer = candidate_consumer;
+      continue;
+    }
+    prefix_channel_bound_monitort candidate_monitor;
+    std::string monitor_reason;
+    if(
+      prefix_channel_bound_monitor(
+        model, ns, worker, candidate_monitor, monitor_reason))
+    {
+      if(!monitor.worker.empty())
+      {
+        reason = "prefix_bound_multiple_monitors";
+        return false;
+      }
+      monitor = candidate_monitor;
+      continue;
+    }
+    reason =
+      "prefix_bound_worker_publish_" + publisher_reason +
+      "_consume_" + consumer_reason +
+      "_monitor_" + monitor_reason;
+    return false;
+  }
+  if(
+    publisher.worker.empty() || consumer.worker.empty() ||
+    monitor.worker.empty() ||
+    publisher.publish.channel.storage != consumer.channel.storage ||
+    publisher.publish.channel.back != consumer.channel.back ||
+    publisher.publish.channel.bound != consumer.channel.bound ||
+    publisher.bound != monitor.bound ||
+    publisher.flag != monitor.flag ||
+    consumer.sum != monitor.sum)
+  {
+    reason = "prefix_bound_signature";
+    return false;
+  }
+  stream_refine_channelt channel = publisher.publish.channel;
+  channel.front = consumer.channel.front;
+  if(
+    !stream_refine_initial_channel(model, life, channel) ||
+    !stream_refine_nonnegative_count(
+      model, life, publisher.bound) ||
+    !prefix_channel_initial_value(
+      model, life, monitor.flag, true_exprt()))
+  {
+    reason = "prefix_bound_initial_state";
+    return false;
+  }
+
+  const goto_programt::instructiont *property_assumption = nullptr;
+  const goto_programt::instructiont *error = nullptr;
+  if(
+    !prefix_channel_false_flag_property(
+      model,
+      life,
+      monitor.flag,
+      property_assumption,
+      error,
+      reason))
+    return false;
+  const std::set<irep_idt> queues = {channel.storage};
+  std::set<irep_idt> protected_symbols = {
+    channel.storage,
+    channel.front,
+    channel.back,
+    channel.bound,
+    publisher.bound,
+    consumer.sum,
+    monitor.flag};
+  std::set<const goto_programt::instructiont *> allowed =
+    publisher.writes;
+  allowed.insert(
+    consumer.writes.begin(), consumer.writes.end());
+  allowed.insert(
+    monitor.writes.begin(), monitor.writes.end());
+  stream_refine_sourcet unused_source;
+  std::vector<stream_refine_staget> unused_stages;
+  if(
+    !stream_refine_fresh_queues(
+      model, ns, life, queues, reason) ||
+    !zero_initialized_symbols(
+      model, {consumer.sum}, allowed, reason) ||
+    !stream_refine_global(
+      model,
+      ns,
+      life,
+      unused_source,
+      unused_stages,
+      queues,
+      protected_symbols,
+      allowed,
+      property_assumption,
+      error,
+      reason))
+    return false;
+
+  std::cout << "NATIVE_PREFIX_CHANNEL applied=1"
+            << " rule=bounded_sum"
+            << " storage=" << channel.storage
+            << " sum=" << consumer.sum
+            << " bound=" << publisher.bound << '\n';
+  return true;
+}
+
+bool prefix_channel_lifecycle(
+  const goto_modelt &model,
+  lifecyclet &result,
+  std::vector<irep_idt> &order,
+  std::string &reason)
+{
+  const auto main = model.goto_functions.function_map.find(ID_main);
+  if(
+    main == model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+  {
+    reason = "prefix_lifecycle_main";
+    return false;
+  }
+  bool joining = false;
+  for(const auto &instruction : main->second.body.instructions)
+  {
+    irep_idt callee;
+    if(!call_id(instruction, callee))
+      continue;
+    const auto &arguments = instruction.call_arguments();
+    if(is_create(callee))
+    {
+      irep_idt handle;
+      irep_idt worker;
+      if(
+        joining || arguments.size() < 3 ||
+        !addressed_id(arguments[0], handle) ||
+        !addressed_id(arguments[2], worker) ||
+        !result.handles.insert(handle).second ||
+        !result.workers.insert(worker).second)
+      {
+        reason = "prefix_lifecycle_create";
+        return false;
+      }
+      order.push_back(worker);
+      if(result.first_create == nullptr)
+        result.first_create = &instruction;
+    }
+    else if(is_join(callee))
+    {
+      joining = true;
+      irep_idt handle;
+      if(
+        arguments.empty() || !symbol_id(arguments[0], handle) ||
+        !result.joins.insert(handle).second)
+      {
+        reason = "prefix_lifecycle_join";
+        return false;
+      }
+      result.last_join = &instruction;
+    }
+  }
+  if(
+    order.size() < 2 || order.size() > 4 ||
+    result.handles != result.joins ||
+    result.first_create == nullptr || result.last_join == nullptr)
+  {
+    reason = "prefix_lifecycle_shape";
+    return false;
+  }
+  for(const auto &worker : order)
+  {
+    const auto found =
+      model.goto_functions.function_map.find(worker);
+    if(
+      found == model.goto_functions.function_map.end() ||
+      !found->second.body_available())
+    {
+      reason = "prefix_lifecycle_worker";
+      return false;
+    }
+  }
+  return true;
+}
+
+struct prefix_channel_affine_staget
+{
+  irep_idt worker;
+  stream_refine_consumet consume;
+  stream_refine_publisht publish;
+  irep_idt flag;
+  irep_idt auxiliary_fold;
+  std::set<const goto_programt::instructiont *> writes;
+};
+
+struct prefix_channel_scaled_monitort
+{
+  irep_idt worker;
+  irep_idt flag;
+  irep_idt sum;
+  irep_idt bound;
+  mp_integer scale;
+  std::set<const goto_programt::instructiont *> writes;
+
+  prefix_channel_scaled_monitort() : scale(0)
+  {
+  }
+};
+
+bool prefix_channel_fold_region(
+  const std::vector<const goto_programt::instructiont *> &region,
+  const namespacet &ns,
+  irep_idt &fold,
+  irep_idt &delta_symbol,
+  std::set<const goto_programt::instructiont *> &writes)
+{
+  std::size_t assignments = 0;
+  for(const auto *instruction : region)
+  {
+    if(instruction->is_assign())
+    {
+      exprt delta;
+      irep_idt lhs;
+      irep_idt candidate_delta;
+      if(
+        !stream_refine_addition(*instruction, lhs, delta) ||
+        !shared_signed(lhs, ns) ||
+        !symbol_id(delta, candidate_delta))
+        return false;
+      fold = lhs;
+      delta_symbol = candidate_delta;
+      writes.insert(instruction);
+      ++assignments;
+      continue;
+    }
+    if(
+      instruction->is_decl() || instruction->is_dead() ||
+      instruction->is_location() || instruction->is_skip())
+      continue;
+    return false;
+  }
+  return assignments == 1;
+}
+
+bool prefix_channel_consume_region(
+  const std::vector<const goto_programt::instructiont *> &region,
+  const namespacet &ns,
+  stream_refine_consumet &result)
+{
+  std::vector<exprt> terms;
+  std::size_t assumes = 0;
+  std::size_t reads = 0;
+  std::size_t increments = 0;
+  const goto_programt::instructiont *last_assume = nullptr;
+  const goto_programt::instructiont *read = nullptr;
+  const goto_programt::instructiont *increment = nullptr;
+  irep_idt storage;
+  irep_idt front;
+  for(const auto *instruction : region)
+  {
+    std::vector<exprt> current;
+    if(prefix_channel_assumption_terms(*instruction, current))
+    {
+      ++assumes;
+      terms.insert(terms.end(), current.begin(), current.end());
+      last_assume = instruction;
+      continue;
+    }
+    if(instruction->is_assign())
+    {
+      irep_idt lhs;
+      irep_idt candidate_storage;
+      irep_idt candidate_front;
+      if(
+        symbol_id(instruction->assign_lhs(), lhs) &&
+        prefix_channel_array_index(
+          instruction->assign_rhs(),
+          candidate_storage,
+          candidate_front))
+      {
+        if(
+          reads != 0 || !local_signed(lhs, ns) ||
+          lhs == candidate_front || lhs == candidate_storage)
+          return false;
+        result.temporary = lhs;
+        storage = candidate_storage;
+        front = candidate_front;
+        ++reads;
+        read = instruction;
+        result.writes.insert(instruction);
+        continue;
+      }
+      if(
+        symbol_id(instruction->assign_lhs(), lhs) &&
+        unit_increment(*instruction, lhs))
+      {
+        if(!front.empty() && front != lhs)
+          return false;
+        front = lhs;
+        ++increments;
+        increment = instruction;
+        result.writes.insert(instruction);
+        continue;
+      }
+      return false;
+    }
+    if(
+      instruction->is_decl() || instruction->is_dead() ||
+      instruction->is_location() || instruction->is_skip())
+      continue;
+    return false;
+  }
+  irep_idt available_front;
+  irep_idt back;
+  std::size_t availability = 0;
+  for(const auto &term : terms)
+  {
+    irep_idt candidate_front;
+    irep_idt candidate_back;
+    if(
+      prefix_channel_availability(
+        term, candidate_front, candidate_back) &&
+      candidate_front == front && back.empty())
+    {
+      available_front = candidate_front;
+      back = candidate_back;
+      ++availability;
+    }
+  }
+  irep_idt bound;
+  if(
+    assumes != 1 || reads != 1 || increments != 1 ||
+    availability != 1 || available_front != front ||
+    last_assume == nullptr || read == nullptr || increment == nullptr ||
+    last_assume->location_number >= read->location_number ||
+    read->location_number >= increment->location_number ||
+    !prefix_channel_bounds_excluding(terms, front, back, bound) ||
+    !shared_signed(front, ns) || !shared_signed(back, ns) ||
+    !shared_signed(bound, ns))
+    return false;
+  result.channel.storage = storage;
+  result.channel.front = front;
+  result.channel.back = back;
+  result.channel.bound = bound;
+  result.first_location =
+    region.empty() ? 0 : region.front()->location_number;
+  result.last_location =
+    region.empty() ? 0 : region.back()->location_number;
+  return true;
+}
+
+bool prefix_channel_plus_one(
+  const exprt &src,
+  const irep_idt &input)
+{
+  const exprt &expr = strip(src);
+  if(expr.id() != ID_plus || expr.operands().size() != 2)
+    return false;
+  irep_idt candidate;
+  return
+    (symbol_id(expr.op0(), candidate) && candidate == input &&
+     value_is(expr.op1(), 1)) ||
+    (symbol_id(expr.op1(), candidate) && candidate == input &&
+     value_is(expr.op0(), 1));
+}
+
+bool prefix_channel_affine_stage(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  prefix_channel_affine_staget &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  natural_loopst loops;
+  loops(program);
+  if(loops.loop_map.size() != 1)
+  {
+    reason = "prefix_affine_stage_loop_count";
+    return false;
+  }
+  const auto &loop = loops.loop_map.begin()->second;
+  bool in_atomic = false;
+  bool region_in_loop = false;
+  std::vector<const goto_programt::instructiont *> region;
+  std::vector<stream_refine_consumet> consumes;
+  std::vector<stream_refine_publisht> publishes;
+  std::set<irep_idt> flags;
+  std::size_t snapshots = 0;
+  std::size_t folds = 0;
+  irep_idt fold_delta;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_atomic_begin())
+    {
+      if(in_atomic)
+      {
+        reason = "prefix_affine_stage_atomic_nesting";
+        return false;
+      }
+      in_atomic = true;
+      region_in_loop = loop.contains(instruction);
+      region.clear();
+      continue;
+    }
+    if(instruction->is_atomic_end())
+    {
+      if(!in_atomic || loop.contains(instruction) != region_in_loop)
+      {
+        reason = "prefix_affine_stage_atomic_balance";
+        return false;
+      }
+      stream_refine_consumet consume;
+      stream_refine_publisht publish;
+      irep_idt flag;
+      irep_idt fold;
+      irep_idt delta;
+      std::set<const goto_programt::instructiont *> fold_writes;
+      if(prefix_channel_consume_region(region, ns, consume))
+        consumes.push_back(consume);
+      else if(
+        stream_refine_publish_region(
+          region, ns, region_in_loop, publish))
+        publishes.push_back(publish);
+      else if(prefix_channel_snapshot_read_region(region, ns, flag))
+      {
+        flags.insert(flag);
+        ++snapshots;
+      }
+      else if(
+        prefix_channel_fold_region(
+          region, ns, fold, delta, fold_writes))
+      {
+        result.auxiliary_fold = fold;
+        fold_delta = delta;
+        result.writes.insert(
+          fold_writes.begin(), fold_writes.end());
+        ++folds;
+      }
+      else
+      {
+        reason =
+          "prefix_affine_stage_atomic_region_" +
+          std::to_string(
+            region.empty() ? 0 :
+              region.front()->location_number) + "_size_" +
+          std::to_string(region.size());
+        return false;
+      }
+      in_atomic = false;
+      region.clear();
+      continue;
+    }
+    if(in_atomic)
+      region.push_back(&*instruction);
+    else if(instruction->is_function_call())
+    {
+      irep_idt callee;
+      if(!call_id(*instruction, callee) || !is_assume(callee))
+      {
+        reason = "prefix_affine_stage_call";
+        return false;
+      }
+    }
+  }
+  if(
+    in_atomic || consumes.size() != 1 || publishes.size() != 1 ||
+    flags.size() != 1 || snapshots != 2 || folds != 1 ||
+    consumes.front().channel.storage ==
+      publishes.front().channel.storage ||
+    consumes.front().first_location >=
+      publishes.front().first_location ||
+    fold_delta != consumes.front().temporary ||
+    !prefix_channel_plus_one(
+      publishes.front().token,
+      consumes.front().temporary))
+  {
+    reason = "prefix_affine_stage_signature";
+    return false;
+  }
+  result.worker = worker;
+  result.consume = consumes.front();
+  result.publish = publishes.front();
+  result.flag = *flags.begin();
+  result.writes.insert(
+    result.consume.writes.begin(), result.consume.writes.end());
+  result.writes.insert(
+    result.publish.writes.begin(), result.publish.writes.end());
+  return true;
+}
+
+bool prefix_channel_scaled_monitor(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  prefix_channel_scaled_monitort &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  natural_loopst loops;
+  loops(program);
+  if(!loops.loop_map.empty())
+  {
+    reason = "prefix_scaled_monitor_loop";
+    return false;
+  }
+  unsigned depth = 0;
+  std::size_t assignments = 0;
+  for(const auto &instruction : program.instructions)
+  {
+    if(instruction.is_atomic_begin())
+    {
+      if(depth != 0)
+        return false;
+      depth = 1;
+      continue;
+    }
+    if(instruction.is_atomic_end())
+    {
+      if(depth != 1)
+        return false;
+      depth = 0;
+      continue;
+    }
+    if(instruction.is_function_call())
+    {
+      reason = "prefix_scaled_monitor_call";
+      return false;
+    }
+    if(!instruction.is_assign())
+      continue;
+    irep_idt flag;
+    if(
+      depth != 1 ||
+      !symbol_id(instruction.assign_lhs(), flag) ||
+      !shared_boolean(flag, ns))
+      return false;
+    const exprt &relation = strip(instruction.assign_rhs());
+    irep_idt sum;
+    if(
+      relation.id() != ID_le ||
+      relation.operands().size() != 2 ||
+      !symbol_id(relation.op0(), sum) ||
+      !shared_signed(sum, ns))
+      return false;
+    const exprt &product = strip(relation.op1());
+    irep_idt bound;
+    mp_integer scale;
+    if(
+      product.id() != ID_mult ||
+      product.operands().size() != 2)
+      return false;
+    if(
+      integer_constant(product.op0(), scale) &&
+      symbol_id(product.op1(), bound))
+    {
+    }
+    else if(
+      integer_constant(product.op1(), scale) &&
+      symbol_id(product.op0(), bound))
+    {
+    }
+    else
+      return false;
+    if(scale <= 0 || !shared_signed(bound, ns))
+      return false;
+    result.flag = flag;
+    result.sum = sum;
+    result.bound = bound;
+    result.scale = scale;
+    result.writes.insert(&instruction);
+    ++assignments;
+  }
+  if(depth != 0 || assignments != 1)
+  {
+    reason = "prefix_scaled_monitor_shape";
+    return false;
+  }
+  result.worker = worker;
+  return true;
+}
+
+bool prefix_channel_scaled_bound_defined(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const irep_idt &bound,
+  const mp_integer &scale)
+{
+  if(scale != 2)
+    return false;
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr &&
+      instruction.location_number >=
+        life.first_create->location_number)
+      break;
+    irep_idt callee;
+    if(
+      !call_id(instruction, callee) || !is_assume(callee) ||
+      instruction.call_arguments().size() != 1)
+      continue;
+    std::vector<exprt> terms;
+    flatten_and(instruction.call_arguments().front(), terms);
+    for(const auto &term : terms)
+    {
+      const exprt &relation = strip(term);
+      irep_idt lhs;
+      mp_integer upper;
+      const exprt &rhs =
+        relation.operands().size() == 2 ?
+          strip(relation.op1()) : nil_exprt();
+      bool has_upper = integer_constant(rhs, upper);
+      if(!has_upper && rhs.id() == ID_div &&
+         rhs.operands().size() == 2)
+      {
+        mp_integer numerator;
+        mp_integer denominator;
+        if(
+          !integer_constant(rhs.op0(), numerator) ||
+          !integer_constant(rhs.op1(), denominator) ||
+          numerator < 0 || denominator <= 0)
+          continue;
+        upper = numerator / denominator;
+        has_upper = true;
+      }
+      if(
+        has_upper &&
+        relation.id() == ID_lt &&
+        relation.operands().size() == 2 &&
+        symbol_id(relation.op0(), lhs) && lhs == bound &&
+        upper > 0 && upper <= 1073741823)
+        return true;
+    }
+  }
+  return false;
+}
+
+bool prefix_channel_affine_pipeline_proof_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &reason)
+{
+  lifecyclet life;
+  std::vector<irep_idt> workers;
+  if(
+    !prefix_channel_lifecycle(model, life, workers, reason) ||
+    workers.size() != 4)
+  {
+    if(reason.empty())
+      reason = "prefix_affine_lifecycle";
+    return false;
+  }
+  prefix_channel_bounded_publishert publisher;
+  prefix_channel_affine_staget stage;
+  prefix_channel_sum_consumert consumer;
+  prefix_channel_scaled_monitort monitor;
+  for(const auto &worker : workers)
+  {
+    prefix_channel_bounded_publishert candidate_publisher;
+    std::string publisher_reason;
+    if(
+      prefix_channel_bounded_publisher(
+        model, ns, worker, candidate_publisher, publisher_reason))
+    {
+      publisher = candidate_publisher;
+      continue;
+    }
+    prefix_channel_affine_staget candidate_stage;
+    std::string stage_reason;
+    if(
+      prefix_channel_affine_stage(
+        model, ns, worker, candidate_stage, stage_reason))
+    {
+      stage = candidate_stage;
+      continue;
+    }
+    prefix_channel_sum_consumert candidate_consumer;
+    std::string consumer_reason;
+    if(
+      prefix_channel_sum_consumer(
+        model, ns, worker, candidate_consumer, consumer_reason))
+    {
+      consumer = candidate_consumer;
+      continue;
+    }
+    prefix_channel_scaled_monitort candidate_monitor;
+    std::string monitor_reason;
+    if(
+      prefix_channel_scaled_monitor(
+        model, ns, worker, candidate_monitor, monitor_reason))
+    {
+      monitor = candidate_monitor;
+      continue;
+    }
+    reason =
+      "prefix_affine_worker_p_" + publisher_reason +
+      "_s_" + stage_reason + "_c_" + consumer_reason +
+      "_m_" + monitor_reason;
+    return false;
+  }
+  if(
+    publisher.worker.empty() || stage.worker.empty() ||
+    consumer.worker.empty() || monitor.worker.empty() ||
+    publisher.publish.channel.storage !=
+      stage.consume.channel.storage ||
+    publisher.publish.channel.back != stage.consume.channel.back ||
+    publisher.publish.channel.bound != stage.consume.channel.bound ||
+    stage.publish.channel.storage != consumer.channel.storage ||
+    stage.publish.channel.back != consumer.channel.back ||
+    stage.publish.channel.bound != consumer.channel.bound ||
+    publisher.flag != stage.flag ||
+    publisher.flag != monitor.flag ||
+    publisher.bound != monitor.bound ||
+    consumer.sum != monitor.sum ||
+    monitor.scale != 2)
+  {
+    reason = "prefix_affine_signature";
+    return false;
+  }
+  stream_refine_channelt first = publisher.publish.channel;
+  first.front = stage.consume.channel.front;
+  stream_refine_channelt second = stage.publish.channel;
+  second.front = consumer.channel.front;
+  if(!stream_refine_initial_channel(model, life, first))
+  {
+    reason = "prefix_affine_initial_first_channel";
+    return false;
+  }
+  if(!stream_refine_initial_channel(model, life, second))
+  {
+    reason = "prefix_affine_initial_second_channel";
+    return false;
+  }
+  if(
+    !stream_refine_nonnegative_count(
+      model, life, publisher.bound))
+  {
+    reason = "prefix_affine_initial_nonnegative_bound";
+    return false;
+  }
+  if(
+    !prefix_channel_scaled_bound_defined(
+      model, life, publisher.bound, monitor.scale))
+  {
+    reason = "prefix_affine_initial_scaled_bound";
+    return false;
+  }
+  if(
+    !prefix_channel_initial_value(
+      model, life, monitor.flag, true_exprt()))
+  {
+    reason = "prefix_affine_initial_flag";
+    return false;
+  }
+  const goto_programt::instructiont *property_assumption = nullptr;
+  const goto_programt::instructiont *error = nullptr;
+  if(
+    !prefix_channel_false_flag_property(
+      model,
+      life,
+      monitor.flag,
+      property_assumption,
+      error,
+      reason))
+    return false;
+
+  const std::set<irep_idt> queues = {
+    first.storage, second.storage};
+  std::set<irep_idt> protected_symbols = {
+    first.storage,
+    first.front,
+    first.back,
+    first.bound,
+    second.storage,
+    second.front,
+    second.back,
+    second.bound,
+    publisher.bound,
+    consumer.sum,
+    monitor.flag};
+  std::set<const goto_programt::instructiont *> allowed =
+    publisher.writes;
+  allowed.insert(stage.writes.begin(), stage.writes.end());
+  allowed.insert(
+    consumer.writes.begin(), consumer.writes.end());
+  allowed.insert(monitor.writes.begin(), monitor.writes.end());
+  stream_refine_sourcet unused_source;
+  std::vector<stream_refine_staget> unused_stages;
+  if(
+    !stream_refine_fresh_queues(
+      model, ns, life, queues, reason) ||
+    !zero_initialized_symbols(
+      model, {consumer.sum}, allowed, reason) ||
+    !stream_refine_global(
+      model,
+      ns,
+      life,
+      unused_source,
+      unused_stages,
+      queues,
+      protected_symbols,
+      allowed,
+      property_assumption,
+      error,
+      reason))
+    return false;
+
+  std::cout << "NATIVE_PREFIX_CHANNEL applied=1"
+            << " rule=affine_pipeline"
+            << " input=" << first.storage
+            << " output=" << second.storage
+            << " sum=" << consumer.sum << '\n';
+  return true;
+}
+
 bool stream_sentinel_refinement_proof_impl(
   const goto_modelt &model,
   const namespacet &ns,
@@ -10643,6 +13792,33 @@ bool extremum_cone_proof(
   (void)message_handler;
   const namespacet ns(goto_model.symbol_table);
   std::string reason;
+  if(prefix_channel_last_value_proof_impl(goto_model, ns, reason))
+    return true;
+  std::cout << "NATIVE_PREFIX_CHANNEL applied=0 reason="
+            << reason << '\n';
+  reason.clear();
+  if(prefix_channel_alternating_sum_proof_impl(goto_model, ns, reason))
+    return true;
+  std::cout << "NATIVE_PREFIX_CHANNEL applied=0 reason="
+            << reason << '\n';
+  reason.clear();
+  if(prefix_channel_alternating_snapshot_proof_impl(
+       goto_model, ns, reason))
+    return true;
+  std::cout << "NATIVE_PREFIX_CHANNEL applied=0 reason="
+            << reason << '\n';
+  reason.clear();
+  if(prefix_channel_bounded_sum_proof_impl(goto_model, ns, reason))
+    return true;
+  std::cout << "NATIVE_PREFIX_CHANNEL applied=0 reason="
+            << reason << '\n';
+  reason.clear();
+  if(prefix_channel_affine_pipeline_proof_impl(
+       goto_model, ns, reason))
+    return true;
+  std::cout << "NATIVE_PREFIX_CHANNEL applied=0 reason="
+            << reason << '\n';
+  reason.clear();
   if(stream_sentinel_refinement_proof_impl(goto_model, ns, reason))
     return true;
   std::cout << "NATIVE_STREAM_REFINEMENT applied=0 reason="
