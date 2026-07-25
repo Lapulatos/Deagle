@@ -34,6 +34,7 @@ SRC = ai.cpp \
       local_may_alias.cpp \
       local_safe_pointers.cpp \
       locals.cpp \
+      lock_relational_ai_analysis.cpp \
       predicate_stability_analysis.cpp \
       reaching_definitions.cpp \
       relational_order_analysis.cpp \

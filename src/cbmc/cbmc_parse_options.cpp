@@ -45,6 +45,7 @@ Author: Daniel Kroening, kroening@kroening.com
 #include <analyses/commuting_sequentialization.h>
 #include <analyses/extremum_cone_analysis.h>
 #include <analyses/lock_ego_abstraction.h>
+#include <analyses/lock_relational_ai_analysis.h>
 #include <analyses/thread_local_cutoff_analysis.h>
 #include <goto-checker/all_properties_verifier.h>
 #include <goto-checker/all_properties_verifier_with_fault_localization.h>
@@ -570,6 +571,7 @@ int cbmc_parse_optionst::doit()
       return CPROVER_EXIT_SUCCESS;
     }
     if(
+      !lock_relational_ai_transform(goto_model, ui_message_handler) &&
       !homogeneous_thread_local_cutoff_transform(
         goto_model, ui_message_handler) &&
       !predicate_stable_linearization_transform(
