@@ -15067,6 +15067,2095 @@ bool role_split_affine_stream_audit_impl(
   sink_roles = source_has_sink_role ? 1 : 0;
   return true;
 }
+
+struct publication_frontier_arrayt
+{
+  irep_idt producer;
+  irep_idt consumer;
+  irep_idt output;
+  irep_idt producer_cursor;
+  irep_idt consumer_cursor;
+  irep_idt frontier;
+  exprt bound;
+  int terminal_offset;
+  mp_integer map_constant;
+  std::set<irep_idt> input_bases;
+  std::set<irep_idt> consumer_summaries;
+  std::map<irep_idt, irep_idt> input_summaries;
+  std::set<const goto_programt::instructiont *> allowed_summary_writes;
+  const goto_programt::instructiont *consumer_fold;
+  const goto_programt::instructiont *consumer_increment;
+  const goto_programt::instructiont *producer_output_write;
+  const goto_programt::instructiont *producer_frontier_write;
+  const goto_programt::instructiont *consumer_guard_source;
+  std::set<const goto_programt::instructiont *> allowed_output_writes;
+  std::set<const goto_programt::instructiont *> allowed_frontier_writes;
+
+  publication_frontier_arrayt()
+    : terminal_offset(0),
+      map_constant(0),
+      consumer_fold(nullptr),
+      consumer_increment(nullptr),
+      producer_output_write(nullptr),
+      producer_frontier_write(nullptr),
+      consumer_guard_source(nullptr)
+  {
+  }
+};
+
+bool publication_frontier_relation(
+  const exprt &src,
+  const irep_idt &cursor,
+  const irep_idt &frontier)
+{
+  const exprt &expr = strip(src);
+  irep_idt left;
+  irep_idt right;
+  if(
+    expr.id() == ID_lt && expr.operands().size() == 2 &&
+    symbol_id(expr.op0(), left) && left == cursor &&
+    symbol_id(expr.op1(), right) && right == frontier)
+    return true;
+  return std::any_of(
+    expr.operands().begin(),
+    expr.operands().end(),
+    [&](const exprt &operand) {
+      return publication_frontier_relation(
+        operand, cursor, frontier);
+    });
+}
+
+bool publication_frontier_array_read(
+  const exprt &src,
+  const irep_idt &base,
+  const irep_idt &index)
+{
+  irep_idt candidate_base;
+  irep_idt candidate_index;
+  if(
+    array_symbol_index(src, candidate_base, candidate_index) &&
+    candidate_base == base && candidate_index == index)
+    return true;
+  return std::any_of(
+    src.operands().begin(),
+    src.operands().end(),
+    [&](const exprt &operand) {
+      return publication_frontier_array_read(
+        operand, base, index);
+    });
+}
+
+bool publication_frontier_loop(
+  const goto_programt &program,
+  irep_idt &cursor,
+  exprt &bound,
+  std::string &reason,
+  const exprt *expected_bound = nullptr)
+{
+  std::size_t exits = 0;
+  for(const auto &instruction : program.instructions)
+  {
+    irep_idt candidate_cursor;
+    exprt candidate_bound;
+    if(
+      parse_loop_exit(
+        instruction, candidate_cursor, candidate_bound) &&
+      (expected_bound == nullptr ||
+       strip(candidate_bound) == strip(*expected_bound)))
+    {
+      ++exits;
+      cursor = candidate_cursor;
+      bound = candidate_bound;
+    }
+  }
+  if(exits != 1)
+  {
+    reason = "publication_frontier_loop_exit";
+    return false;
+  }
+  std::size_t initializations = 0;
+  std::size_t increments = 0;
+  for(const auto &instruction : program.instructions)
+  {
+    irep_idt lhs;
+    if(
+      instruction.is_assign() &&
+      symbol_id(instruction.assign_lhs(), lhs) &&
+      lhs == cursor && value_is(instruction.assign_rhs(), 0))
+      ++initializations;
+    if(unit_increment(instruction, cursor))
+      ++increments;
+  }
+  if(initializations != 1 || increments != 1)
+  {
+    reason = "publication_frontier_cursor_progress";
+    return false;
+  }
+  return true;
+}
+
+bool publication_frontier_assignment(
+  const exprt &src,
+  const irep_idt &cursor,
+  int &offset)
+{
+  const exprt &expr = strip(src);
+  irep_idt identifier;
+  if(symbol_id(expr, identifier) && identifier == cursor)
+  {
+    offset = 0;
+    return true;
+  }
+  if(expr.id() != ID_plus || expr.operands().size() != 2)
+    return false;
+  if(
+    symbol_id(expr.op0(), identifier) && identifier == cursor &&
+    value_is(expr.op1(), 1))
+  {
+    offset = 1;
+    return true;
+  }
+  if(
+    symbol_id(expr.op1(), identifier) && identifier == cursor &&
+    value_is(expr.op0(), 1))
+  {
+    offset = 1;
+    return true;
+  }
+  return false;
+}
+
+bool publication_frontier_additive_map(
+  const exprt &src,
+  const irep_idt &cursor,
+  std::set<irep_idt> &input_bases,
+  mp_integer &constant)
+{
+  const exprt &expr = strip(src);
+  mp_integer value;
+  if(integer_constant(expr, value))
+  {
+    constant += value;
+    return true;
+  }
+  irep_idt base;
+  irep_idt index;
+  if(array_symbol_index(expr, base, index))
+  {
+    if(index != cursor)
+      return false;
+    input_bases.insert(base);
+    return true;
+  }
+  if(expr.id() != ID_plus || expr.operands().empty())
+    return false;
+  return std::all_of(
+    expr.operands().begin(),
+    expr.operands().end(),
+    [&](const exprt &operand) {
+      return publication_frontier_additive_map(
+        operand, cursor, input_bases, constant);
+    });
+}
+
+bool publication_frontier_find_array_producer(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  publication_frontier_arrayt &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  exprt bound;
+  irep_idt cursor;
+  if(!publication_frontier_loop(program, cursor, bound, reason))
+    return false;
+
+  const goto_programt::instructiont *output_write = nullptr;
+  const goto_programt::instructiont *frontier_write = nullptr;
+  irep_idt output;
+  irep_idt frontier;
+  int offset = 0;
+  for(const auto &instruction : program.instructions)
+  {
+    if(!instruction.is_assign())
+      continue;
+    irep_idt base;
+    irep_idt index;
+    if(array_symbol_index(instruction.assign_lhs(), base, index))
+    {
+      if(index != cursor || output_write != nullptr)
+      {
+        reason = "publication_frontier_output_write";
+        return false;
+      }
+      if(
+        !publication_frontier_additive_map(
+          instruction.assign_rhs(),
+          cursor,
+          result.input_bases,
+          result.map_constant))
+      {
+        reason = "publication_frontier_unsupported_map";
+        return false;
+      }
+      output = base;
+      output_write = &instruction;
+      continue;
+    }
+    irep_idt lhs;
+    int candidate_offset = 0;
+    if(
+      shared_symbol_lhs(instruction, ns, lhs) &&
+      publication_frontier_assignment(
+        instruction.assign_rhs(), cursor, candidate_offset))
+    {
+      if(frontier_write != nullptr)
+      {
+        reason = "publication_frontier_multiple_frontiers";
+        return false;
+      }
+      frontier = lhs;
+      offset = candidate_offset;
+      frontier_write = &instruction;
+    }
+  }
+  if(
+    output_write == nullptr || frontier_write == nullptr ||
+    output.empty() || frontier.empty() || output == frontier ||
+    result.input_bases.empty() ||
+    result.input_bases.count(output) != 0 ||
+    output_write->location_number >= frontier_write->location_number)
+  {
+    reason = "publication_frontier_producer_shape";
+    return false;
+  }
+
+  result.producer = worker;
+  result.output = output;
+  result.producer_cursor = cursor;
+  result.frontier = frontier;
+  result.bound = bound;
+  result.terminal_offset = offset;
+  result.allowed_output_writes.insert(output_write);
+  result.allowed_frontier_writes.insert(frontier_write);
+  result.producer_output_write = output_write;
+  result.producer_frontier_write = frontier_write;
+  return true;
+}
+
+bool publication_frontier_find_array_consumer(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  publication_frontier_arrayt &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  irep_idt cursor;
+  exprt bound;
+  if(
+    !publication_frontier_loop(
+      program, cursor, bound, reason, &result.bound))
+    return false;
+
+  std::size_t reads = 0;
+  bool availability = false;
+  for(const auto &instruction : program.instructions)
+  {
+    if(
+      instruction.has_condition() &&
+      publication_frontier_relation(
+        instruction.condition(), cursor, result.frontier))
+      availability = true;
+    if(instruction.is_assign())
+    {
+      if(
+        publication_frontier_relation(
+          instruction.assign_rhs(), cursor, result.frontier))
+        availability = true;
+      if(
+        publication_frontier_array_read(
+          instruction.assign_rhs(), result.output, cursor))
+      {
+        irep_idt lhs;
+        const exprt &rhs = strip(instruction.assign_rhs());
+        bool fold = false;
+        if(
+          shared_symbol_lhs(instruction, ns, lhs) &&
+          rhs.id() == ID_plus && rhs.operands().size() == 2)
+        {
+          irep_idt accumulator;
+          fold =
+            (symbol_id(rhs.op0(), accumulator) &&
+             accumulator == lhs &&
+             publication_frontier_array_read(
+               rhs.op1(), result.output, cursor)) ||
+            (symbol_id(rhs.op1(), accumulator) &&
+             accumulator == lhs &&
+             publication_frontier_array_read(
+               rhs.op0(), result.output, cursor));
+        }
+        if(fold)
+        {
+          ++reads;
+          result.consumer_summaries.insert(lhs);
+          result.allowed_summary_writes.insert(&instruction);
+          result.consumer_fold = &instruction;
+        }
+      }
+      if(unit_increment(instruction, cursor))
+        result.consumer_increment = &instruction;
+    }
+  }
+  if(reads != 1 || !availability || result.consumer_summaries.empty())
+  {
+    reason = "publication_frontier_consumer_shape";
+    return false;
+  }
+  result.consumer = worker;
+  result.consumer_cursor = cursor;
+  return true;
+}
+
+void publication_frontier_collect_symbols(
+  const exprt &src,
+  std::set<irep_idt> &symbols)
+{
+  irep_idt identifier;
+  if(symbol_id(src, identifier))
+    symbols.insert(identifier);
+  for(const auto &operand : src.operands())
+    publication_frontier_collect_symbols(operand, symbols);
+}
+
+bool publication_frontier_array_guarded_consume(
+  const goto_modelt &model,
+  const namespacet &ns,
+  publication_frontier_arrayt &candidate,
+  std::string &reason)
+{
+  if(
+    candidate.consumer_fold == nullptr ||
+    candidate.consumer_increment == nullptr ||
+    candidate.consumer_fold->location_number >=
+      candidate.consumer_increment->location_number)
+  {
+    reason = "publication_frontier_consumer_effect_order";
+    return false;
+  }
+  const auto &program =
+    model.goto_functions.function_map.at(candidate.consumer).body;
+  std::size_t guards = 0;
+  for(const auto &instruction : program.instructions)
+  {
+    if(
+      !instruction.is_goto() ||
+      instruction.targets.size() != 1 ||
+      instruction.location_number >=
+        candidate.consumer_fold->location_number ||
+      instruction.get_target()->location_number <=
+        candidate.consumer_increment->location_number)
+      continue;
+    if(
+      publication_frontier_relation(
+        instruction.condition(),
+        candidate.consumer_cursor,
+        candidate.frontier))
+    {
+      ++guards;
+      candidate.consumer_guard_source = &instruction;
+      continue;
+    }
+    std::set<irep_idt> condition_symbols;
+    publication_frontier_collect_symbols(
+      instruction.condition(), condition_symbols);
+    for(const auto &condition_symbol : condition_symbols)
+    {
+      const symbolt *symbol = lookup(condition_symbol, ns);
+      if(
+        symbol == nullptr || symbol->is_static_lifetime ||
+        (symbol->type.id() != ID_c_bool &&
+         symbol->type.id() != ID_bool))
+        continue;
+      std::size_t writes = 0;
+      bool frontier_snapshot = false;
+      for(const auto &candidate_write : program.instructions)
+      {
+        if(!candidate_write.is_assign())
+          continue;
+        irep_idt lhs;
+        if(
+          symbol_id(candidate_write.assign_lhs(), lhs) &&
+          lhs == condition_symbol)
+        {
+          ++writes;
+          if(
+            candidate_write.location_number <
+              instruction.location_number &&
+            publication_frontier_relation(
+              candidate_write.assign_rhs(),
+              candidate.consumer_cursor,
+              candidate.frontier))
+            frontier_snapshot = true;
+        }
+      }
+      if(writes == 1 && frontier_snapshot)
+      {
+        ++guards;
+        candidate.consumer_guard_source = nullptr;
+        for(const auto &candidate_write : program.instructions)
+        {
+          if(!candidate_write.is_assign())
+            continue;
+          irep_idt lhs;
+          if(
+            symbol_id(candidate_write.assign_lhs(), lhs) &&
+            lhs == condition_symbol &&
+            publication_frontier_relation(
+              candidate_write.assign_rhs(),
+              candidate.consumer_cursor,
+              candidate.frontier))
+          {
+            candidate.consumer_guard_source = &candidate_write;
+            break;
+          }
+        }
+      }
+    }
+  }
+  if(guards != 1)
+  {
+    reason = "publication_frontier_consumer_guard";
+    return false;
+  }
+  return true;
+}
+
+unsigned publication_frontier_atomic_epoch(
+  const goto_programt &program,
+  const goto_programt::instructiont *target)
+{
+  unsigned epoch = 0;
+  unsigned active = 0;
+  int depth = 0;
+  for(const auto &instruction : program.instructions)
+  {
+    if(instruction.is_atomic_begin())
+    {
+      ++depth;
+      ++epoch;
+      active = epoch;
+    }
+    if(&instruction == target)
+      return depth == 1 ? active : 0;
+    if(instruction.is_atomic_end())
+    {
+      --depth;
+      if(depth == 0)
+        active = 0;
+    }
+  }
+  return 0;
+}
+
+bool publication_frontier_array_memory_order(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  publication_frontier_arrayt &candidate,
+  std::string &reason)
+{
+  if(
+    candidate.producer_output_write == nullptr ||
+    candidate.producer_frontier_write == nullptr ||
+    candidate.consumer_guard_source == nullptr ||
+    candidate.consumer_fold == nullptr)
+  {
+    reason = "publication_frontier_memory_events";
+    return false;
+  }
+  std::set<const goto_programt::instructiont *> initial_writes;
+  if(
+    !zero_initialized_symbols(
+      model, {candidate.frontier}, initial_writes, reason))
+    return false;
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr &&
+      instruction.location_number >=
+        life.first_create->location_number)
+      break;
+    if(!instruction.is_assign())
+      continue;
+    irep_idt lhs;
+    if(
+      symbol_id(instruction.assign_lhs(), lhs) &&
+      lhs == candidate.frontier)
+    {
+      reason = "publication_frontier_main_frontier_write";
+      return false;
+    }
+  }
+
+  const auto &producer =
+    model.goto_functions.function_map.at(candidate.producer).body;
+  const unsigned output_epoch =
+    publication_frontier_atomic_epoch(
+      producer, candidate.producer_output_write);
+  const unsigned frontier_epoch =
+    publication_frontier_atomic_epoch(
+      producer, candidate.producer_frontier_write);
+  const bool atomic_producer_objects =
+    atomic_type(
+      candidate.producer_output_write->assign_lhs().type()) &&
+    atomic_type(
+      candidate.producer_frontier_write->assign_lhs().type());
+  if(
+    !atomic_producer_objects &&
+    (output_epoch == 0 || output_epoch != frontier_epoch))
+  {
+    reason = "publication_frontier_producer_memory_order";
+    return false;
+  }
+
+  const auto &consumer =
+    model.goto_functions.function_map.at(candidate.consumer).body;
+  const unsigned guard_epoch =
+    publication_frontier_atomic_epoch(
+      consumer, candidate.consumer_guard_source);
+  const unsigned fold_epoch =
+    publication_frontier_atomic_epoch(
+      consumer, candidate.consumer_fold);
+  const symbolt *frontier_symbol =
+    lookup(candidate.frontier, namespacet(model.symbol_table));
+  const bool atomic_frontier =
+    frontier_symbol != nullptr &&
+    atomic_type(frontier_symbol->type);
+  const bool atomic_fold_objects =
+    atomic_type(candidate.consumer_fold->assign_lhs().type()) &&
+    atomic_type(candidate.producer_output_write->assign_lhs().type());
+  if(
+    (!atomic_frontier && guard_epoch == 0) ||
+    (!atomic_fold_objects && fold_epoch == 0))
+  {
+    reason = "publication_frontier_consumer_memory_order";
+    return false;
+  }
+  return true;
+}
+
+bool publication_frontier_additive_symbols(
+  const exprt &src,
+  std::multiset<irep_idt> &symbols)
+{
+  const exprt &expr = strip(src);
+  irep_idt identifier;
+  if(symbol_id(expr, identifier))
+  {
+    symbols.insert(identifier);
+    return true;
+  }
+  if(expr.id() != ID_plus || expr.operands().empty())
+    return false;
+  return std::all_of(
+    expr.operands().begin(),
+    expr.operands().end(),
+    [&](const exprt &operand) {
+      return publication_frontier_additive_symbols(
+        operand, symbols);
+    });
+}
+
+bool publication_frontier_array_property_equation(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const irep_idt &consumer_summary,
+  exprt &expected,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::size_t matches = 0;
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.last_join == nullptr ||
+      instruction.location_number <=
+        life.last_join->location_number)
+      continue;
+    irep_idt callee;
+    if(
+      !call_id(instruction, callee) || !is_assume(callee) ||
+      instruction.call_arguments().size() != 1)
+      continue;
+    const exprt &condition =
+      strip(instruction.call_arguments().front());
+    if(
+      condition.id() != ID_notequal ||
+      condition.operands().size() != 2)
+      continue;
+    irep_idt left;
+    irep_idt right;
+    if(
+      symbol_id(condition.op0(), left) &&
+      left == consumer_summary &&
+      !contains_symbol(condition.op1(), consumer_summary))
+    {
+      ++matches;
+      expected = strip(condition.op1());
+    }
+    else if(
+      symbol_id(condition.op1(), right) &&
+      right == consumer_summary &&
+      !contains_symbol(condition.op0(), consumer_summary))
+    {
+      ++matches;
+      expected = strip(condition.op0());
+    }
+  }
+  if(matches != 1)
+  {
+    reason = "publication_frontier_array_equation";
+    return false;
+  }
+  return true;
+}
+
+bool publication_frontier_input_fold(
+  const goto_programt::instructiont &instruction,
+  const irep_idt &input,
+  const irep_idt &cursor,
+  irep_idt &summary)
+{
+  if(
+    !instruction.is_assign() ||
+    !symbol_id(instruction.assign_lhs(), summary))
+    return false;
+  const exprt &rhs = strip(instruction.assign_rhs());
+  if(rhs.id() != ID_plus || rhs.operands().size() != 2)
+    return false;
+  irep_idt accumulator;
+  return
+    (symbol_id(rhs.op0(), accumulator) &&
+     accumulator == summary &&
+     publication_frontier_array_read(
+       rhs.op1(), input, cursor)) ||
+    (symbol_id(rhs.op1(), accumulator) &&
+     accumulator == summary &&
+     publication_frontier_array_read(
+       rhs.op0(), input, cursor));
+}
+
+bool publication_frontier_find_input_folds(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const std::vector<irep_idt> &workers,
+  publication_frontier_arrayt &candidate,
+  std::string &reason)
+{
+  std::size_t fold_workers = 0;
+  for(const auto &worker : workers)
+  {
+    if(
+      worker == candidate.producer ||
+      worker == candidate.consumer)
+      continue;
+    const auto &program =
+      model.goto_functions.function_map.at(worker).body;
+    irep_idt cursor;
+    exprt bound;
+    std::string loop_reason;
+    if(
+      !publication_frontier_loop(
+        program,
+        cursor,
+        bound,
+        loop_reason,
+        &candidate.bound))
+      continue;
+
+    std::map<irep_idt, irep_idt> folds;
+    std::set<const goto_programt::instructiont *> writes;
+    bool valid = true;
+    for(const auto &input : candidate.input_bases)
+    {
+      std::size_t matches = 0;
+      irep_idt input_summary;
+      for(const auto &instruction : program.instructions)
+      {
+        irep_idt summary;
+        if(
+          publication_frontier_input_fold(
+            instruction, input, cursor, summary))
+        {
+          if(!shared_unsigned32(summary, ns))
+            valid = false;
+          ++matches;
+          input_summary = summary;
+          writes.insert(&instruction);
+        }
+      }
+      if(matches != 1)
+        valid = false;
+      folds[input] = input_summary;
+    }
+    if(
+      valid && folds.size() == candidate.input_bases.size())
+    {
+      ++fold_workers;
+      candidate.input_summaries = folds;
+      candidate.allowed_summary_writes.insert(
+        writes.begin(), writes.end());
+    }
+  }
+  if(fold_workers != 1)
+  {
+    reason = "publication_frontier_input_fold_partition";
+    return false;
+  }
+  return true;
+}
+
+bool publication_frontier_array_summary_obligations(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  publication_frontier_arrayt &candidate,
+  std::string &reason)
+{
+  if(candidate.consumer_summaries.size() != 1)
+  {
+    reason = "publication_frontier_consumer_summary";
+    return false;
+  }
+  const irep_idt consumer_summary =
+    *candidate.consumer_summaries.begin();
+  if(!shared_unsigned32(consumer_summary, namespacet(model.symbol_table)))
+  {
+    reason = "publication_frontier_consumer_summary_type";
+    return false;
+  }
+
+  exprt expected;
+  if(
+    !publication_frontier_array_property_equation(
+      model, life, consumer_summary, expected, reason))
+    return false;
+  if(
+    candidate.terminal_offset == 1 &&
+    candidate.map_constant != 0)
+  {
+    reason = "publication_frontier_complete_map_constant";
+    return false;
+  }
+  std::multiset<irep_idt> expected_symbols;
+  if(
+    !publication_frontier_additive_symbols(
+      expected, expected_symbols))
+  {
+    reason = "publication_frontier_expected_additive";
+    return false;
+  }
+  std::multiset<irep_idt> required;
+  for(const auto &entry : candidate.input_summaries)
+    required.insert(entry.second);
+  if(candidate.terminal_offset == 0)
+  {
+    irep_idt bound;
+    if(!symbol_id(candidate.bound, bound))
+    {
+      reason = "publication_frontier_incomplete_bound";
+      return false;
+    }
+    required.insert(bound);
+  }
+  if(expected_symbols != required)
+  {
+    reason = "publication_frontier_expected_equation";
+    return false;
+  }
+
+  std::set<irep_idt> summaries = {consumer_summary};
+  for(const auto &entry : candidate.input_summaries)
+    summaries.insert(entry.second);
+  std::set<const goto_programt::instructiont *> initial_writes;
+  if(
+    !zero_initialized_symbols(
+      model, summaries, initial_writes, reason))
+    return false;
+  candidate.allowed_summary_writes.insert(
+    initial_writes.begin(), initial_writes.end());
+
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(!instruction.is_assign())
+        continue;
+      irep_idt lhs;
+      if(
+        !symbol_id(instruction.assign_lhs(), lhs) ||
+        summaries.count(lhs) == 0)
+        continue;
+      if(
+        candidate.allowed_summary_writes.count(&instruction) == 0)
+      {
+        reason = "publication_frontier_summary_external_writer";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool publication_frontier_postjoin_property(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const std::set<irep_idt> &summaries,
+  bool boolean_summary,
+  std::string &reason)
+{
+  const goto_programt::instructiont *error = nullptr;
+  std::size_t errors = 0;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(call_id(instruction, callee) && is_reach_error(callee))
+      {
+        ++errors;
+        if(entry.first != ID_main)
+        {
+          reason = "publication_frontier_error_function";
+          return false;
+        }
+        error = &instruction;
+      }
+    }
+  }
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::size_t properties = 0;
+  const goto_programt::instructiont *assumption = nullptr;
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.last_join == nullptr ||
+      instruction.location_number <=
+        life.last_join->location_number)
+      continue;
+    irep_idt callee;
+    if(
+      !call_id(instruction, callee) || !is_assume(callee) ||
+      instruction.call_arguments().size() != 1)
+      continue;
+    const exprt &condition =
+      strip(instruction.call_arguments().front());
+    for(const auto &summary : summaries)
+    {
+      bool valid = false;
+      if(boolean_summary)
+      {
+        irep_idt identifier;
+        if(
+          condition.id() == ID_not &&
+          condition.operands().size() == 1)
+        {
+          const exprt &inner = strip(condition.op0());
+          if(
+            symbol_id(inner, identifier) &&
+            identifier == summary)
+            valid = true;
+          if(
+            inner.id() == ID_notequal &&
+            inner.operands().size() == 2)
+          {
+            valid =
+              (symbol_id(inner.op0(), identifier) &&
+               identifier == summary && value_is(inner.op1(), 0)) ||
+              (symbol_id(inner.op1(), identifier) &&
+               identifier == summary && value_is(inner.op0(), 0));
+          }
+        }
+        if(
+          condition.id() == ID_equal &&
+          condition.operands().size() == 2)
+        {
+          valid =
+            (symbol_id(condition.op0(), identifier) &&
+             identifier == summary && value_is(condition.op1(), 0)) ||
+            (symbol_id(condition.op1(), identifier) &&
+             identifier == summary && value_is(condition.op0(), 0));
+        }
+      }
+      else if(
+        condition.id() == ID_notequal &&
+        condition.operands().size() == 2)
+      {
+        irep_idt identifier;
+        valid =
+          (symbol_id(condition.op0(), identifier) &&
+           identifier == summary &&
+           !contains_symbol(condition.op1(), summary)) ||
+          (symbol_id(condition.op1(), identifier) &&
+           identifier == summary &&
+           !contains_symbol(condition.op0(), summary));
+      }
+      if(valid)
+      {
+        ++properties;
+        assumption = &instruction;
+        break;
+      }
+    }
+  }
+  if(
+    properties != 1 || errors != 1 || assumption == nullptr ||
+    error == nullptr ||
+    assumption->location_number >= error->location_number)
+  {
+    reason = "publication_frontier_property";
+    return false;
+  }
+  flow_equality_propertyt control;
+  control.assumption = assumption;
+  control.error = error;
+  return flow_main_control(model, life, control, reason);
+}
+
+bool publication_frontier_array_global_obligations(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const publication_frontier_arrayt &candidate,
+  std::string &reason)
+{
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(!instruction.is_assign())
+        continue;
+      irep_idt base;
+      irep_idt direct;
+      const bool writes_output =
+        base_pointer(instruction.assign_lhs(), base) &&
+        base == candidate.output;
+      const bool writes_frontier =
+        symbol_id(instruction.assign_lhs(), direct) &&
+        direct == candidate.frontier;
+      bool writes_input = false;
+      if(base_pointer(instruction.assign_lhs(), base))
+        writes_input = candidate.input_bases.count(base) != 0;
+      if(
+        symbol_id(instruction.assign_lhs(), direct) &&
+        direct == candidate.output)
+      {
+        for(const auto &input : candidate.input_bases)
+        {
+          if(contains_symbol(instruction.assign_rhs(), input))
+          {
+            reason = "publication_frontier_source_output_alias";
+            return false;
+          }
+        }
+      }
+      if(
+        writes_output &&
+        candidate.allowed_output_writes.count(&instruction) == 0)
+      {
+        reason = "publication_frontier_external_output_writer";
+        return false;
+      }
+      if(
+        writes_input &&
+        !is_start_function(entry.first) &&
+        !(entry.first == ID_main &&
+          life.first_create != nullptr &&
+          instruction.location_number <
+            life.first_create->location_number))
+      {
+        reason = "publication_frontier_input_mutation";
+        return false;
+      }
+      if(
+        writes_frontier &&
+        !is_start_function(entry.first) &&
+        !(entry.first == ID_main &&
+          life.first_create != nullptr &&
+          instruction.location_number <
+            life.first_create->location_number) &&
+        candidate.allowed_frontier_writes.count(&instruction) == 0)
+      {
+        reason = "publication_frontier_external_frontier_writer";
+        return false;
+      }
+    }
+  }
+  if(!flow_alias_free(model, candidate.output, reason))
+    return false;
+  return no_addresses(model, {candidate.frontier}, reason);
+}
+
+bool publication_frontier_array_audit_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const lifecyclet &life,
+  const std::vector<irep_idt> &workers,
+  publication_frontier_arrayt &candidate,
+  std::string &reason)
+{
+  std::size_t producers = 0;
+  for(const auto &worker : workers)
+  {
+    publication_frontier_arrayt current;
+    std::string current_reason;
+    if(
+      publication_frontier_find_array_producer(
+        model, ns, worker, current, current_reason))
+    {
+      ++producers;
+      candidate = current;
+    }
+  }
+  if(producers != 1)
+  {
+    reason = "publication_frontier_producer_partition";
+    return false;
+  }
+
+  std::size_t consumers = 0;
+  for(const auto &worker : workers)
+  {
+    if(worker == candidate.producer)
+      continue;
+    publication_frontier_arrayt current = candidate;
+    std::string current_reason;
+    if(
+      publication_frontier_find_array_consumer(
+        model, ns, worker, current, current_reason))
+    {
+      ++consumers;
+      candidate = current;
+    }
+  }
+  if(consumers != 1)
+  {
+    reason = "publication_frontier_consumer_partition";
+    return false;
+  }
+  if(
+    !publication_frontier_array_guarded_consume(
+      model, ns, candidate, reason) ||
+    !publication_frontier_array_memory_order(
+      model, life, candidate, reason) ||
+    !publication_frontier_find_input_folds(
+      model, ns, workers, candidate, reason) ||
+    !publication_frontier_array_summary_obligations(
+      model, life, candidate, reason) ||
+    !publication_frontier_postjoin_property(
+      model,
+      life,
+      candidate.consumer_summaries,
+      false,
+      reason) ||
+    !publication_frontier_array_global_obligations(
+      model, life, candidate, reason))
+    return false;
+  return true;
+}
+
+struct publication_frontier_filtert
+{
+  irep_idt producer;
+  irep_idt consumer;
+  irep_idt source;
+  irep_idt output;
+  irep_idt scan;
+  irep_idt frontier;
+  irep_idt cursor;
+  irep_idt last;
+  irep_idt previous;
+  irep_idt current;
+  irep_idt summary;
+  exprt bound;
+  bool increasing;
+  std::set<const goto_programt::instructiont *> allowed_writes;
+  const goto_programt::instructiont *guard;
+  const goto_programt::instructiont *publication;
+  const goto_programt::instructiont *frontier_increment;
+  const goto_programt::instructiont *last_update;
+  const goto_programt::instructiont *scan_increment;
+  const goto_programt::instructiont *consumer_read;
+  const goto_programt::instructiont *consumer_cursor_increment;
+  const goto_programt::instructiont *consumer_summary_update;
+  const goto_programt::instructiont *consumer_previous_update;
+  const goto_programt::instructiont *consumer_availability;
+  const goto_programt::instructiont *consumer_progress_first;
+  const goto_programt::instructiont *consumer_progress_last;
+  irep_idt consumer_progress_condition;
+
+  publication_frontier_filtert()
+    : increasing(false),
+      guard(nullptr),
+      publication(nullptr),
+      frontier_increment(nullptr),
+      last_update(nullptr),
+      scan_increment(nullptr),
+      consumer_read(nullptr),
+      consumer_cursor_increment(nullptr),
+      consumer_summary_update(nullptr),
+      consumer_previous_update(nullptr),
+      consumer_availability(nullptr),
+      consumer_progress_first(nullptr),
+      consumer_progress_last(nullptr)
+  {
+  }
+};
+
+bool publication_frontier_indexed_relation(
+  const exprt &src,
+  irep_idt &base,
+  irep_idt &index,
+  irep_idt &value,
+  bool &greater)
+{
+  const exprt &expr = strip(src);
+  if(
+    (expr.id() == ID_ge || expr.id() == ID_le) &&
+    expr.operands().size() == 2)
+  {
+    irep_idt candidate_base;
+    irep_idt candidate_index;
+    irep_idt candidate_value;
+    if(
+      array_symbol_index(
+        expr.op0(), candidate_base, candidate_index) &&
+      symbol_id(expr.op1(), candidate_value))
+    {
+      base = candidate_base;
+      index = candidate_index;
+      value = candidate_value;
+      greater = expr.id() == ID_ge;
+      return true;
+    }
+  }
+  for(const auto &operand : expr.operands())
+  {
+    if(
+      publication_frontier_indexed_relation(
+        operand, base, index, value, greater))
+      return true;
+  }
+  return false;
+}
+
+bool publication_frontier_array_equality(
+  const exprt &src,
+  irep_idt &left_base,
+  irep_idt &left_index,
+  irep_idt &right_base,
+  irep_idt &right_index)
+{
+  const exprt &expr = strip(src);
+  if(expr.id() == ID_equal && expr.operands().size() == 2)
+  {
+    if(
+      array_symbol_index(expr.op0(), left_base, left_index) &&
+      array_symbol_index(expr.op1(), right_base, right_index))
+      return true;
+    if(
+      array_symbol_index(expr.op1(), left_base, left_index) &&
+      array_symbol_index(expr.op0(), right_base, right_index))
+      return true;
+  }
+  for(const auto &operand : expr.operands())
+  {
+    if(
+      publication_frontier_array_equality(
+        operand,
+        left_base,
+        left_index,
+        right_base,
+        right_index))
+      return true;
+  }
+  return false;
+}
+
+bool publication_frontier_symbol_relation(
+  const exprt &src,
+  const irep_idt &left,
+  const irep_idt &right,
+  bool increasing)
+{
+  const exprt &expr = strip(src);
+  irep_idt lhs;
+  irep_idt rhs;
+  if(
+    expr.operands().size() == 2 &&
+    symbol_id(expr.op0(), lhs) && lhs == left &&
+    symbol_id(expr.op1(), rhs) && rhs == right &&
+    expr.id() == (increasing ? ID_le : ID_ge))
+    return true;
+  return std::any_of(
+    expr.operands().begin(),
+    expr.operands().end(),
+    [&](const exprt &operand) {
+      return publication_frontier_symbol_relation(
+        operand, left, right, increasing);
+    });
+}
+
+bool publication_frontier_or_progress(
+  const exprt &src,
+  const irep_idt &scan,
+  const exprt &bound,
+  const irep_idt &cursor,
+  const irep_idt &frontier)
+{
+  const exprt &expr = strip(src);
+  if(expr.id() == ID_or && expr.operands().size() == 2)
+  {
+    bool scan_progress = false;
+    bool drain_progress = false;
+    for(const auto &operand : expr.operands())
+    {
+      const exprt &term = strip(operand);
+      irep_idt left;
+      irep_idt right;
+      if(
+        term.id() == ID_lt && term.operands().size() == 2 &&
+        symbol_id(term.op0(), left) && left == scan &&
+        strip(term.op1()) == strip(bound))
+        scan_progress = true;
+      if(
+        term.id() == ID_lt && term.operands().size() == 2 &&
+        symbol_id(term.op0(), left) && left == cursor &&
+        symbol_id(term.op1(), right) && right == frontier)
+        drain_progress = true;
+    }
+    if(scan_progress && drain_progress)
+      return true;
+  }
+  return std::any_of(
+    expr.operands().begin(),
+    expr.operands().end(),
+    [&](const exprt &operand) {
+      return publication_frontier_or_progress(
+        operand, scan, bound, cursor, frontier);
+    });
+}
+
+bool publication_frontier_find_filter_producer(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  publication_frontier_filtert &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  std::size_t loop_exits = 0;
+  for(const auto &instruction : program.instructions)
+  {
+    irep_idt cursor;
+    exprt bound;
+    if(parse_loop_exit(instruction, cursor, bound))
+    {
+      ++loop_exits;
+      result.scan = cursor;
+      result.bound = bound;
+    }
+  }
+  std::size_t scan_increments = 0;
+  for(const auto &instruction : program.instructions)
+  {
+    if(unit_increment(instruction, result.scan))
+      ++scan_increments;
+  }
+  if(loop_exits != 1 || scan_increments != 1)
+  {
+    reason = "publication_frontier_filter_loop";
+    return false;
+  }
+
+  std::size_t guards = 0;
+  std::size_t publications = 0;
+  std::size_t frontier_increments = 0;
+  std::size_t last_updates = 0;
+  for(const auto &instruction : program.instructions)
+  {
+    if(instruction.has_condition())
+    {
+      irep_idt source;
+      irep_idt index;
+      irep_idt last;
+      bool greater = false;
+      if(
+        publication_frontier_indexed_relation(
+          instruction.condition(),
+          source,
+          index,
+          last,
+          greater) &&
+        index == result.scan)
+      {
+        ++guards;
+        result.source = source;
+        result.last = last;
+        result.increasing = greater;
+        result.guard = &instruction;
+      }
+    }
+    irep_idt callee;
+    if(
+      call_id(instruction, callee) && is_assume(callee) &&
+      instruction.call_arguments().size() == 1)
+    {
+      irep_idt output;
+      irep_idt frontier;
+      irep_idt source;
+      irep_idt scan;
+      if(
+        publication_frontier_array_equality(
+          instruction.call_arguments().front(),
+          output,
+          frontier,
+          source,
+          scan) &&
+        source == result.source && scan == result.scan)
+      {
+        ++publications;
+        result.output = output;
+        result.frontier = frontier;
+        result.publication = &instruction;
+      }
+    }
+    if(
+      !result.frontier.empty() &&
+      unit_increment(instruction, result.frontier))
+    {
+      ++frontier_increments;
+      result.allowed_writes.insert(&instruction);
+      result.frontier_increment = &instruction;
+    }
+    if(instruction.is_assign())
+    {
+      irep_idt lhs;
+      if(
+        symbol_id(instruction.assign_lhs(), lhs) &&
+        lhs == result.last &&
+        publication_frontier_array_read(
+          instruction.assign_rhs(),
+          result.source,
+          result.scan))
+      {
+        ++last_updates;
+        result.allowed_writes.insert(&instruction);
+        result.last_update = &instruction;
+      }
+      if(unit_increment(instruction, result.scan))
+      {
+        result.allowed_writes.insert(&instruction);
+        result.scan_increment = &instruction;
+      }
+    }
+  }
+  if(
+    guards != 1 || publications != 1 ||
+    frontier_increments != 1 || last_updates != 1 ||
+    result.output.empty() || result.source.empty() ||
+    result.output == result.source ||
+    result.frontier == result.scan)
+  {
+    reason = "publication_frontier_filter_producer";
+    return false;
+  }
+  result.producer = worker;
+  return true;
+}
+
+bool publication_frontier_filter_producer_control(
+  const goto_modelt &model,
+  const publication_frontier_filtert &candidate,
+  std::string &reason)
+{
+  if(
+    candidate.guard == nullptr ||
+    candidate.publication == nullptr ||
+    candidate.frontier_increment == nullptr ||
+    candidate.last_update == nullptr ||
+    candidate.scan_increment == nullptr ||
+    !candidate.guard->is_goto() ||
+    candidate.guard->targets.size() != 1)
+  {
+    reason = "publication_frontier_filter_producer_control_shape";
+    return false;
+  }
+  const unsigned guard = candidate.guard->location_number;
+  const unsigned publication =
+    candidate.publication->location_number;
+  const unsigned frontier =
+    candidate.frontier_increment->location_number;
+  const unsigned last = candidate.last_update->location_number;
+  const unsigned scan = candidate.scan_increment->location_number;
+  const unsigned skip =
+    candidate.guard->get_target()->location_number;
+  if(
+    !(guard < publication && publication < frontier &&
+      frontier < last && last < skip && skip <= scan))
+  {
+    reason = "publication_frontier_filter_producer_order";
+    return false;
+  }
+
+  const auto &program =
+    model.goto_functions.function_map.at(candidate.producer).body;
+  unsigned epoch = 0;
+  int depth = 0;
+  unsigned publication_epoch = 0;
+  unsigned frontier_epoch = 0;
+  unsigned scan_epoch = 0;
+  for(const auto &instruction : program.instructions)
+  {
+    if(instruction.is_atomic_begin())
+    {
+      ++depth;
+      ++epoch;
+    }
+    if(&instruction == candidate.publication && depth == 1)
+      publication_epoch = epoch;
+    if(&instruction == candidate.frontier_increment && depth == 1)
+      frontier_epoch = epoch;
+    if(&instruction == candidate.scan_increment && depth == 1)
+      scan_epoch = epoch;
+    if(instruction.is_atomic_end())
+      --depth;
+    if(depth < 0 || depth > 1)
+    {
+      reason = "publication_frontier_filter_atomic_nesting";
+      return false;
+    }
+  }
+  if(
+    depth != 0 || publication_epoch == 0 ||
+    publication_epoch != frontier_epoch || scan_epoch == 0 ||
+    scan_epoch == publication_epoch)
+  {
+    reason = "publication_frontier_filter_producer_atomicity";
+    return false;
+  }
+  return true;
+}
+
+bool publication_frontier_find_filter_consumer(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  publication_frontier_filtert &result,
+  std::string &reason)
+{
+  (void)ns;
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  std::size_t reads = 0;
+  std::size_t cursor_increments = 0;
+  std::size_t previous_updates = 0;
+  bool availability = false;
+  bool complete_drain = false;
+
+  for(const auto &instruction : program.instructions)
+  {
+    if(instruction.is_assign())
+    {
+      irep_idt lhs;
+      if(
+        symbol_id(instruction.assign_lhs(), lhs))
+      {
+        irep_idt index;
+        if(
+          base_index(
+            instruction.assign_rhs(), result.output, index))
+        {
+          ++reads;
+          result.current = lhs;
+          result.cursor = index;
+          result.consumer_read = &instruction;
+          result.allowed_writes.insert(&instruction);
+        }
+      }
+    }
+  }
+
+  if(reads != 1 || result.cursor.empty() || result.current.empty())
+  {
+    reason = "publication_frontier_filter_consumer_read";
+    return false;
+  }
+
+  for(const auto &instruction : program.instructions)
+  {
+    if(instruction.is_assign())
+    {
+      irep_idt lhs;
+      irep_idt rhs;
+      if(
+        symbol_id(instruction.assign_lhs(), lhs) &&
+        symbol_id(instruction.assign_rhs(), rhs) &&
+        rhs == result.current && lhs != result.current)
+      {
+        result.previous = lhs;
+        ++previous_updates;
+        result.allowed_writes.insert(&instruction);
+        result.consumer_previous_update = &instruction;
+      }
+      if(unit_increment(instruction, result.cursor))
+      {
+        ++cursor_increments;
+        result.allowed_writes.insert(&instruction);
+        result.consumer_cursor_increment = &instruction;
+      }
+      if(
+        publication_frontier_or_progress(
+          instruction.assign_rhs(),
+          result.scan,
+          result.bound,
+          result.cursor,
+          result.frontier))
+      {
+        complete_drain = true;
+        irep_idt lhs;
+        if(
+          symbol_id(instruction.assign_lhs(), lhs) &&
+          !lookup(lhs, ns)->is_static_lifetime)
+        {
+          if(result.consumer_progress_first == nullptr)
+          {
+            result.consumer_progress_first = &instruction;
+            result.consumer_progress_condition = lhs;
+          }
+          result.consumer_progress_last = &instruction;
+        }
+      }
+    }
+    irep_idt callee;
+    if(
+      call_id(instruction, callee) && is_assume(callee) &&
+      instruction.call_arguments().size() == 1 &&
+      publication_frontier_relation(
+        instruction.call_arguments().front(),
+        result.cursor,
+        result.frontier))
+    {
+      availability = true;
+      result.consumer_availability = &instruction;
+    }
+  }
+
+  std::size_t summary_updates = 0;
+  for(const auto &instruction : program.instructions)
+  {
+    if(!instruction.is_assign())
+      continue;
+    irep_idt lhs;
+    if(
+      symbol_id(instruction.assign_lhs(), lhs) &&
+      contains_symbol(instruction.assign_rhs(), lhs) &&
+      publication_frontier_symbol_relation(
+        instruction.assign_rhs(),
+        result.previous,
+        result.current,
+        result.increasing))
+    {
+      ++summary_updates;
+      result.summary = lhs;
+      result.allowed_writes.insert(&instruction);
+      result.consumer_summary_update = &instruction;
+    }
+  }
+  if(
+    cursor_increments != 1 || summary_updates != 1 ||
+    previous_updates != 1 || !availability || !complete_drain ||
+    result.summary.empty() || result.previous.empty())
+  {
+    reason = "publication_frontier_filter_consumer";
+    return false;
+  }
+  result.consumer = worker;
+  return true;
+}
+
+bool publication_frontier_filter_consumer_control(
+  const goto_modelt &model,
+  const publication_frontier_filtert &candidate,
+  std::string &reason)
+{
+  if(
+    candidate.consumer_read == nullptr ||
+    candidate.consumer_cursor_increment == nullptr ||
+    candidate.consumer_summary_update == nullptr ||
+    candidate.consumer_previous_update == nullptr ||
+    candidate.consumer_availability == nullptr ||
+    candidate.consumer_progress_first == nullptr ||
+    candidate.consumer_progress_last == nullptr ||
+    candidate.consumer_progress_first ==
+      candidate.consumer_progress_last ||
+    candidate.consumer_progress_condition.empty())
+  {
+    reason = "publication_frontier_filter_consumer_control_shape";
+    return false;
+  }
+  const unsigned progress_first =
+    candidate.consumer_progress_first->location_number;
+  const unsigned availability =
+    candidate.consumer_availability->location_number;
+  const unsigned read = candidate.consumer_read->location_number;
+  const unsigned increment =
+    candidate.consumer_cursor_increment->location_number;
+  const unsigned summary =
+    candidate.consumer_summary_update->location_number;
+  const unsigned previous =
+    candidate.consumer_previous_update->location_number;
+  const unsigned progress_last =
+    candidate.consumer_progress_last->location_number;
+  if(
+    !(progress_first < availability &&
+      availability < read && read < increment &&
+      increment < summary && summary < previous &&
+      previous < progress_last))
+  {
+    reason = "publication_frontier_filter_consumer_order";
+    return false;
+  }
+
+  const auto &program =
+    model.goto_functions.function_map.at(candidate.consumer).body;
+  std::size_t progress_writes = 0;
+  std::size_t loop_guards = 0;
+  unsigned epoch = 0;
+  int depth = 0;
+  unsigned availability_epoch = 0;
+  unsigned read_epoch = 0;
+  unsigned increment_epoch = 0;
+  for(const auto &instruction : program.instructions)
+  {
+    if(instruction.is_atomic_begin())
+    {
+      ++depth;
+      ++epoch;
+    }
+    if(&instruction == candidate.consumer_availability && depth == 1)
+      availability_epoch = epoch;
+    if(&instruction == candidate.consumer_read && depth == 1)
+      read_epoch = epoch;
+    if(
+      &instruction == candidate.consumer_cursor_increment &&
+      depth == 1)
+      increment_epoch = epoch;
+    if(instruction.is_assign())
+    {
+      irep_idt lhs;
+      if(
+        symbol_id(instruction.assign_lhs(), lhs) &&
+        lhs == candidate.consumer_progress_condition)
+      {
+        ++progress_writes;
+        if(
+          !publication_frontier_or_progress(
+            instruction.assign_rhs(),
+            candidate.scan,
+            candidate.bound,
+            candidate.cursor,
+            candidate.frontier))
+        {
+          reason = "publication_frontier_filter_progress_write";
+          return false;
+        }
+      }
+    }
+    if(
+      instruction.is_goto() &&
+      instruction.targets.size() == 1 &&
+      instruction.location_number > progress_first &&
+      instruction.location_number < availability &&
+      contains_symbol(
+        instruction.condition(),
+        candidate.consumer_progress_condition) &&
+      instruction.get_target()->location_number > progress_last)
+      ++loop_guards;
+    if(instruction.is_atomic_end())
+      --depth;
+    if(depth < 0 || depth > 1)
+    {
+      reason = "publication_frontier_filter_consumer_atomic_nesting";
+      return false;
+    }
+  }
+  if(
+    depth != 0 || progress_writes != 2 || loop_guards != 1 ||
+    availability_epoch == 0 ||
+    availability_epoch != read_epoch ||
+    availability_epoch != increment_epoch)
+  {
+    reason = "publication_frontier_filter_consumer_control";
+    return false;
+  }
+  return true;
+}
+
+bool publication_frontier_filter_global_obligations(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const publication_frontier_filtert &candidate,
+  std::string &reason)
+{
+  const std::set<irep_idt> protected_symbols = {
+    candidate.scan,
+    candidate.frontier,
+    candidate.cursor,
+    candidate.last,
+    candidate.previous,
+    candidate.current,
+    candidate.summary};
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(!instruction.is_assign())
+        continue;
+      irep_idt base;
+      if(
+        base_pointer(instruction.assign_lhs(), base) &&
+        base == candidate.source &&
+        !is_start_function(entry.first) &&
+        !(entry.first == ID_main &&
+          life.first_create != nullptr &&
+          instruction.location_number <
+            life.first_create->location_number))
+      {
+        reason = "publication_frontier_filter_source_mutation";
+        return false;
+      }
+      if(
+        base_pointer(instruction.assign_lhs(), base) &&
+        base == candidate.output)
+      {
+        reason = "publication_frontier_filter_output_mutation";
+        return false;
+      }
+      irep_idt direct;
+      if(
+        symbol_id(instruction.assign_lhs(), direct) &&
+        direct == candidate.output &&
+        contains_symbol(instruction.assign_rhs(), candidate.source))
+      {
+        reason = "publication_frontier_filter_source_output_alias";
+        return false;
+      }
+      irep_idt lhs;
+      if(
+        !symbol_id(instruction.assign_lhs(), lhs) ||
+        protected_symbols.count(lhs) == 0)
+        continue;
+      if(is_start_function(entry.first))
+        continue;
+      if(
+        entry.first == ID_main && life.first_create != nullptr &&
+        instruction.location_number <
+          life.first_create->location_number)
+        continue;
+      if(candidate.allowed_writes.count(&instruction) == 0)
+      {
+        reason = "publication_frontier_filter_external_writer";
+        return false;
+      }
+    }
+  }
+  if(
+    !flow_alias_free(model, candidate.source, reason) ||
+    !flow_alias_free(model, candidate.output, reason))
+    return false;
+  return no_addresses(model, protected_symbols, reason);
+}
+
+bool publication_frontier_filter_no_feedback(
+  const goto_modelt &model,
+  const publication_frontier_filtert &candidate,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(candidate.producer).body;
+  const std::set<irep_idt> consumer_state = {
+    candidate.cursor,
+    candidate.previous,
+    candidate.current,
+    candidate.summary};
+  for(const auto &instruction : program.instructions)
+  {
+    for(const auto &symbol : consumer_state)
+    {
+      if(
+        contains_symbol(instruction.code(), symbol) ||
+        (instruction.has_condition() &&
+         contains_symbol(instruction.condition(), symbol)))
+      {
+        reason = "publication_frontier_filter_feedback";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool publication_frontier_filter_initial_state(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const publication_frontier_filtert &candidate,
+  std::string &reason)
+{
+  irep_idt bound;
+  if(!symbol_id(candidate.bound, bound))
+  {
+    reason = "publication_frontier_filter_bound_symbol";
+    return false;
+  }
+
+  std::set<const goto_programt::instructiont *> zero_writes;
+  std::string zero_reason;
+  if(
+    !zero_initialized_symbols(
+      model, {candidate.scan}, zero_writes, zero_reason))
+  {
+    reason = "publication_frontier_filter_scan_init";
+    return false;
+  }
+
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::size_t summary_true = 0;
+  std::size_t frontier_cursor = 0;
+  std::size_t previous_source = 0;
+  std::size_t last_previous = 0;
+  std::size_t positive_bound = 0;
+  std::size_t scan_main_writes = 0;
+  std::size_t summary_writes = 0;
+  std::size_t frontier_writes = 0;
+  std::size_t previous_writes = 0;
+  std::size_t last_writes = 0;
+  unsigned summary_location = 0;
+  unsigned frontier_location = 0;
+  unsigned previous_location = 0;
+  unsigned last_location = 0;
+  unsigned cursor_last_location = 0;
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr &&
+      instruction.location_number >=
+        life.first_create->location_number)
+      break;
+    if(instruction.is_assign())
+    {
+      irep_idt lhs;
+      irep_idt rhs;
+      if(!symbol_id(instruction.assign_lhs(), lhs))
+        continue;
+      if(lhs == candidate.scan)
+      {
+        ++scan_main_writes;
+        continue;
+      }
+      if(lhs == candidate.cursor)
+        cursor_last_location = instruction.location_number;
+      if(
+        lhs == candidate.summary &&
+        value_is(instruction.assign_rhs(), 1))
+      {
+        ++summary_true;
+        ++summary_writes;
+        summary_location = instruction.location_number;
+        continue;
+      }
+      if(lhs == candidate.summary)
+        ++summary_writes;
+      if(
+        lhs == candidate.frontier &&
+        symbol_id(instruction.assign_rhs(), rhs) &&
+        rhs == candidate.cursor)
+      {
+        ++frontier_cursor;
+        ++frontier_writes;
+        frontier_location = instruction.location_number;
+        continue;
+      }
+      if(lhs == candidate.frontier)
+        ++frontier_writes;
+      if(
+        lhs == candidate.previous &&
+        array_at_zero(instruction.assign_rhs(), candidate.source))
+      {
+        ++previous_source;
+        ++previous_writes;
+        previous_location = instruction.location_number;
+        continue;
+      }
+      if(lhs == candidate.previous)
+        ++previous_writes;
+      if(
+        lhs == candidate.last &&
+        symbol_id(instruction.assign_rhs(), rhs) &&
+        rhs == candidate.previous)
+      {
+        ++last_previous;
+        ++last_writes;
+        last_location = instruction.location_number;
+        continue;
+      }
+      if(lhs == candidate.last)
+        ++last_writes;
+    }
+    irep_idt callee;
+    if(
+      call_id(instruction, callee) && is_assume(callee) &&
+      instruction.call_arguments().size() == 1)
+    {
+      std::vector<exprt> terms;
+      flatten_and(instruction.call_arguments().front(), terms);
+      for(const auto &term : terms)
+      {
+        if(
+          stream_refine_symbol_zero_relation(
+            term, bound, ID_gt))
+          ++positive_bound;
+      }
+    }
+  }
+  if(
+    summary_true != 1 || frontier_cursor != 1 ||
+    previous_source != 1 || last_previous != 1 ||
+    positive_bound != 1 || scan_main_writes != 0 ||
+    summary_writes != 1 || frontier_writes != 1 ||
+    previous_writes != 1 || last_writes != 1 ||
+    summary_location >= frontier_location ||
+    cursor_last_location >= frontier_location ||
+    frontier_location >= previous_location ||
+    previous_location >= last_location)
+  {
+    reason = "publication_frontier_filter_initial_state";
+    return false;
+  }
+  return true;
+}
+
+bool publication_frontier_filter_audit_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const lifecyclet &life,
+  const std::vector<irep_idt> &workers,
+  publication_frontier_filtert &candidate,
+  std::string &reason)
+{
+  if(workers.size() != 2)
+  {
+    reason = "publication_frontier_filter_worker_count";
+    return false;
+  }
+  std::size_t producers = 0;
+  std::string producer_reasons;
+  for(const auto &worker : workers)
+  {
+    publication_frontier_filtert current;
+    std::string current_reason;
+    if(
+      publication_frontier_find_filter_producer(
+        model, ns, worker, current, current_reason))
+    {
+      ++producers;
+      candidate = current;
+    }
+    else
+    {
+      if(!producer_reasons.empty())
+        producer_reasons += "_";
+      producer_reasons += current_reason;
+    }
+  }
+  if(producers != 1)
+  {
+    reason =
+      "publication_frontier_filter_producer_partition_" +
+      producer_reasons;
+    return false;
+  }
+  for(const auto &worker : workers)
+  {
+    if(worker == candidate.producer)
+      continue;
+    if(
+      !publication_frontier_find_filter_consumer(
+        model, ns, worker, candidate, reason))
+      return false;
+  }
+  if(
+    !publication_frontier_postjoin_property(
+      model, life, {candidate.summary}, true, reason) ||
+    !publication_frontier_filter_initial_state(
+      model, life, candidate, reason) ||
+    !publication_frontier_filter_producer_control(
+      model, candidate, reason) ||
+    !publication_frontier_filter_consumer_control(
+      model, candidate, reason) ||
+    !publication_frontier_filter_no_feedback(
+      model, candidate, reason) ||
+    !publication_frontier_filter_global_obligations(
+      model, life, candidate, reason))
+    return false;
+  return true;
+}
+
+bool publication_frontier_sequence_audit_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &mode,
+  std::string &reason)
+{
+  lifecyclet life;
+  std::vector<irep_idt> workers;
+  if(!stream_refine_lifecycle(model, life, workers, reason))
+    return false;
+
+  publication_frontier_arrayt array_candidate;
+  if(
+    publication_frontier_array_audit_impl(
+      model, ns, life, workers, array_candidate, reason))
+  {
+    mode =
+      array_candidate.terminal_offset == 1 ?
+      "complete-array" : "incomplete-array";
+    return true;
+  }
+  const std::string array_reason = reason;
+  publication_frontier_filtert filter_candidate;
+  reason.clear();
+  if(
+    publication_frontier_filter_audit_impl(
+      model, ns, life, workers, filter_candidate, reason))
+  {
+    mode =
+      filter_candidate.increasing ?
+      "monotone-filter-increasing" :
+      "monotone-filter-decreasing";
+    return true;
+  }
+  reason =
+    "array_" + array_reason + "_filter_" + reason;
+  return false;
+}
 } // namespace
 
 void role_split_affine_stream_audit(
@@ -15093,6 +17182,26 @@ void role_split_affine_stream_audit(
             << " stage_roles=" << stage_roles
             << " sink_roles=" << sink_roles;
   if(!candidate)
+    std::cout << " reason=" << reason;
+  std::cout << '\n';
+}
+
+void publication_frontier_sequence_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  const namespacet ns(goto_model.symbol_table);
+  std::string mode;
+  std::string reason;
+  const bool candidate =
+    publication_frontier_sequence_audit_impl(
+      goto_model, ns, mode, reason);
+  std::cout << "NATIVE_PUBLICATION_FRONTIER_AUDIT candidate="
+            << (candidate ? 1 : 0);
+  if(candidate)
+    std::cout << " mode=" << mode;
+  else
     std::cout << " reason=" << reason;
   std::cout << '\n';
 }
@@ -15195,6 +17304,18 @@ bool extremum_cone_proof(
     return true;
   }
   std::cout << "NATIVE_ROLE_SPLIT_STREAM applied=0 reason="
+            << reason << '\n';
+  reason.clear();
+  std::string publication_mode;
+  if(
+    publication_frontier_sequence_audit_impl(
+      goto_model, ns, publication_mode, reason))
+  {
+    std::cout << "NATIVE_PUBLICATION_FRONTIER applied=1 mode="
+              << publication_mode << '\n';
+    return true;
+  }
+  std::cout << "NATIVE_PUBLICATION_FRONTIER applied=0 reason="
             << reason << '\n';
   reason.clear();
   propertyt property;

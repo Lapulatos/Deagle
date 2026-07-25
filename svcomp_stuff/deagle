@@ -66,6 +66,7 @@ def get_result(remove = True):
                 or line.startswith("NATIVE_CAS_STABILITY ")
                 or line.startswith("NATIVE_PREDICATE_STABILITY ")
                 or line.startswith("NATIVE_PROPERTY_AFFINE_CERTIFICATE ")
+                or line.startswith("NATIVE_PUBLICATION_FRONTIER ")
                 or line.startswith("COUNTERFACTUAL_UIP_PROFILE ")
                 or line.startswith("COUNTERFACTUAL_UIP_DOMAIN ")
                 or line.startswith("COUNTERFACTUAL_UIP_DOMAIN_SOURCE ")
