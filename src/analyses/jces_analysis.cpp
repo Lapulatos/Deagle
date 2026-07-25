@@ -7067,7 +7067,249 @@ bool nested_iteration_homomorphism_audit_impl(
     return false;
   return true;
 }
+
+bool local_scalar_expression(
+  const exprt &expr,
+  const namespacet &ns)
+{
+  if(
+    expr.id() == ID_side_effect || expr.id() == ID_dereference ||
+    expr.id() == ID_address_of)
+    return false;
+  if(expr.id() == ID_symbol)
+  {
+    const symbolt *symbol = nullptr;
+    if(ns.lookup(to_symbol_expr(expr).get_identifier(), symbol))
+      return false;
+    return
+      !symbol->is_static_lifetime && !symbol->is_type &&
+      symbol->type.id() != ID_pointer;
+  }
+  for(const auto &operand : expr.operands())
+  {
+    if(!local_scalar_expression(operand, ns))
+      return false;
+  }
+  return true;
+}
+
+bool event_free_local_counting_loop(
+  const goto_programt &program,
+  const namespacet &ns,
+  goto_programt::const_targett backedge,
+  irep_idt &induction,
+  exprt &bound)
+{
+  if(
+    !backedge->is_goto() || !backedge->condition().is_true() ||
+    backedge->targets.size() != 1)
+    return false;
+  const auto head = backedge->get_target();
+  if(!parse_exit_guard(*head, induction, bound))
+    return false;
+
+  const symbolt *induction_symbol = nullptr;
+  if(
+    ns.lookup(induction, induction_symbol) ||
+    induction_symbol->is_static_lifetime || induction_symbol->is_type ||
+    (induction_symbol->type.id() != ID_signedbv &&
+     induction_symbol->type.id() != ID_unsignedbv) ||
+    induction_symbol->type.get_bool(ID_C_volatile) ||
+    !local_scalar_expression(bound, ns) ||
+    contains_symbol(bound, {induction}))
+    return false;
+
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : program.instructions)
+    positions.emplace(&instruction, position++);
+  const auto head_position = positions.at(&*head);
+  const auto backedge_position = positions.at(&*backedge);
+  if(
+    head->targets.size() != 1 ||
+    positions.at(&*head->get_target()) <= backedge_position)
+    return false;
+
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(!instruction->is_goto())
+      continue;
+    const auto source_position = positions.at(&*instruction);
+    for(const auto &target : instruction->targets)
+    {
+      const auto target_position = positions.at(&*target);
+      if(
+        target_position >= head_position &&
+        target_position <= backedge_position &&
+        (source_position < head_position ||
+         source_position > backedge_position))
+        return false;
+    }
+  }
+
+  std::size_t increments = 0;
+  for(auto instruction = head; instruction != std::next(backedge);
+      ++instruction)
+  {
+    if(instruction == head || instruction == backedge)
+      continue;
+    irep_idt incremented;
+    if(
+      parse_unit_increment(*instruction, incremented) &&
+      incremented == induction)
+    {
+      ++increments;
+      continue;
+    }
+    if(instruction->is_skip() || instruction->is_location())
+      continue;
+    return false;
+  }
+  if(increments != 1)
+    return false;
+
+  bool zero_initialized = false;
+  auto last_semantic = program.instructions.end();
+  for(auto instruction = program.instructions.begin(); instruction != head;
+      ++instruction)
+  {
+    if(!instruction->is_skip() && !instruction->is_location())
+      last_semantic = instruction;
+    if(
+      instruction->is_assign() &&
+      without_cast(instruction->assign_lhs()).id() == ID_symbol &&
+      to_symbol_expr(without_cast(instruction->assign_lhs()))
+          .get_identifier() == induction)
+      zero_initialized =
+        parse_zero_initialization(*instruction, induction);
+  }
+  return
+    zero_initialized &&
+    last_semantic != program.instructions.end() &&
+    parse_zero_initialization(*last_semantic, induction);
+}
 } // namespace
+
+bool local_loop_acceleration_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  std::size_t loop_count = 0;
+  std::set<irep_idt> functions;
+  for(const auto &function_entry : goto_model.goto_functions.function_map)
+  {
+    if(!function_entry.second.body_available())
+      continue;
+    const auto &program = function_entry.second.body;
+    std::map<const goto_programt::instructiont *, std::size_t> positions;
+    std::size_t position = 0;
+    for(const auto &instruction : program.instructions)
+      positions.emplace(&instruction, position++);
+
+    for(auto instruction = program.instructions.begin();
+        instruction != program.instructions.end(); ++instruction)
+    {
+      if(
+        !instruction->is_goto() || !instruction->condition().is_true() ||
+        instruction->targets.size() != 1 ||
+        positions.at(&*instruction->get_target()) >=
+          positions.at(&*instruction))
+        continue;
+      irep_idt induction;
+      exprt bound;
+      if(
+        !event_free_local_counting_loop(
+          program, ns, instruction, induction, bound))
+        continue;
+      ++loop_count;
+      functions.insert(function_entry.first);
+      std::cout
+        << "NATIVE_LOCAL_LOOP_ACCEL_LOOP function="
+        << function_entry.first << " induction=" << induction
+        << " line=" << instruction->source_location().get_line() << '\n';
+    }
+  }
+
+  std::cout << "NATIVE_LOCAL_LOOP_ACCEL_AUDIT applicable="
+            << (loop_count != 0 ? 1 : 0)
+            << " loops=" << loop_count
+            << " functions=" << functions.size() << '\n';
+  (void)message_handler;
+  return loop_count != 0;
+}
+
+bool local_loop_acceleration_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  std::size_t transformed = 0;
+  std::set<irep_idt> functions;
+  for(auto &function_entry : goto_model.goto_functions.function_map)
+  {
+    if(!function_entry.second.body_available())
+      continue;
+    auto &program = function_entry.second.body;
+    std::map<const goto_programt::instructiont *, std::size_t> positions;
+    std::size_t position = 0;
+    for(const auto &instruction : program.instructions)
+      positions.emplace(&instruction, position++);
+
+    std::vector<goto_programt::targett> backedges;
+    for(auto instruction = program.instructions.begin();
+        instruction != program.instructions.end(); ++instruction)
+    {
+      if(
+        instruction->is_goto() && instruction->condition().is_true() &&
+        instruction->targets.size() == 1 &&
+        positions.at(&*instruction->get_target()) <
+          positions.at(&*instruction))
+        backedges.push_back(instruction);
+    }
+
+    for(auto backedge : backedges)
+    {
+      irep_idt induction;
+      exprt bound;
+      if(
+        !event_free_local_counting_loop(
+          program, ns, backedge, induction, bound))
+        continue;
+      const symbolt *symbol = nullptr;
+      INVARIANT(
+        !ns.lookup(induction, symbol),
+        "accepted local induction symbol exists");
+      exprt count = exact_count(bound, symbol->type);
+      INVARIANT(
+        !count.is_nil(),
+        "accepted local induction has exact bit-vector count");
+      const auto head = backedge->get_target();
+      const auto location = head->source_location();
+      program.insert_before(
+        head,
+        goto_programt::make_assignment(
+          symbol_exprt(induction, symbol->type),
+          std::move(count),
+          location));
+      for(auto instruction = head; instruction != std::next(backedge);
+          ++instruction)
+        instruction->turn_into_skip();
+      ++transformed;
+      functions.insert(function_entry.first);
+    }
+  }
+  if(transformed != 0)
+    goto_model.goto_functions.update();
+  std::cout
+    << "NATIVE_LOCAL_LOOP_ACCEL applied="
+    << (transformed != 0 ? 1 : 0)
+    << " loops=" << transformed
+    << " functions=" << functions.size() << '\n';
+  (void)message_handler;
+  return transformed != 0;
+}
 
 void nested_iteration_homomorphism_audit(
   const goto_modelt &goto_model,

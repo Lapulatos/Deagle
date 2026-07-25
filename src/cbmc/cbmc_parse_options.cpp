@@ -560,6 +560,10 @@ int cbmc_parse_optionst::doit()
     nested_iteration_homomorphism_audit(
       goto_model, ui_message_handler);
 
+  if(cmdline.isset("native-local-loop-accel-audit"))
+    local_loop_acceleration_audit(
+      goto_model, ui_message_handler);
+
   if(
     cmdline.isset("native-jces") &&
     !cmdline.isset("unwind-suggest") &&
@@ -592,6 +596,12 @@ int cbmc_parse_optionst::doit()
 
   if(cmdline.isset("native-prefix-affine-envelope"))
     prefix_affine_envelope_transform(goto_model, ui_message_handler);
+
+  if(
+    cmdline.isset("native-jces") &&
+    !cmdline.isset("unwind-suggest"))
+    local_loop_acceleration_transform(
+      goto_model, ui_message_handler);
 
   if(cmdline.isset("native-property-affine-audit"))
     property_directed_affine_audit(goto_model, ui_message_handler);

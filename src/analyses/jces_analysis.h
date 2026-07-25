@@ -10,6 +10,18 @@ Module: Join-Scoped Compositional Effect Summary
 class goto_modelt;
 class message_handlert;
 
+/// Audit exact acceleration opportunities for event-free thread-local
+/// counting loops. This does not mutate the GOTO model.
+bool local_loop_acceleration_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// Replace event-free thread-local zero-based unit-counting loops with their
+/// exact signed or unsigned bit-vector exit assignment.
+bool local_loop_acceleration_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 /// Audit whether a joined nested loop of unit additions is equivalent to a
 /// joined loop that adds the runtime inner iteration count once.
 void nested_iteration_homomorphism_audit(
