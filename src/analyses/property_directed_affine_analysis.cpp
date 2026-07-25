@@ -806,9 +806,13 @@ bool rational_coefficients_to_affine(
   result.constant = constant;
   for(const auto &term : coefficients)
   {
-    if(term.second.get_denominator() != 1)
+    const mp_integer denominator = term.second.get_denominator();
+    if(denominator != 1 && denominator != -1)
       return false;
-    result.coefficients[term.first] = term.second.get_numerator();
+    result.coefficients[term.first] =
+      denominator == 1
+        ? term.second.get_numerator()
+        : -term.second.get_numerator();
   }
   return true;
 }
@@ -1017,26 +1021,145 @@ bool direct_conservation_certificate(
       model, stats.workers, first_create, invariant);
 }
 
-bool lt_loop_guard(
+bool integer_combination(
+  const std::vector<affine_formt> &facts,
+  const affine_formt &target,
+  std::vector<mp_integer> *multipliers_output)
+{
+  if(facts.empty())
+    return false;
+  std::set<irep_idt> variable_set;
+  for(const auto &fact : facts)
+    for(const auto &term : fact.coefficients)
+      variable_set.insert(term.first);
+  for(const auto &term : target.coefficients)
+    variable_set.insert(term.first);
+  std::vector<irep_idt> variables(variable_set.begin(), variable_set.end());
+
+  std::vector<std::vector<rationalt>> matrix(
+    variables.size() + 1,
+    std::vector<rationalt>(facts.size() + 1));
+  for(std::size_t row = 0; row < variables.size(); ++row)
+  {
+    for(std::size_t column = 0; column < facts.size(); ++column)
+    {
+      const auto found = facts[column].coefficients.find(variables[row]);
+      if(found != facts[column].coefficients.end())
+        matrix[row][column] = rationalt(found->second);
+    }
+    const auto target_term = target.coefficients.find(variables[row]);
+    if(target_term != target.coefficients.end())
+      matrix[row].back() = rationalt(target_term->second);
+  }
+  for(std::size_t column = 0; column < facts.size(); ++column)
+    matrix.back()[column] = rationalt(facts[column].constant);
+  matrix.back().back() = rationalt(target.constant);
+
+  std::vector<std::size_t> pivot_columns;
+  std::size_t pivot_row = 0;
+  for(std::size_t column = 0;
+      column < facts.size() && pivot_row < matrix.size();
+      ++column)
+  {
+    std::size_t selected = pivot_row;
+    while(selected < matrix.size() && matrix[selected][column].is_zero())
+      ++selected;
+    if(selected == matrix.size())
+      continue;
+    std::swap(matrix[pivot_row], matrix[selected]);
+    const rationalt pivot = matrix[pivot_row][column];
+    for(std::size_t j = column; j <= facts.size(); ++j)
+      matrix[pivot_row][j] /= pivot;
+    for(std::size_t row = 0; row < matrix.size(); ++row)
+    {
+      if(row == pivot_row || matrix[row][column].is_zero())
+        continue;
+      const rationalt factor = matrix[row][column];
+      for(std::size_t j = column; j <= facts.size(); ++j)
+        matrix[row][j] -= factor * matrix[pivot_row][j];
+    }
+    pivot_columns.push_back(column);
+    ++pivot_row;
+  }
+
+  for(const auto &row : matrix)
+  {
+    bool zero = true;
+    for(std::size_t column = 0; column < facts.size(); ++column)
+      zero = zero && row[column].is_zero();
+    if(zero && !row.back().is_zero())
+      return false;
+  }
+
+  std::vector<mp_integer> multipliers(facts.size());
+  for(std::size_t row = 0; row < pivot_columns.size(); ++row)
+  {
+    const mp_integer denominator =
+      matrix[row].back().get_denominator();
+    if(denominator != 1 && denominator != -1)
+      return false;
+    multipliers[pivot_columns[row]] =
+      denominator == 1
+        ? matrix[row].back().get_numerator()
+        : -matrix[row].back().get_numerator();
+  }
+
+  affine_formt reconstructed;
+  for(std::size_t index = 0; index < facts.size(); ++index)
+    reconstructed.add(facts[index], multipliers[index]);
+  if(
+    reconstructed.coefficients != target.coefficients ||
+    reconstructed.constant != target.constant)
+    return false;
+  if(multipliers_output != nullptr)
+    *multipliers_output = multipliers;
+  return true;
+}
+
+std::string integer_multipliers_string(
+  const std::vector<mp_integer> &multipliers)
+{
+  std::ostringstream out;
+  for(std::size_t index = 0; index < multipliers.size(); ++index)
+  {
+    if(index != 0)
+      out << ':';
+    out << multipliers[index];
+  }
+  return out.str();
+}
+
+bool canonical_lt_loop_guard(
   const exprt &src,
   irep_idt &induction,
   irep_idt &bound)
 {
-  const exprt *condition = &strip_casts(src);
-  if(condition->id() == ID_not && condition->operands().size() == 1)
-    condition = &strip_casts(condition->op0());
-  if(condition->id() != ID_lt || condition->operands().size() != 2)
+  const exprt &condition = strip_casts(src);
+  if(condition.id() != ID_not || condition.operands().size() != 1)
+    return false;
+  const exprt &guard = strip_casts(condition.op0());
+  if(guard.id() != ID_lt || guard.operands().size() != 2)
     return false;
   return
-    symbol_identifier(condition->op0(), induction) &&
-    symbol_identifier(condition->op1(), bound) &&
+    symbol_identifier(guard.op0(), induction) &&
+    symbol_identifier(guard.op1(), bound) &&
     induction != bound;
 }
 
 struct counted_loopt
 {
+  irep_idt worker;
   irep_idt induction;
   irep_idt bound;
+};
+
+struct lattice_audit_statst
+{
+  bool integer_invariant = false;
+  bool integer_initial = false;
+  bool preserved = false;
+  bool common_domain = false;
+  bool complete_coverage = false;
 };
 
 std::string counted_loop_string(
@@ -1049,7 +1172,7 @@ std::string counted_loop_string(
     if(!first)
       out << ';';
     first = false;
-    out << loop.induction << ':' << loop.bound;
+    out << loop.worker << ':' << loop.induction << ':' << loop.bound;
   }
   return out.str();
 }
@@ -1083,7 +1206,6 @@ bool extract_counted_loops(
   const goto_modelt &model,
   const namespacet &ns,
   const std::set<irep_idt> &workers,
-  const std::vector<affine_formt> &initial_facts,
   std::vector<counted_loopt> &summaries)
 {
   for(const auto &worker : workers)
@@ -1098,15 +1220,42 @@ bool extract_counted_loops(
     {
       irep_idt induction;
       irep_idt bound;
-      if(!lt_loop_guard(entry.first->condition(), induction, bound))
+      if(
+        !entry.first->is_goto() ||
+        !canonical_lt_loop_guard(
+          entry.first->condition(), induction, bound) ||
+        !shared_integer(induction, ns) || !shared_integer(bound, ns))
         continue;
-      if(!shared_integer(induction, ns) || !shared_integer(bound, ns))
+      const auto exit = entry.first->get_target();
+      if(entry.second.contains(exit))
+        continue;
+      const auto head_successors = program.get_successors(entry.first);
+      if(head_successors.size() != 2)
+        continue;
+      std::size_t inside_successors = 0;
+      std::size_t outside_successors = 0;
+      for(const auto &successor : head_successors)
+      {
+        if(entry.second.contains(successor))
+          ++inside_successors;
+        else if(successor == exit)
+          ++outside_successors;
+      }
+      if(inside_successors != 1 || outside_successors != 1)
         continue;
 
       goto_programt::const_targett increment = program.instructions.end();
       std::size_t induction_assignments = 0;
+      bool closed_body = true;
       for(const auto &instruction : entry.second)
       {
+        for(const auto &successor : program.get_successors(instruction))
+        {
+          if(
+            !entry.second.contains(successor) &&
+            !(instruction == entry.first && successor == exit))
+            closed_body = false;
+        }
         if(!instruction->is_assign())
           continue;
         irep_idt lhs;
@@ -1123,95 +1272,107 @@ bool extract_counted_loops(
         }
       }
       if(
-        induction_assignments != 1 ||
+        !closed_body || induction_assignments != 1 ||
         increment == program.instructions.end())
         continue;
 
-      bool dominates_backedges = true;
+      std::size_t backedges = 0;
+      bool canonical_backedges = true;
       for(const auto &instruction : entry.second)
       {
-        if(
-          instruction->is_backwards_goto() &&
-          instruction->get_target() == entry.first &&
-          !loops.get_dominator_info().dominates(increment, instruction))
-          dominates_backedges = false;
+        if(!instruction->is_backwards_goto())
+          continue;
+        if(instruction->get_target() != entry.first)
+        {
+          canonical_backedges = false;
+          continue;
+        }
+        ++backedges;
+        if(!loops.get_dominator_info().dominates(increment, instruction))
+          canonical_backedges = false;
       }
-      if(!dominates_backedges)
+      if(!canonical_backedges || backedges == 0)
         continue;
       if(
         worker_assigns_symbol(model, workers, induction, &*increment) ||
         worker_assigns_symbol(model, workers, bound, nullptr))
         continue;
-
-      std::map<irep_idt, rationalt> zero_target;
-      zero_target[induction] = rationalt(1);
-      if(!implied_by_equalities(initial_facts, zero_target, 0))
-        continue;
-      summaries.push_back({induction, bound});
+      summaries.push_back({worker, induction, bound});
     }
   }
   return !summaries.empty();
 }
 
 bool property_discharged_by_counted_loops(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const audit_statst &stats,
+  const goto_programt::instructiont *first_create,
   const affine_formt &property,
+  const transition_systemt &transition_system,
   const std::map<irep_idt, rationalt> &coefficients,
   const std::vector<affine_formt> &initial_facts,
   const std::vector<counted_loopt> &counted_loops,
-  std::size_t &equal_bound_pairs)
+  std::size_t &equal_loop_pairs,
+  std::vector<mp_integer> &property_multipliers,
+  lattice_audit_statst &lattice_stats)
 {
   affine_formt invariant;
-  if(
-    !rational_coefficients_to_affine(
-      coefficients, property.constant, invariant))
+  std::vector<mp_integer> base_multipliers;
+  lattice_stats.integer_invariant =
+    rational_coefficients_to_affine(
+      coefficients, property.constant, invariant);
+  lattice_stats.integer_initial =
+    lattice_stats.integer_invariant &&
+    integer_combination(initial_facts, invariant, &base_multipliers);
+  lattice_stats.preserved =
+    lattice_stats.integer_initial &&
+    every_path_preserves(transition_system, invariant);
+  if(!lattice_stats.preserved)
     return false;
+
+  affine_formt relevant = invariant;
+  for(const auto &loop : counted_loops)
+  {
+    relevant.coefficients[loop.induction] += 1;
+    relevant.coefficients[loop.bound] += 1;
+  }
+  lattice_stats.common_domain = common_bitvector_domain(relevant, ns);
+  lattice_stats.complete_coverage =
+    lattice_stats.common_domain &&
+    direct_certificate_coverage(
+      model, stats.workers, first_create, relevant);
+  if(!lattice_stats.complete_coverage)
+    return false;
+
   std::vector<affine_formt> join_facts;
   join_facts.push_back(invariant);
-
-  const auto bounds_equal =
-    [&](const irep_idt &left, const irep_idt &right) {
-      if(left == right)
-        return true;
-      for(const auto &fact : initial_facts)
-      {
-        if(fact.constant != 0 || fact.coefficients.size() != 2)
-          continue;
-        const auto left_term = fact.coefficients.find(left);
-        const auto right_term = fact.coefficients.find(right);
-        if(
-          left_term != fact.coefficients.end() &&
-          right_term != fact.coefficients.end() &&
-          left_term->second + right_term->second == 0 &&
-          (left_term->second == 1 || left_term->second == -1))
-          return true;
-      }
-      return false;
-    };
-
   for(std::size_t left = 0; left < counted_loops.size(); ++left)
   {
     for(std::size_t right = left + 1;
         right < counted_loops.size();
         ++right)
     {
-      if(
-        !bounds_equal(
-          counted_loops[left].bound, counted_loops[right].bound))
+      if(counted_loops[left].worker == counted_loops[right].worker)
         continue;
-      ++equal_bound_pairs;
-      affine_formt equal_inductions;
-      equal_inductions.coefficients[counted_loops[left].induction] = 1;
-      equal_inductions.coefficients[counted_loops[right].induction] = -1;
-      join_facts.push_back(equal_inductions);
+      affine_formt equal_initial;
+      equal_initial.coefficients[counted_loops[left].induction] = 1;
+      equal_initial.coefficients[counted_loops[right].induction] = -1;
+      affine_formt equal_bounds;
+      equal_bounds.coefficients[counted_loops[left].bound] = 1;
+      equal_bounds.coefficients[counted_loops[right].bound] = -1;
+      if(
+        !integer_combination(initial_facts, equal_initial, nullptr) ||
+        !integer_combination(initial_facts, equal_bounds, nullptr))
+        continue;
+      ++equal_loop_pairs;
+      join_facts.push_back(equal_initial);
     }
   }
-
-  std::map<irep_idt, rationalt> property_coefficients;
-  for(const auto &term : property.coefficients)
-    property_coefficients[term.first] = rationalt(term.second);
   return
-    implied_by_equalities(
-      join_facts, property_coefficients, property.constant);
+    equal_loop_pairs > 0 &&
+    integer_combination(
+      join_facts, property, &property_multipliers);
 }
 
 bool property_after_join(
@@ -1354,16 +1515,25 @@ void property_directed_affine_audit(
   const bool counted =
     base &&
     extract_counted_loops(
-      goto_model, ns, stats.workers, initial_facts, counted_loops);
-  std::size_t equal_bound_pairs = 0;
-  const bool discharged =
+      goto_model, ns, stats.workers, counted_loops);
+  std::size_t equal_loop_pairs = 0;
+  std::vector<mp_integer> lattice_multipliers;
+  lattice_audit_statst lattice_stats;
+  const bool lattice_discharged =
     base &&
     property_discharged_by_counted_loops(
+      goto_model,
+      ns,
+      stats,
+      first_create,
       bad_difference,
+      transition_system,
       coefficients,
       initial_facts,
       counted_loops,
-      equal_bound_pairs);
+      equal_loop_pairs,
+      lattice_multipliers,
+      lattice_stats);
   const bool direct_certificate =
     base &&
     direct_conservation_certificate(
@@ -1380,9 +1550,18 @@ void property_directed_affine_audit(
             << " transitions=" << (transitions ? 1 : 0)
             << " synthesized=" << (synthesized ? 1 : 0)
             << " base=" << (base ? 1 : 0)
-            << " counted=" << (counted ? counted_loops.size() : 0)
-            << " equal_bound_pairs=" << equal_bound_pairs
-            << " discharged=" << (discharged ? 1 : 0)
+            << " strict_counted=" << (counted ? counted_loops.size() : 0)
+            << " lattice_pairs=" << equal_loop_pairs
+            << " lattice_discharged=" << (lattice_discharged ? 1 : 0)
+            << " lattice_integer_invariant="
+            << (lattice_stats.integer_invariant ? 1 : 0)
+            << " lattice_integer_initial="
+            << (lattice_stats.integer_initial ? 1 : 0)
+            << " lattice_preserved=" << (lattice_stats.preserved ? 1 : 0)
+            << " lattice_common_domain="
+            << (lattice_stats.common_domain ? 1 : 0)
+            << " lattice_complete_coverage="
+            << (lattice_stats.complete_coverage ? 1 : 0)
             << " direct_certificate=" << (direct_certificate ? 1 : 0)
             << " initial_facts=" << initial_facts.size()
             << " property_symbols=" << bad_difference.coefficients.size()
@@ -1398,6 +1577,9 @@ void property_directed_affine_audit(
     std::cout << " coefficients=" << coefficient_string(coefficients);
   if(!counted_loops.empty())
     std::cout << " counted_loops=" << counted_loop_string(counted_loops);
+  if(!lattice_multipliers.empty())
+    std::cout << " lattice_multipliers="
+              << integer_multipliers_string(lattice_multipliers);
   if(!initial_facts.empty())
     std::cout << " initial_equalities="
               << affine_facts_string(initial_facts);
@@ -1436,15 +1618,17 @@ bool property_directed_affine_proof(
     return false;
 
   std::vector<affine_formt> initial_facts;
-  if(
-    !initial_relation_established(
+  if(!initial_relation_established(
       goto_model,
       ns,
       first_create,
       coefficients,
       bad_difference.constant,
-      &initial_facts) ||
-    !direct_conservation_certificate(
+      &initial_facts))
+    return false;
+
+  const bool direct_certificate =
+    direct_conservation_certificate(
       goto_model,
       ns,
       stats,
@@ -1452,13 +1636,41 @@ bool property_directed_affine_proof(
       bad_difference,
       transition_system,
       coefficients,
-      initial_facts))
+      initial_facts);
+  std::vector<counted_loopt> counted_loops;
+  std::size_t equal_loop_pairs = 0;
+  std::vector<mp_integer> lattice_multipliers;
+  lattice_audit_statst lattice_stats;
+  const bool lattice_certificate =
+    !direct_certificate &&
+    extract_counted_loops(
+      goto_model, ns, stats.workers, counted_loops) &&
+    property_discharged_by_counted_loops(
+      goto_model,
+      ns,
+      stats,
+      first_create,
+      bad_difference,
+      transition_system,
+      coefficients,
+      initial_facts,
+      counted_loops,
+      equal_loop_pairs,
+      lattice_multipliers,
+      lattice_stats);
+  if(!direct_certificate && !lattice_certificate)
     return false;
 
   std::cout << "NATIVE_PROPERTY_AFFINE_CERTIFICATE applied=1"
+            << " mode=" << (direct_certificate ? "direct" : "lattice")
             << " workers=" << stats.workers.size()
             << " paths=" << transition_system.explored_paths
-            << " relation=" << coefficient_string(coefficients)
-            << '\n';
+            << " relation=" << coefficient_string(coefficients);
+  if(lattice_certificate)
+    std::cout << " strict_counted=" << counted_loops.size()
+              << " lattice_pairs=" << equal_loop_pairs
+              << " lattice_multipliers="
+              << integer_multipliers_string(lattice_multipliers);
+  std::cout << '\n';
   return true;
 }
