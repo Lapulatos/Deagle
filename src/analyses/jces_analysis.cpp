@@ -67,6 +67,13 @@ struct transition_word_summaryt
   std::vector<transition_word_stept> steps;
 };
 
+struct modular_chunk_summaryt
+{
+  transition_word_summaryt word;
+  irep_idt bound;
+  std::size_t chunk = 0;
+};
+
 struct affine_worker_summaryt
 {
   irep_idt worker;
@@ -3793,6 +3800,463 @@ bool transition_word_worker(
   return true;
 }
 
+bool transition_word_parse_step(
+  const goto_programt::const_targett &guard,
+  const goto_programt::const_targett &update,
+  const goto_programt::const_targett &increment,
+  const irep_idt &state,
+  const irep_idt &induction,
+  const goto_modelt &model,
+  const namespacet &ns,
+  transition_word_stept &step,
+  std::string &reason)
+{
+  irep_idt helper;
+  if(
+    !direct_call_identifier(*guard, helper) ||
+    guard->call_arguments().size() != 1 ||
+    !is_restricting_helper(helper, model, ns))
+  {
+    reason = "modular_step_guard";
+    return false;
+  }
+  if(!update->is_assign())
+  {
+    reason = "modular_step_update";
+    return false;
+  }
+  irep_idt updated;
+  if(
+    !direct_symbol(update->assign_lhs(), updated) ||
+    updated != state)
+  {
+    reason = "modular_step_state";
+    return false;
+  }
+  irep_idt incremented;
+  if(
+    !parse_unit_increment(*increment, incremented) ||
+    incremented != induction)
+  {
+    reason = "modular_step_increment";
+    return false;
+  }
+  step = {guard->call_arguments().front(), update->assign_rhs()};
+  return true;
+}
+
+bool transition_word_subtractive_bound(
+  const exprt &src,
+  const typet &counter_type,
+  irep_idt &base,
+  mp_integer &distance)
+{
+  const exprt &bound = without_cast(src);
+  if(
+    bound.id() != ID_minus || bound.operands().size() != 2 ||
+    bound.type() != counter_type ||
+    !direct_symbol(bound.op0(), base))
+    return false;
+  const exprt &amount = without_cast(bound.op1());
+  return
+    bound.op1().type() == counter_type &&
+    amount.id() == ID_constant &&
+    !to_integer(to_constant_expr(amount), distance) &&
+    distance > 0;
+}
+
+bool transition_word_tail_bound(
+  const exprt &src,
+  const typet &counter_type,
+  const irep_idt &base,
+  const std::size_t expected_distance)
+{
+  if(expected_distance == 0)
+  {
+    irep_idt identifier;
+    return
+      direct_symbol(without_cast(src), identifier) &&
+      identifier == base && without_cast(src).type() == counter_type;
+  }
+  irep_idt identifier;
+  mp_integer distance;
+  return
+    transition_word_subtractive_bound(
+      src, counter_type, identifier, distance) &&
+    identifier == base && distance == expected_distance;
+}
+
+bool transition_word_power_of_two(const std::size_t value)
+{
+  return value >= 2 && (value & (value - 1)) == 0;
+}
+
+bool modular_chunk_worker(
+  const irep_idt &worker,
+  const irep_idt &state,
+  const goto_modelt &model,
+  const namespacet &ns,
+  modular_chunk_summaryt &summary,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(worker);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "modular_missing_worker";
+    return false;
+  }
+  const auto &program = function->second.body;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : program.instructions)
+    positions.emplace(&instruction, position++);
+
+  auto backedge = program.instructions.end();
+  auto loop_head = program.instructions.end();
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(!instruction->is_goto())
+      continue;
+    if(instruction->targets.size() != 1)
+    {
+      reason = "modular_multi_target";
+      return false;
+    }
+    if(
+      positions.at(&*instruction->get_target()) <
+      positions.at(&*instruction))
+    {
+      if(
+        !instruction->condition().is_true() ||
+        backedge != program.instructions.end())
+      {
+        reason = "modular_backedge";
+        return false;
+      }
+      backedge = instruction;
+      loop_head = instruction->get_target();
+    }
+  }
+  if(backedge == program.instructions.end())
+  {
+    reason = "modular_no_loop";
+    return false;
+  }
+
+  irep_idt induction;
+  exprt wrapped_bound;
+  if(!parse_exit_guard(*loop_head, induction, wrapped_bound))
+  {
+    reason = "modular_loop_guard";
+    return false;
+  }
+  const symbolt *induction_symbol = nullptr;
+  if(
+    ns.lookup(induction, induction_symbol) ||
+    induction_symbol->type.id() != ID_unsignedbv)
+  {
+    reason = "modular_induction_type";
+    return false;
+  }
+  const std::size_t counter_width =
+    to_unsignedbv_type(induction_symbol->type).get_width();
+
+  irep_idt base;
+  mp_integer distance;
+  if(
+    !transition_word_subtractive_bound(
+      wrapped_bound, induction_symbol->type, base, distance) ||
+    distance > 63)
+  {
+    reason = "modular_subtractive_bound";
+    return false;
+  }
+  const std::size_t chunk =
+    numeric_cast_v<std::size_t>(distance + 1);
+  if(
+    !transition_word_power_of_two(chunk) ||
+    chunk > 64 ||
+    power(2, counter_width) <= chunk)
+  {
+    reason = "modular_chunk_power";
+    return false;
+  }
+
+  std::size_t initializations = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != loop_head; ++instruction)
+  {
+    if(parse_zero_initialization(*instruction, induction))
+      ++initializations;
+    else if(
+      instruction->is_assign() || instruction->is_function_call() ||
+      instruction->is_goto() || instruction->is_assume() ||
+      instruction->is_assert() || instruction->is_start_thread() ||
+      instruction->is_atomic_begin() || instruction->is_atomic_end())
+    {
+      reason = "modular_prefix_effect";
+      return false;
+    }
+  }
+  if(initializations != 1)
+  {
+    reason = "modular_induction_initialization";
+    return false;
+  }
+
+  std::vector<goto_programt::const_targett> loop_body;
+  for(auto instruction = std::next(loop_head);
+      instruction != backedge; ++instruction)
+  {
+    if(
+      instruction->is_skip() || instruction->is_location() ||
+      instruction->is_decl() || instruction->is_dead())
+      continue;
+    if(instruction->is_goto())
+    {
+      reason = "modular_body_control";
+      return false;
+    }
+    loop_body.push_back(instruction);
+  }
+  if(loop_body.size() != 3 * chunk)
+  {
+    reason = "modular_body_word";
+    return false;
+  }
+
+  std::vector<transition_word_stept> steps;
+  for(std::size_t index = 0; index < loop_body.size(); index += 3)
+  {
+    transition_word_stept step;
+    if(
+      !transition_word_parse_step(
+        loop_body[index],
+        loop_body[index + 1],
+        loop_body[index + 2],
+        state,
+        induction,
+        model,
+        ns,
+        step,
+        reason))
+      return false;
+    steps.push_back(std::move(step));
+  }
+
+  std::vector<goto_programt::const_targett> suffix;
+  for(auto instruction = std::next(backedge);
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(
+      instruction->is_skip() || instruction->is_location() ||
+      instruction->is_decl() || instruction->is_dead() ||
+      instruction->is_set_return_value() ||
+      instruction->is_end_function())
+      continue;
+    suffix.push_back(instruction);
+  }
+  if(suffix.size() != 4 * (chunk - 1))
+  {
+    reason = "modular_tail_size";
+    return false;
+  }
+  if(loop_head->get_target() != suffix.front())
+  {
+    reason = "modular_loop_exit_target";
+    return false;
+  }
+  for(std::size_t tail = 0; tail < chunk - 1; ++tail)
+  {
+    const std::size_t offset = 4 * tail;
+    irep_idt tail_induction;
+    exprt tail_bound;
+    if(
+      !parse_exit_guard(
+        *suffix[offset], tail_induction, tail_bound) ||
+      tail_induction != induction ||
+      !transition_word_tail_bound(
+        tail_bound,
+        induction_symbol->type,
+        base,
+        chunk - 2 - tail))
+    {
+      reason = "modular_tail_guard";
+      return false;
+    }
+    if(tail + 1 < chunk - 1)
+    {
+      if(suffix[offset]->get_target() != suffix[offset + 4])
+      {
+        reason = "modular_tail_target";
+        return false;
+      }
+    }
+    else
+    {
+      const auto target_position =
+        positions.at(&*suffix[offset]->get_target());
+      const auto last_step_position =
+        positions.at(&*suffix[offset + 3]);
+      if(target_position <= last_step_position)
+      {
+        reason = "modular_tail_target";
+        return false;
+      }
+    }
+    transition_word_stept step;
+    if(
+      !transition_word_parse_step(
+        suffix[offset + 1],
+        suffix[offset + 2],
+        suffix[offset + 3],
+        state,
+        induction,
+        model,
+        ns,
+        step,
+        reason))
+      return false;
+    steps.push_back(std::move(step));
+  }
+
+  for(const auto &instruction : program.instructions)
+  {
+    if(
+      instruction.is_assert() || instruction.is_assume() ||
+      instruction.is_start_thread() || instruction.is_atomic_begin() ||
+      instruction.is_atomic_end())
+    {
+      reason = "modular_worker_effect";
+      return false;
+    }
+    if(!instruction.is_assign())
+      continue;
+    const exprt &lhs = without_cast(instruction.assign_lhs());
+    const symbolt *lhs_symbol = nullptr;
+    if(
+      is_shared_scalar(lhs, ns, lhs_symbol) &&
+      to_symbol_expr(lhs).get_identifier() != state)
+    {
+      reason = "modular_environment_write";
+      return false;
+    }
+    if(
+      lhs.id() == ID_dereference ||
+      (lhs.id() != ID_symbol && lhs.id() != ID_member &&
+       lhs.id() != ID_index))
+    {
+      reason = "modular_indirect_write";
+      return false;
+    }
+  }
+
+  summary.word.worker = worker;
+  summary.word.state = state;
+  summary.word.induction = induction;
+  summary.word.bound = symbol_exprt(base, induction_symbol->type);
+  summary.word.steps = std::move(steps);
+  summary.bound = base;
+  summary.chunk = chunk;
+  return true;
+}
+
+bool transition_word_immutable_bound(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &bound,
+  const typet &counter_type,
+  const goto_programt::targett &first_create,
+  std::string &reason)
+{
+  const symbolt *bound_symbol = nullptr;
+  if(
+    ns.lookup(bound, bound_symbol) ||
+    !bound_symbol->is_static_lifetime ||
+    bound_symbol->type != counter_type)
+  {
+    reason = "modular_bound_type";
+    return false;
+  }
+
+  std::size_t main_initializations = 0;
+  const auto main =
+    model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != model.goto_functions.function_map.end(),
+    "lifecycle collection found main");
+  bool before_create = true;
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != main->second.body.instructions.end(); ++instruction)
+  {
+    if(instruction == first_create)
+      before_create = false;
+    if(
+      contains_address_of_symbol(instruction->code(), {bound}) ||
+      (instruction->has_condition() &&
+       contains_address_of_symbol(instruction->condition(), {bound})))
+    {
+      reason = "modular_bound_alias";
+      return false;
+    }
+    if(!instruction->is_assign())
+      continue;
+    irep_idt target;
+    if(
+      direct_symbol(instruction->assign_lhs(), target) &&
+      target == bound)
+    {
+      if(!before_create)
+      {
+        reason = "modular_late_bound_write";
+        return false;
+      }
+      ++main_initializations;
+    }
+  }
+  if(main_initializations != 1)
+  {
+    reason = "modular_bound_initialization";
+    return false;
+  }
+
+  for(const auto &function_entry : model.goto_functions.function_map)
+  {
+    if(
+      !function_entry.second.body_available() ||
+      function_entry.first == "main" ||
+      function_entry.first == "__CPROVER_initialize")
+      continue;
+    for(const auto &instruction :
+        function_entry.second.body.instructions)
+    {
+      if(
+        contains_address_of_symbol(instruction.code(), {bound}) ||
+        (instruction.has_condition() &&
+         contains_address_of_symbol(instruction.condition(), {bound})))
+      {
+        reason = "modular_bound_alias";
+        return false;
+      }
+      if(!instruction.is_assign())
+        continue;
+      irep_idt target;
+      if(
+        direct_symbol(instruction.assign_lhs(), target) &&
+        target == bound)
+      {
+        reason = "modular_foreign_bound_write";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 bool transition_word_initial_and_accesses(
   const goto_modelt &model,
   const namespacet &ns,
@@ -3975,12 +4439,203 @@ bool transition_word_initial_and_accesses(
   }
   return true;
 }
+
+bool modular_chunk_equivalence_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  std::vector<create_recordt> creates;
+  std::vector<goto_programt::targett> joins;
+  std::string reason;
+  if(
+    !collect_lifecycle(goto_model, ns, creates, joins, reason) ||
+    creates.size() != 2 ||
+    !validate_main_region(goto_model, ns, creates, joins, reason))
+  {
+    std::cout
+      << "NATIVE_MODULAR_CHUNK applied=0 reason="
+      << (reason.empty() ? "modular_lifecycle" : reason) << '\n';
+    return false;
+  }
+
+  irep_idt first;
+  irep_idt second;
+  goto_programt::targett error_call;
+  if(
+    !transition_word_property(
+      goto_model,
+      ns,
+      joins,
+      first,
+      second,
+      error_call,
+      reason))
+  {
+    std::cout
+      << "NATIVE_MODULAR_CHUNK applied=0 reason=" << reason << '\n';
+    return false;
+  }
+
+  transition_word_summaryt reference;
+  modular_chunk_summaryt chunked;
+  bool summarized = false;
+  std::vector<std::string> candidate_reasons;
+  for(std::size_t permutation = 0; permutation < 2; ++permutation)
+  {
+    const irep_idt &reference_state =
+      permutation == 0 ? first : second;
+    const irep_idt &chunked_state =
+      permutation == 0 ? second : first;
+    std::string candidate_reason;
+    transition_word_summaryt candidate_reference;
+    modular_chunk_summaryt candidate_chunked;
+    if(
+      transition_word_worker(
+        creates[permutation].worker,
+        reference_state,
+        goto_model,
+        ns,
+        candidate_reference,
+        candidate_reason) &&
+      modular_chunk_worker(
+        creates[1 - permutation].worker,
+        chunked_state,
+        goto_model,
+        ns,
+        candidate_chunked,
+        candidate_reason))
+    {
+      reference = std::move(candidate_reference);
+      chunked = std::move(candidate_chunked);
+      summarized = true;
+      break;
+    }
+    candidate_reasons.push_back(candidate_reason);
+    reason = candidate_reason;
+  }
+  if(!summarized)
+  {
+    std::cout
+      << "NATIVE_MODULAR_CHUNK applied=0 reason=" << reason;
+    for(std::size_t index = 0; index < candidate_reasons.size(); ++index)
+      std::cout
+        << " attempt" << index << '=' << candidate_reasons[index];
+    std::cout << '\n';
+    return false;
+  }
+
+  std::vector<transition_word_summaryt> summaries{
+    reference, chunked.word};
+  if(
+    !transition_word_initial_and_accesses(
+      goto_model, ns, summaries, first, second, reason))
+  {
+    std::cout
+      << "NATIVE_MODULAR_CHUNK applied=0 reason=" << reason << '\n';
+    return false;
+  }
+  const auto induction_entry =
+    goto_model.symbol_table.symbols.find(reference.induction);
+  const auto chunk_induction_entry =
+    goto_model.symbol_table.symbols.find(chunked.word.induction);
+  if(
+    induction_entry == goto_model.symbol_table.symbols.end() ||
+    chunk_induction_entry == goto_model.symbol_table.symbols.end() ||
+    induction_entry->second.type !=
+      chunk_induction_entry->second.type ||
+    !transition_word_immutable_bound(
+      goto_model,
+      ns,
+      chunked.bound,
+      induction_entry->second.type,
+      creates.front().instruction,
+      reason))
+  {
+    std::cout
+      << "NATIVE_MODULAR_CHUNK applied=0 reason="
+      << (reason.empty() ? "modular_reference_type" : reason) << '\n';
+    return false;
+  }
+  exprt reference_bound = reference.bound;
+  exprt chunk_bound = chunked.word.bound;
+  simplify_expr(reference_bound, ns);
+  simplify_expr(chunk_bound, ns);
+  if(reference_bound != chunk_bound || reference.steps.size() != 1)
+  {
+    std::cout
+      << "NATIVE_MODULAR_CHUNK applied=0 reason=modular_bound_mismatch\n";
+    return false;
+  }
+
+  const auto reference_symbol_entry =
+    goto_model.symbol_table.symbols.find(reference.state);
+  const auto chunked_symbol_entry =
+    goto_model.symbol_table.symbols.find(chunked.word.state);
+  INVARIANT(
+    reference_symbol_entry != goto_model.symbol_table.symbols.end() &&
+    chunked_symbol_entry != goto_model.symbol_table.symbols.end(),
+    "modular summaries use state symbols");
+  if(
+    reference_symbol_entry->second.type !=
+    chunked_symbol_entry->second.type)
+  {
+    std::cout
+      << "NATIVE_MODULAR_CHUNK applied=0 reason=modular_state_type\n";
+    return false;
+  }
+  const symbol_exprt reference_symbol(
+    reference.state, reference_symbol_entry->second.type);
+  const symbol_exprt chunked_symbol(
+    chunked.word.state, chunked_symbol_entry->second.type);
+  exprt reference_guard = reference.steps.front().guard;
+  exprt reference_update = reference.steps.front().update;
+  simplify_expr(reference_guard, ns);
+  simplify_expr(reference_update, ns);
+  for(const auto &step : chunked.word.steps)
+  {
+    const exprt guard = transition_word_normalize(
+      step.guard, chunked_symbol, reference_symbol, ns);
+    const exprt update = transition_word_normalize(
+      step.update, chunked_symbol, reference_symbol, ns);
+    if(guard != reference_guard || update != reference_update)
+    {
+      std::cout
+        << "NATIVE_MODULAR_CHUNK applied=0"
+        << " reason=modular_step_mismatch\n";
+      return false;
+    }
+  }
+
+  auto main =
+    goto_model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != goto_model.goto_functions.function_map.end(),
+    "modular lifecycle found main");
+  for(auto &instruction : main->second.body.instructions)
+  {
+    if(!instruction.is_end_function())
+      instruction.turn_into_skip();
+  }
+  error_call->turn_into_skip();
+  goto_model.goto_functions.update();
+
+  std::cout
+    << "NATIVE_MODULAR_CHUNK applied=1 workers=2 chunk="
+    << chunked.chunk << " state_first=" << first
+    << " state_second=" << second << '\n';
+  (void)message_handler;
+  return true;
+}
 } // namespace
 
 bool transition_word_equivalence_transform(
   goto_modelt &goto_model,
   message_handlert &message_handler)
 {
+  if(modular_chunk_equivalence_transform(goto_model, message_handler))
+    return true;
+
   const namespacet ns(goto_model.symbol_table);
   std::vector<create_recordt> creates;
   std::vector<goto_programt::targett> joins;
