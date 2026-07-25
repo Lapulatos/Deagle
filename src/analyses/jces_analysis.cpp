@@ -11,6 +11,7 @@ Module: Join-Scoped Compositional Effect Summary
 #include <util/arith_tools.h>
 #include <util/bitvector_types.h>
 #include <util/expr_util.h>
+#include <util/find_symbols.h>
 #include <util/message.h>
 #include <util/namespace.h>
 #include <util/pointer_expr.h>
@@ -4627,7 +4628,1072 @@ bool modular_chunk_equivalence_transform(
   (void)message_handler;
   return true;
 }
+
+struct group_action_workert
+{
+  irep_idt worker;
+  irep_idt state;
+  irep_idt induction;
+  exprt bound;
+  irep_idt callee;
+  exprt action;
+  std::vector<exprt> restrictions;
+};
+
+bool group_action_constant_zero(const exprt &src)
+{
+  const exprt &expr = without_cast(src);
+  if(expr.id() != ID_constant)
+    return false;
+  mp_integer value;
+  return !to_integer(to_constant_expr(expr), value) && value == 0;
+}
+
+bool group_action_has_nondeterminism(const exprt &expr)
+{
+  if(expr.id() == ID_side_effect)
+    return true;
+  return std::any_of(
+    expr.operands().begin(),
+    expr.operands().end(),
+    group_action_has_nondeterminism);
+}
+
+bool group_action_parameter_truth(
+  const exprt &src,
+  const irep_idt &parameter)
+{
+  const exprt &expr = without_cast(src);
+  irep_idt identifier;
+  if(direct_symbol(expr, identifier))
+    return identifier == parameter;
+  if(
+    expr.id() != ID_notequal ||
+    expr.operands().size() != 2)
+    return false;
+  return
+    (direct_symbol(expr.op0(), identifier) &&
+     identifier == parameter &&
+     group_action_constant_zero(expr.op1())) ||
+    (direct_symbol(expr.op1(), identifier) &&
+     identifier == parameter &&
+     group_action_constant_zero(expr.op0()));
+}
+
+bool group_action_abort_sink(
+  const irep_idt &callee,
+  const goto_modelt &model)
+{
+  const auto function =
+    model.goto_functions.function_map.find(callee);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+    return false;
+  std::size_t false_assumptions = 0;
+  for(const auto &instruction : function->second.body.instructions)
+  {
+    if(instruction.is_assume())
+    {
+      const exprt &condition = without_cast(instruction.condition());
+      mp_integer left;
+      mp_integer right;
+      const bool false_condition =
+        condition.is_false() ||
+        (condition.id() == ID_notequal &&
+         condition.operands().size() == 2 &&
+         without_cast(condition.op0()).id() == ID_constant &&
+         without_cast(condition.op1()).id() == ID_constant &&
+         !to_integer(to_constant_expr(
+           without_cast(condition.op0())), left) &&
+         !to_integer(to_constant_expr(
+           without_cast(condition.op1())), right) &&
+         left == right);
+      if(false_condition)
+        ++false_assumptions;
+      else
+        return false;
+    }
+    else if(
+      !instruction.is_end_function() &&
+      !instruction.is_skip() &&
+      !instruction.is_location())
+      return false;
+  }
+  return false_assumptions == 1;
+}
+
+bool group_action_assume_semantics(
+  const irep_idt &callee,
+  const goto_modelt &model)
+{
+  if(callee == "__CPROVER_assume")
+    return true;
+  const auto symbol = model.symbol_table.symbols.find(callee);
+  const auto function =
+    model.goto_functions.function_map.find(callee);
+  if(
+    symbol == model.symbol_table.symbols.end() ||
+    symbol->second.type.id() != ID_code ||
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+    return false;
+  const auto &parameters =
+    to_code_type(symbol->second.type).parameters();
+  if(
+    parameters.size() != 1 ||
+    parameters.front().get_identifier().empty())
+    return false;
+  const irep_idt parameter =
+    parameters.front().get_identifier();
+  const goto_programt::instructiont *guard = nullptr;
+  const goto_programt::instructiont *abort_call = nullptr;
+  irep_idt abort_callee;
+  for(const auto &instruction : function->second.body.instructions)
+  {
+    if(instruction.is_goto())
+    {
+      if(
+        guard != nullptr ||
+        instruction.targets.size() != 1 ||
+        !group_action_parameter_truth(
+          instruction.condition(), parameter))
+        return false;
+      guard = &instruction;
+      continue;
+    }
+    if(instruction.is_function_call())
+    {
+      if(
+        abort_call != nullptr ||
+        !direct_call_identifier(instruction, abort_callee) ||
+        abort_callee != "abort")
+        return false;
+      abort_call = &instruction;
+      continue;
+    }
+    if(
+      !instruction.is_end_function() &&
+      !instruction.is_skip() &&
+      !instruction.is_location())
+      return false;
+  }
+  return
+    guard != nullptr && abort_call != nullptr &&
+    guard->get_target()->location_number >
+      abort_call->location_number &&
+    guard->location_number < abort_call->location_number &&
+    group_action_abort_sink(abort_callee, model);
+}
+
+bool group_action_property(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const std::vector<goto_programt::targett> &joins,
+  irep_idt &state,
+  std::string &reason)
+{
+  const auto main = model.goto_functions.function_map.find("main");
+  if(
+    main == model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+  {
+    reason = "group_missing_main";
+    return false;
+  }
+  std::vector<goto_programt::const_targett> calls;
+  bool after_join = false;
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != main->second.body.instructions.end(); ++instruction)
+  {
+    if(instruction == joins.back())
+    {
+      after_join = true;
+      continue;
+    }
+    if(!after_join)
+      continue;
+    if(instruction->is_function_call())
+      calls.push_back(instruction);
+    else if(
+      instruction->is_assign() || instruction->is_goto() ||
+      instruction->is_assume() || instruction->is_assert() ||
+      instruction->is_start_thread() || instruction->is_end_thread() ||
+      instruction->is_atomic_begin() || instruction->is_atomic_end())
+    {
+      reason = "group_post_join_effect";
+      return false;
+    }
+  }
+  if(calls.size() != 2)
+  {
+    reason = "group_property_calls";
+    return false;
+  }
+  irep_idt restriction;
+  irep_idt error;
+  if(
+    !direct_call_identifier(*calls[0], restriction) ||
+    calls[0]->call_arguments().size() != 1 ||
+    !group_action_assume_semantics(restriction, model) ||
+    !direct_call_identifier(*calls[1], error) ||
+    !calls[1]->call_arguments().empty() ||
+    !transition_word_error_function(error, model))
+  {
+    reason = "group_property_shape";
+    return false;
+  }
+  const exprt &bad =
+    without_cast(calls[0]->call_arguments().front());
+  if(
+    bad.id() != ID_notequal || bad.operands().size() != 2)
+  {
+    reason = "group_property_relation";
+    return false;
+  }
+  irep_idt candidate;
+  if(
+    direct_symbol(bad.op0(), candidate) &&
+    group_action_constant_zero(bad.op1()))
+    state = candidate;
+  else if(
+    direct_symbol(bad.op1(), candidate) &&
+    group_action_constant_zero(bad.op0()))
+    state = candidate;
+  else
+  {
+    reason = "group_property_identity";
+    return false;
+  }
+  const symbolt *symbol = nullptr;
+  if(
+    ns.lookup(state, symbol) ||
+    !symbol->is_static_lifetime ||
+    (symbol->type.id() != ID_signedbv &&
+     symbol->type.id() != ID_unsignedbv))
+  {
+    reason = "group_state_type";
+    return false;
+  }
+  std::size_t assertions = 0;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+      assertions += instruction.is_assert();
+  }
+  if(assertions != 1)
+  {
+    reason = "group_property_count";
+    return false;
+  }
+  return true;
+}
+
+bool group_action_loop(
+  const irep_idt &worker,
+  const goto_modelt &model,
+  group_action_workert &summary,
+  std::vector<goto_programt::const_targett> &body,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(worker);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "group_missing_worker";
+    return false;
+  }
+  const auto &program = function->second.body;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : program.instructions)
+    positions.emplace(&instruction, position++);
+
+  auto backedge = program.instructions.end();
+  auto loop_head = program.instructions.end();
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(!instruction->is_goto())
+      continue;
+    if(instruction->targets.size() != 1)
+    {
+      reason = "group_multi_target";
+      return false;
+    }
+    if(
+      positions.at(&*instruction->get_target()) <
+      positions.at(&*instruction))
+    {
+      if(
+        !instruction->condition().is_true() ||
+        backedge != program.instructions.end())
+      {
+        reason = "group_backedge";
+        return false;
+      }
+      backedge = instruction;
+      loop_head = instruction->get_target();
+    }
+  }
+  if(backedge == program.instructions.end())
+  {
+    reason = "group_no_loop";
+    return false;
+  }
+  if(!parse_exit_guard(
+       *loop_head, summary.induction, summary.bound))
+  {
+    reason = "group_loop_guard";
+    return false;
+  }
+  const symbolt *induction_symbol =
+    model.symbol_table.lookup(summary.induction);
+  if(
+    induction_symbol == nullptr ||
+    (induction_symbol->type.id() != ID_signedbv &&
+     induction_symbol->type.id() != ID_unsignedbv))
+  {
+    reason = "group_induction_type";
+    return false;
+  }
+  std::size_t initializations = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != loop_head; ++instruction)
+  {
+    if(parse_zero_initialization(*instruction, summary.induction))
+      ++initializations;
+    else if(instruction->is_assign())
+    {
+      irep_idt assigned;
+      if(
+        direct_symbol(instruction->assign_lhs(), assigned) &&
+        assigned == summary.induction)
+      {
+        reason = "group_induction_initialization";
+        return false;
+      }
+    }
+  }
+  if(initializations != 1)
+  {
+    reason = "group_induction_initialization";
+    return false;
+  }
+
+  std::size_t increments = 0;
+  for(auto instruction = std::next(loop_head);
+      instruction != backedge; ++instruction)
+  {
+    if(
+      instruction->is_skip() || instruction->is_location() ||
+      instruction->is_decl() || instruction->is_dead())
+      continue;
+    irep_idt incremented;
+    if(
+      parse_unit_increment(*instruction, incremented) &&
+      incremented == summary.induction)
+    {
+      ++increments;
+      continue;
+    }
+    if(instruction->is_goto())
+    {
+      reason = "group_body_control";
+      return false;
+    }
+    body.push_back(instruction);
+  }
+  if(increments != 1)
+  {
+    reason = "group_induction_increment";
+    return false;
+  }
+  for(const auto &instruction : program.instructions)
+  {
+    if(
+      instruction.is_assert() || instruction.is_assume() ||
+      instruction.is_start_thread() || instruction.is_end_thread())
+    {
+      reason = "group_worker_effect";
+      return false;
+    }
+  }
+  summary.worker = worker;
+  return true;
+}
+
+bool group_action_exact_atomic_body(
+  const std::vector<goto_programt::const_targett> &body,
+  std::vector<goto_programt::const_targett> &inside,
+  std::string &reason)
+{
+  std::size_t depth = 0;
+  std::size_t regions = 0;
+  for(const auto &instruction : body)
+  {
+    if(instruction->is_atomic_begin())
+    {
+      if(depth != 0)
+      {
+        reason = "group_nested_atomic";
+        return false;
+      }
+      ++depth;
+      ++regions;
+      continue;
+    }
+    if(instruction->is_atomic_end())
+    {
+      if(depth != 1)
+      {
+        reason = "group_atomic_balance";
+        return false;
+      }
+      --depth;
+      continue;
+    }
+    if(depth != 1)
+    {
+      reason = "group_nonatomic_action";
+      return false;
+    }
+    inside.push_back(instruction);
+  }
+  if(depth != 0 || regions != 1 || inside.empty())
+  {
+    reason = "group_atomic_shape";
+    return false;
+  }
+  return true;
+}
+
+bool group_action_pure_arithmetic_helper(
+  const irep_idt &callee,
+  const irep_idt &operation,
+  const goto_modelt &model,
+  const namespacet &ns)
+{
+  const auto function =
+    model.goto_functions.function_map.find(callee);
+  const auto symbol = model.symbol_table.symbols.find(callee);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available() ||
+    symbol == model.symbol_table.symbols.end() ||
+    symbol->second.type.id() != ID_code)
+    return false;
+  const auto &parameters =
+    to_code_type(symbol->second.type).parameters();
+  if(parameters.size() != 2)
+    return false;
+  std::size_t returns = 0;
+  for(const auto &instruction : function->second.body.instructions)
+  {
+    if(instruction.is_set_return_value())
+    {
+      const exprt &value =
+        without_cast(instruction.return_value());
+      if(
+        value.id() != operation ||
+        value.operands().size() != 2)
+        return false;
+      irep_idt first;
+      irep_idt second;
+      if(
+        !direct_symbol(value.op0(), first) ||
+        !direct_symbol(value.op1(), second) ||
+        first != parameters[0].get_identifier() ||
+        second != parameters[1].get_identifier())
+        return false;
+      ++returns;
+    }
+    else if(instruction.is_function_call())
+    {
+      irep_idt restriction;
+      if(
+        !direct_call_identifier(instruction, restriction) ||
+        !is_restricting_helper(restriction, model, ns))
+        return false;
+    }
+    else if(
+      instruction.is_assign() || instruction.is_assert() ||
+      instruction.is_assume() || instruction.is_start_thread() ||
+      instruction.is_atomic_begin() || instruction.is_atomic_end())
+      return false;
+  }
+  return returns == 1;
+}
+
+bool group_action_additive_worker(
+  const irep_idt &worker,
+  const irep_idt &state,
+  const goto_modelt &model,
+  const namespacet &ns,
+  group_action_workert &summary,
+  bool &subtract,
+  std::string &reason)
+{
+  std::vector<goto_programt::const_targett> body;
+  if(!group_action_loop(
+       worker, model, summary, body, reason))
+    return false;
+  std::vector<goto_programt::const_targett> inside;
+  if(!group_action_exact_atomic_body(body, inside, reason))
+    return false;
+  if(inside.size() != 1 || !inside.front()->is_function_call())
+  {
+    reason = "group_additive_action_count";
+    return false;
+  }
+  const auto &call = *inside.front();
+  irep_idt target;
+  if(
+    !direct_symbol(call.call_lhs(), target) ||
+    target != state ||
+    call.call_arguments().size() != 2 ||
+    !direct_symbol(call.call_arguments()[0], target) ||
+    target != state ||
+    !direct_call_identifier(call, summary.callee))
+  {
+    reason = "group_additive_action";
+    return false;
+  }
+  const bool plus =
+    group_action_pure_arithmetic_helper(
+      summary.callee, ID_plus, model, ns);
+  const bool minus =
+    group_action_pure_arithmetic_helper(
+      summary.callee, ID_minus, model, ns);
+  if(plus == minus)
+  {
+    reason = "group_additive_helper";
+    return false;
+  }
+  subtract = minus;
+  summary.state = state;
+  summary.action = call.call_arguments()[1];
+  return true;
+}
+
+bool group_action_array_application(
+  const exprt &src,
+  const irep_idt &argument,
+  irep_idt &array)
+{
+  const exprt &expr = without_cast(src);
+  if(expr.id() != ID_dereference || expr.operands().size() != 1)
+    return false;
+  const exprt &address = without_cast(expr.op0());
+  if(
+    address.id() != ID_plus ||
+    address.operands().size() != 2)
+    return false;
+  irep_idt index;
+  return
+    direct_symbol(address.op0(), array) &&
+    direct_symbol(address.op1(), index) &&
+    index == argument;
+}
+
+bool group_action_inverse_law(
+  const exprt &src,
+  const irep_idt &state,
+  const irep_idt &outer,
+  const irep_idt &inner)
+{
+  const exprt &expr = without_cast(src);
+  if(expr.id() != ID_equal || expr.operands().size() != 2)
+    return false;
+  const exprt *application = nullptr;
+  irep_idt identity;
+  if(direct_symbol(expr.op0(), identity) && identity == state)
+    application = &expr.op1();
+  else if(direct_symbol(expr.op1(), identity) && identity == state)
+    application = &expr.op0();
+  else
+    return false;
+  irep_idt outer_array;
+  const exprt &outer_expr = without_cast(*application);
+  if(
+    outer_expr.id() != ID_dereference ||
+    outer_expr.operands().size() != 1)
+    return false;
+  const exprt &outer_address = without_cast(outer_expr.op0());
+  if(
+    outer_address.id() != ID_plus ||
+    outer_address.operands().size() != 2 ||
+    !direct_symbol(outer_address.op0(), outer_array) ||
+    outer_array != outer)
+    return false;
+  irep_idt inner_array;
+  return group_action_array_application(
+    outer_address.op1(), state, inner_array) &&
+    inner_array == inner;
+}
+
+bool group_action_inverse_worker(
+  const irep_idt &worker,
+  const irep_idt &state,
+  const goto_modelt &model,
+  const namespacet &ns,
+  group_action_workert &summary,
+  irep_idt &array,
+  std::string &reason)
+{
+  std::vector<goto_programt::const_targett> body;
+  if(!group_action_loop(
+       worker, model, summary, body, reason))
+    return false;
+  std::vector<goto_programt::const_targett> inside;
+  if(!group_action_exact_atomic_body(body, inside, reason))
+    return false;
+  std::size_t assignments = 0;
+  for(const auto &instruction : inside)
+  {
+    if(instruction->is_function_call())
+    {
+      irep_idt restriction;
+      if(
+        !instruction->call_lhs().is_nil() ||
+        !direct_call_identifier(*instruction, restriction) ||
+        instruction->call_arguments().size() != 1 ||
+        !group_action_assume_semantics(restriction, model))
+      {
+        reason = "group_inverse_restriction";
+        return false;
+      }
+      summary.restrictions.push_back(
+        instruction->call_arguments().front());
+      continue;
+    }
+    if(!instruction->is_assign())
+    {
+      reason = "group_inverse_instruction";
+      return false;
+    }
+    irep_idt target;
+    if(
+      !direct_symbol(instruction->assign_lhs(), target) ||
+      target != state ||
+      !group_action_array_application(
+        instruction->assign_rhs(), state, array))
+    {
+      reason = "group_inverse_action";
+      return false;
+    }
+    summary.action = instruction->assign_rhs();
+    ++assignments;
+  }
+  if(assignments != 1)
+  {
+    reason = "group_inverse_action_count";
+    return false;
+  }
+  summary.state = state;
+  return true;
+}
+
+void group_action_replace_symbol(
+  exprt &expr,
+  const irep_idt &from,
+  const irep_idt &to,
+  const goto_modelt &model)
+{
+  const auto source = model.symbol_table.symbols.find(from);
+  const auto target = model.symbol_table.symbols.find(to);
+  if(
+    source == model.symbol_table.symbols.end() ||
+    target == model.symbol_table.symbols.end())
+    return;
+  replace_expr(
+    symbol_exprt(from, source->second.type),
+    symbol_exprt(to, target->second.type),
+    expr);
+}
+
+bool group_action_no_unmodelled_writes(
+  const goto_modelt &model,
+  const std::set<irep_idt> &workers,
+  const irep_idt &state,
+  const std::set<irep_idt> &read_only,
+  std::string &reason)
+{
+  std::set<irep_idt> protected_symbols = read_only;
+  protected_symbols.insert(state);
+  std::map<irep_idt, std::size_t> worker_state_writes;
+  for(const auto &worker : workers)
+    worker_state_writes.emplace(worker, 0);
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(
+        contains_address_of_symbol(
+          instruction.code(), protected_symbols) ||
+        (instruction.has_condition() &&
+         contains_address_of_symbol(
+           instruction.condition(), protected_symbols)))
+      {
+        reason = "group_address_escape";
+        return false;
+      }
+      irep_idt written;
+      bool writes = false;
+      if(instruction.is_assign())
+      {
+        const exprt &lhs = without_cast(instruction.assign_lhs());
+        if(
+          (lhs.id() == ID_dereference || lhs.id() == ID_index) &&
+          workers.count(entry.first) != 0)
+        {
+          reason = "group_pointer_write";
+          return false;
+        }
+        writes = direct_symbol(lhs, written);
+      }
+      else if(
+        instruction.is_function_call() &&
+        !instruction.call_lhs().is_nil())
+        writes = direct_symbol(instruction.call_lhs(), written);
+      if(!writes)
+        continue;
+      if(
+        written == state &&
+        workers.count(entry.first) != 0)
+        ++worker_state_writes[entry.first];
+      if(
+        read_only.count(written) != 0 &&
+        entry.first != "main" &&
+        entry.first != "__CPROVER_initialize")
+      {
+        reason = "group_input_write";
+        return false;
+      }
+      if(
+        written == state &&
+        workers.count(entry.first) == 0 &&
+        entry.first != "main" &&
+        entry.first != "__CPROVER_initialize")
+      {
+        reason = "group_foreign_state_write";
+        return false;
+      }
+    }
+  }
+  for(const auto &entry : worker_state_writes)
+  {
+    if(entry.second != 1)
+    {
+      reason = "group_state_write_count";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool group_action_identity_initialization(
+  const goto_modelt &model,
+  const irep_idt &state,
+  std::string &reason)
+{
+  std::vector<exprt> main_values;
+  const auto main = model.goto_functions.function_map.find("main");
+  if(
+    main == model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+  {
+    reason = "group_missing_main";
+    return false;
+  }
+  bool create_seen = false;
+  for(const auto &instruction : main->second.body.instructions)
+  {
+    irep_idt callee;
+    if(
+      direct_call_identifier(instruction, callee) &&
+      callee == "pthread_create")
+      create_seen = true;
+    irep_idt target;
+    if(
+      instruction.is_assign() &&
+      direct_symbol(instruction.assign_lhs(), target) &&
+      target == state)
+    {
+      if(create_seen)
+      {
+        reason = "group_late_state_write";
+        return false;
+      }
+      main_values.push_back(instruction.assign_rhs());
+    }
+    else if(
+      instruction.is_function_call() &&
+      !instruction.call_lhs().is_nil() &&
+      direct_symbol(instruction.call_lhs(), target) &&
+      target == state)
+    {
+      reason = "group_call_identity_write";
+      return false;
+    }
+  }
+  if(!main_values.empty())
+  {
+    if(
+      main_values.size() != 1 ||
+      !group_action_constant_zero(main_values.front()))
+    {
+      reason = "group_explicit_identity";
+      return false;
+    }
+    return true;
+  }
+  const auto initializer =
+    model.goto_functions.function_map.find("__CPROVER_initialize");
+  std::vector<exprt> values;
+  if(
+    initializer != model.goto_functions.function_map.end() &&
+    initializer->second.body_available())
+  {
+    for(const auto &instruction :
+        initializer->second.body.instructions)
+    {
+      irep_idt target;
+      if(
+        instruction.is_assign() &&
+        direct_symbol(instruction.assign_lhs(), target) &&
+        target == state)
+        values.push_back(instruction.assign_rhs());
+    }
+  }
+  if(
+    values.size() != 1 ||
+    !group_action_constant_zero(values.front()))
+  {
+    reason = "group_static_identity";
+    return false;
+  }
+  return true;
+}
+
+bool group_action_cancellation_audit_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &mode,
+  std::string &reason)
+{
+  goto_modelt &mutable_model = const_cast<goto_modelt &>(model);
+  std::vector<create_recordt> creates;
+  std::vector<goto_programt::targett> joins;
+  if(
+    !collect_lifecycle(
+      mutable_model, ns, creates, joins, reason) ||
+    creates.size() != 2 ||
+    !validate_main_region(
+      mutable_model, ns, creates, joins, reason))
+  {
+    if(reason.empty())
+      reason = "group_lifecycle";
+    return false;
+  }
+  irep_idt state;
+  if(!group_action_property(model, ns, joins, state, reason))
+    return false;
+  if(!group_action_identity_initialization(model, state, reason))
+    return false;
+
+  group_action_workert additive[2];
+  bool subtract[2] = {false, false};
+  std::string additive_reason;
+  if(
+    group_action_additive_worker(
+      creates[0].worker,
+      state,
+      model,
+      ns,
+      additive[0],
+      subtract[0],
+      additive_reason) &&
+    group_action_additive_worker(
+      creates[1].worker,
+      state,
+      model,
+      ns,
+      additive[1],
+      subtract[1],
+      additive_reason))
+  {
+    exprt right_bound = additive[1].bound;
+    exprt right_action = additive[1].action;
+    group_action_replace_symbol(
+      right_bound,
+      additive[1].induction,
+      additive[0].induction,
+      model);
+    group_action_replace_symbol(
+      right_action,
+      additive[1].induction,
+      additive[0].induction,
+      model);
+    simplify_expr(right_bound, ns);
+    simplify_expr(right_action, ns);
+    exprt left_bound = additive[0].bound;
+    exprt left_action = additive[0].action;
+    simplify_expr(left_bound, ns);
+    simplify_expr(left_action, ns);
+    find_symbols_sett found_symbols;
+    find_symbols(left_bound, found_symbols);
+    find_symbols(left_action, found_symbols);
+    std::set<irep_idt> read_only(
+      found_symbols.begin(), found_symbols.end());
+    read_only.erase(additive[0].induction);
+    if(
+      subtract[0] != subtract[1] &&
+      left_bound == right_bound &&
+      left_action == right_action &&
+      read_only.count(state) == 0 &&
+      !contains_side_effect(left_bound) &&
+      !group_action_has_nondeterminism(left_action) &&
+      group_action_no_unmodelled_writes(
+        model,
+        {creates[0].worker, creates[1].worker},
+        state,
+        read_only,
+        reason))
+    {
+      mode = "indexed-additive-inverse";
+      return true;
+    }
+    if(reason.empty())
+      reason = "group_additive_mismatch";
+  }
+
+  group_action_workert inverse[2];
+  irep_idt arrays[2];
+  std::string inverse_reason;
+  if(
+    group_action_inverse_worker(
+      creates[0].worker,
+      state,
+      model,
+      ns,
+      inverse[0],
+      arrays[0],
+      inverse_reason) &&
+    group_action_inverse_worker(
+      creates[1].worker,
+      state,
+      model,
+      ns,
+      inverse[1],
+      arrays[1],
+      inverse_reason))
+  {
+    exprt right_bound = inverse[1].bound;
+    group_action_replace_symbol(
+      right_bound,
+      inverse[1].induction,
+      inverse[0].induction,
+      model);
+    simplify_expr(right_bound, ns);
+    exprt left_bound = inverse[0].bound;
+    simplify_expr(left_bound, ns);
+    const bool first_law = std::any_of(
+      inverse[0].restrictions.begin(),
+      inverse[0].restrictions.end(),
+      [&](const exprt &restriction) {
+        return group_action_inverse_law(
+          restriction, state, arrays[1], arrays[0]);
+      });
+    const bool second_law = std::any_of(
+      inverse[1].restrictions.begin(),
+      inverse[1].restrictions.end(),
+      [&](const exprt &restriction) {
+        return group_action_inverse_law(
+          restriction, state, arrays[0], arrays[1]);
+      });
+    find_symbols_sett bound_symbols;
+    find_symbols(left_bound, bound_symbols);
+    std::set<irep_idt> inverse_read_only(
+      bound_symbols.begin(), bound_symbols.end());
+    inverse_read_only.insert(arrays[0]);
+    inverse_read_only.insert(arrays[1]);
+    if(
+      arrays[0] != arrays[1] &&
+      left_bound == right_bound &&
+      inverse_read_only.count(state) == 0 &&
+      !contains_side_effect(left_bound) &&
+      first_law && second_law &&
+      group_action_no_unmodelled_writes(
+        model,
+        {creates[0].worker, creates[1].worker},
+        state,
+        inverse_read_only,
+        reason))
+    {
+      mode = "single-generator-inverse";
+      return true;
+    }
+    if(reason.empty())
+      reason = "group_inverse_mismatch";
+  }
+  if(reason.empty())
+    reason =
+      "additive_" + additive_reason +
+      "_inverse_" + inverse_reason;
+  return false;
+}
 } // namespace
+
+void group_action_cancellation_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  const namespacet ns(goto_model.symbol_table);
+  std::string mode;
+  std::string reason;
+  const bool candidate =
+    group_action_cancellation_audit_impl(
+      goto_model, ns, mode, reason);
+  std::cout
+    << "NATIVE_GROUP_ACTION_CANCELLATION_AUDIT candidate="
+    << (candidate ? 1 : 0);
+  if(candidate)
+    std::cout << " mode=" << mode;
+  else
+    std::cout << " reason=" << reason;
+  std::cout << '\n';
+}
+
+bool group_action_cancellation_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  const namespacet ns(goto_model.symbol_table);
+  std::string mode;
+  std::string reason;
+  if(
+    group_action_cancellation_audit_impl(
+      goto_model, ns, mode, reason))
+  {
+    std::cout
+      << "NATIVE_GROUP_ACTION_CANCELLATION applied=1 mode="
+      << mode << '\n';
+    return true;
+  }
+  std::cout
+    << "NATIVE_GROUP_ACTION_CANCELLATION applied=0 reason="
+    << reason << '\n';
+  return false;
+}
 
 bool transition_word_equivalence_transform(
   goto_modelt &goto_model,

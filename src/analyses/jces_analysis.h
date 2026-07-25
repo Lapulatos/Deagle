@@ -10,6 +10,18 @@ Module: Join-Scoped Compositional Effect Summary
 class goto_modelt;
 class message_handlert;
 
+/// Audit whether fully joined atomic worker loops form inverse group actions
+/// whose combined word restores one shared state to its identity.
+void group_action_cancellation_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// Prove that fully joined atomic worker loops contribute inverse group
+/// actions and therefore restore one shared state to its identity.
+bool group_action_cancellation_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 /// Prove equality of two fully joined workers whose loop bodies spell the
 /// same guarded transition word at different unrolling factors. Unsupported
 /// programs are unchanged and return false.

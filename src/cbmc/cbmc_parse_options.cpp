@@ -548,6 +548,20 @@ int cbmc_parse_optionst::doit()
   if(get_goto_program_ret!=-1)
     return get_goto_program_ret;
 
+  if(cmdline.isset("native-group-action-cancellation-audit"))
+    group_action_cancellation_audit(
+      goto_model, ui_message_handler);
+
+  if(
+    cmdline.isset("native-jces") &&
+    !cmdline.isset("unwind-suggest") &&
+    group_action_cancellation_proof(
+      goto_model, ui_message_handler))
+  {
+    std::cout << "VERIFICATION SUCCESSFUL\n";
+    return CPROVER_EXIT_SUCCESS;
+  }
+
   if(cmdline.isset("native-prefix-affine-envelope"))
     prefix_affine_envelope_transform(goto_model, ui_message_handler);
 
