@@ -616,30 +616,43 @@ elif is_onlystatic:
     result = get_result()
 elif force_experiment_direct:
     if shallow_counterexample_prepass:
-        print("Trying a counterexample-only shallow prepass (bound 3, 2 s)!")
-        prepass_args = (
-            [deagle_exe_path, program_path]
-            + shlex.split(flags)
-            + ["--unwind", "3"]
-        )
-        try:
-            with open("deagle_tmp_output", "w") as prepass_output:
-                subprocess.run(
-                    prepass_args,
-                    stdout=prepass_output,
-                    stderr=subprocess.STDOUT,
-                    timeout=2,
-                    check=False,
+        for shallow_bound in (1, 3):
+            print(
+                "Trying a counterexample-only shallow prepass "
+                "(bound %d, 2 s)!" % shallow_bound
+            )
+            prepass_args = (
+                [deagle_exe_path, program_path]
+                + shlex.split(flags)
+                + ["--unwind", str(shallow_bound)]
+            )
+            try:
+                with open("deagle_tmp_output", "w") as prepass_output:
+                    subprocess.run(
+                        prepass_args,
+                        stdout=prepass_output,
+                        stderr=subprocess.STDOUT,
+                        timeout=2,
+                        check=False,
+                    )
+            except subprocess.TimeoutExpired:
+                print(
+                    "Bound-%d shallow prepass timed out; "
+                    "trying the next stage." % shallow_bound
                 )
-        except subprocess.TimeoutExpired:
-            print("Shallow prepass timed out; falling back to original Deagle.")
 
-        prepass_result = inspect_result("deagle_tmp_output")
-        if prepass_result == "FAILURE":
-            print("Shallow prepass found a property violation.")
-            result = get_result()
-        else:
-            print("Shallow prepass found no accepted violation; falling back.")
+            prepass_result = inspect_result("deagle_tmp_output")
+            if prepass_result == "FAILURE":
+                print(
+                    "Bound-%d shallow prepass found a property violation."
+                    % shallow_bound
+                )
+                result = get_result()
+                break
+            print(
+                "Bound-%d shallow prepass found no accepted violation."
+                % shallow_bound
+            )
             os.remove("deagle_tmp_output")
 
     if shallow_counterexample_prepass and 'result' in locals():
