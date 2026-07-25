@@ -9,6 +9,7 @@ Module: Join-Scoped Compositional Effect Summary
 #include <goto-programs/goto_model.h>
 
 #include <util/arith_tools.h>
+#include <util/bitvector_expr.h>
 #include <util/bitvector_types.h>
 #include <util/expr_util.h>
 #include <util/find_symbols.h>
@@ -7189,7 +7190,487 @@ bool event_free_local_counting_loop(
     last_semantic != program.instructions.end() &&
     parse_zero_initialization(*last_semantic, induction);
 }
+
+struct homogeneous_spawn_witnesst
+{
+  irep_idt induction;
+  exprt bound;
+  irep_idt worker;
+  irep_idt shared;
+  mp_integer increment;
+  const goto_programt::instructiont *create_instruction = nullptr;
+};
+
+bool homogeneous_spawn_stable_bound(
+  const exprt &bound,
+  const goto_modelt &model,
+  const namespacet &ns,
+  goto_programt::const_targett loop_head,
+  std::string &reason)
+{
+  std::set<irep_idt> symbols;
+  std::vector<const exprt *> pending{&bound};
+  while(!pending.empty())
+  {
+    const exprt &current = *pending.back();
+    pending.pop_back();
+    if(
+      current.id() == ID_side_effect ||
+      current.id() == ID_dereference ||
+      current.id() == ID_address_of)
+    {
+      reason = "spawn_bound_expression";
+      return false;
+    }
+    if(current.id() == ID_symbol)
+    {
+      const auto identifier =
+        to_symbol_expr(current).get_identifier();
+      const symbolt *symbol = nullptr;
+      if(
+        ns.lookup(identifier, symbol) || symbol->is_type ||
+        (symbol->type.id() != ID_signedbv &&
+         symbol->type.id() != ID_unsignedbv) ||
+        symbol->type.get_bool(ID_C_volatile))
+      {
+        reason = "spawn_bound_type";
+        return false;
+      }
+      symbols.insert(identifier);
+    }
+    for(const auto &operand : current.operands())
+      pending.push_back(&operand);
+  }
+  const auto main =
+    model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != model.goto_functions.function_map.end(),
+    "spawn stable bound has main");
+  bool after_head = false;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    if(entry.first == "main")
+      after_head = false;
+    for(auto instruction = entry.second.body.instructions.begin();
+        instruction != entry.second.body.instructions.end(); ++instruction)
+    {
+      if(entry.first == "main" && instruction == loop_head)
+        after_head = true;
+      if(
+        contains_address_of_symbol(
+          instruction->code(), symbols) ||
+        (instruction->has_condition() &&
+         contains_address_of_symbol(
+           instruction->condition(), symbols)))
+      {
+        reason = "spawn_bound_escape";
+        return false;
+      }
+      irep_idt written;
+      const bool writes =
+        (instruction->is_assign() &&
+         direct_symbol(instruction->assign_lhs(), written)) ||
+        (instruction->is_function_call() &&
+         !instruction->call_lhs().is_nil() &&
+         direct_symbol(instruction->call_lhs(), written));
+      if(
+        writes && symbols.count(written) != 0 &&
+        entry.first != "__CPROVER_initialize" &&
+        (entry.first != "main" || after_head))
+      {
+        reason = "spawn_bound_late_write";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool homogeneous_spawn_worker_effect(
+  const irep_idt &worker,
+  const goto_modelt &model,
+  const namespacet &ns,
+  irep_idt &shared,
+  mp_integer &increment,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(worker);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "spawn_missing_worker";
+    return false;
+  }
+  std::vector<goto_programt::const_targett> semantic;
+  for(auto instruction = function->second.body.instructions.begin();
+      instruction != function->second.body.instructions.end(); ++instruction)
+  {
+    if(
+      instruction->is_skip() || instruction->is_location() ||
+      instruction->is_decl() || instruction->is_dead() ||
+      instruction->is_set_return_value() ||
+      instruction->is_end_function())
+      continue;
+    semantic.push_back(instruction);
+  }
+  if(semantic.size() != 2 || !semantic[0]->is_assign() ||
+     !semantic[1]->is_assign())
+  {
+    reason =
+      "spawn_worker_instruction_count_" +
+      std::to_string(semantic.size());
+    return false;
+  }
+
+  irep_idt local;
+  if(
+    !direct_symbol(semantic[0]->assign_lhs(), local) ||
+    !direct_symbol(semantic[0]->assign_rhs(), shared) ||
+    local == shared)
+  {
+    reason = "spawn_worker_load";
+    return false;
+  }
+  const symbolt *local_symbol = nullptr;
+  const symbolt *shared_symbol = nullptr;
+  if(
+    ns.lookup(local, local_symbol) ||
+    ns.lookup(shared, shared_symbol) ||
+    local_symbol->is_static_lifetime ||
+    !shared_symbol->is_static_lifetime ||
+    local_symbol->type != shared_symbol->type ||
+    (shared_symbol->type.id() != ID_signedbv &&
+     shared_symbol->type.id() != ID_unsignedbv))
+  {
+    reason = "spawn_worker_state_type";
+    return false;
+  }
+
+  irep_idt lhs;
+  if(
+    !direct_symbol(semantic[1]->assign_lhs(), lhs) ||
+    lhs != shared)
+  {
+    reason = "spawn_worker_store";
+    return false;
+  }
+  const exprt &rhs = without_cast(semantic[1]->assign_rhs());
+  if(rhs.id() != ID_plus || rhs.operands().size() != 2)
+  {
+    reason = "spawn_worker_affine_rhs";
+    return false;
+  }
+  irep_idt state;
+  const exprt *constant = nullptr;
+  if(direct_symbol(rhs.op0(), state) && state == local)
+    constant = &rhs.op1();
+  else if(direct_symbol(rhs.op1(), state) && state == local)
+    constant = &rhs.op0();
+  if(
+    constant == nullptr ||
+    !constant_eval(*constant, {}, increment) ||
+    increment != 1)
+  {
+    reason = "spawn_worker_increment";
+    return false;
+  }
+  return true;
+}
+
+bool homogeneous_spawn_loop(
+  const goto_modelt &model,
+  const namespacet &ns,
+  goto_programt::const_targett backedge,
+  homogeneous_spawn_witnesst &summary,
+  std::string &reason)
+{
+  const auto main =
+    model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != model.goto_functions.function_map.end(),
+    "spawn witness audit has main");
+  const auto &program = main->second.body;
+  if(
+    !backedge->is_goto() || !backedge->condition().is_true() ||
+    backedge->targets.size() != 1)
+  {
+    reason = "spawn_backedge";
+    return false;
+  }
+  const auto head = backedge->get_target();
+  if(!parse_exit_guard(
+       *head, summary.induction, summary.bound))
+  {
+    reason = "spawn_exit_guard";
+    return false;
+  }
+  const symbolt *induction_symbol = nullptr;
+  if(
+    ns.lookup(summary.induction, induction_symbol) ||
+    induction_symbol->is_static_lifetime ||
+    (induction_symbol->type.id() != ID_signedbv &&
+     induction_symbol->type.id() != ID_unsignedbv) ||
+    !homogeneous_spawn_stable_bound(
+      summary.bound, model, ns, head, reason))
+  {
+    if(reason.empty())
+      reason = "spawn_loop_state";
+    return false;
+  }
+
+  std::size_t creates = 0;
+  std::size_t increments = 0;
+  for(auto instruction = head; instruction != std::next(backedge);
+      ++instruction)
+  {
+    if(instruction == head || instruction == backedge)
+      continue;
+    irep_idt incremented;
+    if(
+      parse_unit_increment(*instruction, incremented) &&
+      incremented == summary.induction)
+    {
+      ++increments;
+      continue;
+    }
+    irep_idt callee;
+    if(
+      direct_call_identifier(*instruction, callee) &&
+      callee == "pthread_create" &&
+      instruction->call_arguments().size() == 4 &&
+      addressed_symbol(
+        instruction->call_arguments()[2], summary.worker))
+    {
+      ++creates;
+      summary.create_instruction = &*instruction;
+      continue;
+    }
+    if(
+      instruction->is_skip() || instruction->is_location() ||
+      instruction->is_decl() || instruction->is_dead())
+      continue;
+    reason = "spawn_loop_effect";
+    return false;
+  }
+  if(creates != 1 || increments != 1)
+  {
+    reason = "spawn_loop_counts";
+    return false;
+  }
+
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    bool after_loop = false;
+    for(auto instruction = entry.second.body.instructions.begin();
+        instruction != entry.second.body.instructions.end(); ++instruction)
+    {
+      if(entry.first == "main" && instruction == std::next(backedge))
+        after_loop = true;
+      irep_idt callee;
+      if(
+        direct_call_identifier(*instruction, callee) &&
+        callee == "pthread_create" &&
+        &*instruction != summary.create_instruction &&
+        (entry.first != "main" || !after_loop))
+      {
+        reason = "spawn_preexisting_concurrency";
+        return false;
+      }
+    }
+  }
+
+  auto last_semantic = program.instructions.end();
+  for(auto instruction = program.instructions.begin(); instruction != head;
+      ++instruction)
+  {
+    if(!instruction->is_skip() && !instruction->is_location())
+      last_semantic = instruction;
+  }
+  if(
+    last_semantic == program.instructions.end() ||
+    !parse_zero_initialization(
+      *last_semantic, summary.induction))
+  {
+    reason = "spawn_loop_initialization";
+    return false;
+  }
+  return homogeneous_spawn_worker_effect(
+    summary.worker,
+    model,
+    ns,
+    summary.shared,
+    summary.increment,
+    reason);
+}
 } // namespace
+
+bool homogeneous_spawn_witness_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  if(
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+  {
+    std::cout
+      << "NATIVE_HOMOGENEOUS_SPAWN_AUDIT applicable=0"
+      << " reason=spawn_missing_main\n";
+    return false;
+  }
+  const auto &program = main->second.body;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : program.instructions)
+    positions.emplace(&instruction, position++);
+
+  std::size_t loops = 0;
+  std::vector<std::string> reasons;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(
+      !instruction->is_goto() || !instruction->condition().is_true() ||
+      instruction->targets.size() != 1 ||
+      positions.at(&*instruction->get_target()) >=
+        positions.at(&*instruction))
+      continue;
+    homogeneous_spawn_witnesst summary;
+    std::string reason;
+    if(
+      !homogeneous_spawn_loop(
+        goto_model, ns, instruction, summary, reason))
+    {
+      reasons.push_back(std::move(reason));
+      continue;
+    }
+    ++loops;
+    std::cout
+      << "NATIVE_HOMOGENEOUS_SPAWN_LOOP worker="
+      << summary.worker << " induction=" << summary.induction
+      << " shared=" << summary.shared
+      << " increment=" << summary.increment
+      << " line=" << instruction->source_location().get_line()
+      << '\n';
+  }
+  std::cout
+    << "NATIVE_HOMOGENEOUS_SPAWN_AUDIT applicable="
+    << (loops != 0 ? 1 : 0)
+    << " loops=" << loops;
+  if(loops == 0 && !reasons.empty())
+    std::cout << " last_reason=" << reasons.back();
+  std::cout << '\n';
+  (void)message_handler;
+  return loops != 0;
+}
+
+bool homogeneous_spawn_witness_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  auto main =
+    goto_model.goto_functions.function_map.find("main");
+  if(
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+  {
+    std::cout
+      << "NATIVE_HOMOGENEOUS_SPAWN applied=0"
+      << " reason=spawn_missing_main\n";
+    return false;
+  }
+  auto &program = main->second.body;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : program.instructions)
+    positions.emplace(&instruction, position++);
+
+  std::vector<goto_programt::targett> candidates;
+  std::vector<homogeneous_spawn_witnesst> summaries;
+  std::string last_reason;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(
+      !instruction->is_goto() || !instruction->condition().is_true() ||
+      instruction->targets.size() != 1 ||
+      positions.at(&*instruction->get_target()) >=
+        positions.at(&*instruction))
+      continue;
+    homogeneous_spawn_witnesst summary;
+    std::string reason;
+    if(
+      homogeneous_spawn_loop(
+        goto_model, ns, instruction, summary, reason))
+    {
+      candidates.push_back(instruction);
+      summaries.push_back(std::move(summary));
+    }
+    else
+      last_reason = std::move(reason);
+  }
+  if(candidates.size() != 1)
+  {
+    std::cout
+      << "NATIVE_HOMOGENEOUS_SPAWN applied=0"
+      << " reason="
+      << (candidates.empty() ? last_reason : "spawn_candidate_count")
+      << " candidates=" << candidates.size() << '\n';
+    return false;
+  }
+
+  auto backedge = candidates.front();
+  auto head = backedge->get_target();
+  const auto &summary = summaries.front();
+  const symbolt *induction_symbol = nullptr;
+  const symbolt *shared_symbol = nullptr;
+  INVARIANT(
+    !ns.lookup(summary.induction, induction_symbol) &&
+    !ns.lookup(summary.shared, shared_symbol),
+    "accepted spawn witness symbols exist");
+  exprt count =
+    exact_count(summary.bound, induction_symbol->type);
+  count = cast_if_needed(count, shared_symbol->type);
+  exprt delta = from_integer(
+    summary.increment, shared_symbol->type);
+  exprt contribution =
+    mult_exprt(std::move(count), std::move(delta));
+  symbol_exprt shared(summary.shared, shared_symbol->type);
+  exprt update = plus_exprt(shared, contribution);
+  const auto location = head->source_location();
+  if(shared_symbol->type.id() == ID_signedbv)
+  {
+    program.insert_before(
+      head,
+      goto_programt::make_assumption(
+        not_exprt(plus_overflow_exprt(shared, contribution)),
+        location));
+  }
+  program.insert_before(
+    head,
+    goto_programt::make_assignment(
+      shared, std::move(update), location));
+  for(auto instruction = head; instruction != std::next(backedge);
+      ++instruction)
+    instruction->turn_into_skip();
+  goto_model.goto_functions.update();
+  std::cout
+    << "NATIVE_HOMOGENEOUS_SPAWN applied=1"
+    << " worker=" << summary.worker
+    << " shared=" << summary.shared
+    << " increment=" << summary.increment << '\n';
+  (void)message_handler;
+  return true;
+}
 
 bool local_loop_acceleration_audit(
   const goto_modelt &goto_model,

@@ -564,6 +564,14 @@ int cbmc_parse_optionst::doit()
     local_loop_acceleration_audit(
       goto_model, ui_message_handler);
 
+  if(cmdline.isset("native-homogeneous-spawn-witness-audit"))
+    homogeneous_spawn_witness_audit(
+      goto_model, ui_message_handler);
+
+  if(cmdline.isset("native-homogeneous-spawn-witness"))
+    homogeneous_spawn_witness_transform(
+      goto_model, ui_message_handler);
+
   if(
     cmdline.isset("native-jces") &&
     !cmdline.isset("unwind-suggest") &&

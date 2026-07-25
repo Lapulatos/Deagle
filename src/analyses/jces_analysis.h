@@ -10,6 +10,19 @@ Module: Join-Scoped Compositional Effect Summary
 class goto_modelt;
 class message_handlert;
 
+/// Audit finite homogeneous spawn loops whose worker has one composable
+/// affine scalar effect. This does not mutate the GOTO model.
+bool homogeneous_spawn_witness_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// In a counterexample-only model, replace one finite homogeneous spawn loop
+/// by the exact effect of the legal schedule that runs each worker to
+/// completion immediately after creation. Unsupported models are unchanged.
+bool homogeneous_spawn_witness_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 /// Audit exact acceleration opportunities for event-free thread-local
 /// counting loops. This does not mutate the GOTO model.
 bool local_loop_acceleration_audit(

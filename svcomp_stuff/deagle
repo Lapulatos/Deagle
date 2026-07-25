@@ -626,6 +626,10 @@ elif force_experiment_direct:
                 + shlex.split(flags)
                 + ["--unwind", str(shallow_bound)]
             )
+            if shallow_bound == 1:
+                prepass_args.append(
+                    "--native-homogeneous-spawn-witness"
+                )
             try:
                 with open("deagle_tmp_output", "w") as prepass_output:
                     subprocess.run(
