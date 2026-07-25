@@ -7029,11 +7029,13 @@ struct stream_refine_consumet
 {
   stream_refine_channelt channel;
   irep_idt temporary;
+  bool in_loop;
   unsigned first_location;
   unsigned last_location;
   std::set<const goto_programt::instructiont *> writes;
 
-  stream_refine_consumet() : first_location(0), last_location(0)
+  stream_refine_consumet()
+    : in_loop(false), first_location(0), last_location(0)
   {
   }
 };
@@ -7047,9 +7049,11 @@ struct stream_refine_staget
   irep_idt fold;
   irep_idt account;
   exprt account_delta;
+  exprt transform;
+  bool nonpositive_exit;
   std::set<const goto_programt::instructiont *> writes;
 
-  stream_refine_staget() : forwards(false)
+  stream_refine_staget() : forwards(false), nonpositive_exit(false)
   {
   }
 };
@@ -7186,7 +7190,8 @@ bool stream_refine_publish_region(
     return false;
   }
   if(
-    assumes != 2 || increments != 1 || back.empty() ||
+    (assumes < 1 || assumes > 2) ||
+    increments != 1 || back.empty() ||
     !shared_signed(back, ns))
     return false;
 
@@ -7270,7 +7275,8 @@ bool stream_refine_consume_guard(
 bool stream_refine_consume_region(
   const std::vector<const goto_programt::instructiont *> &region,
   const namespacet &ns,
-  stream_refine_consumet &result)
+  stream_refine_consumet &result,
+  const bool in_loop = false)
 {
   std::vector<exprt> terms;
   std::size_t assumes = 0;
@@ -7354,6 +7360,7 @@ bool stream_refine_consume_region(
   result.channel.front = front;
   result.channel.back = back;
   result.channel.bound = bound;
+  result.in_loop = in_loop;
   result.first_location =
     region.empty() ? 0 : region.front()->location_number;
   result.last_location =
@@ -7398,7 +7405,9 @@ bool stream_refine_transactions(
       stream_refine_consumet consume;
       if(stream_refine_publish_region(region, ns, region_in_loop, publish))
         publishes.push_back(publish);
-      else if(stream_refine_consume_region(region, ns, consume))
+      else if(
+        stream_refine_consume_region(
+          region, ns, consume, region_in_loop))
         consumes.push_back(consume);
       else
       {
@@ -7450,12 +7459,16 @@ bool stream_refine_addition(
 bool stream_refine_sentinel_exit(
   const goto_programt::instructiont &instruction,
   const natural_loopst::natural_loopt &loop,
-  const irep_idt &temporary)
+  const irep_idt &temporary,
+  const bool allow_nonpositive = false)
 {
   if(!instruction.is_goto() || instruction.targets.size() != 1)
     return false;
   const exprt &condition = strip(instruction.condition());
-  if(condition.id() != ID_equal || condition.operands().size() != 2)
+  if(
+    (condition.id() != ID_equal &&
+     (!allow_nonpositive || condition.id() != ID_le)) ||
+    condition.operands().size() != 2)
     return false;
   irep_idt candidate;
   const bool matches =
@@ -7466,12 +7479,93 @@ bool stream_refine_sentinel_exit(
   return matches && !loop.contains(instruction.get_target());
 }
 
+bool stream_refine_affine_form(
+  const exprt &src,
+  const irep_idt &variable,
+  mp_integer &coefficient,
+  mp_integer &constant)
+{
+  const exprt &expr = strip(src);
+  irep_idt identifier;
+  if(symbol_id(expr, identifier))
+  {
+    if(identifier != variable)
+      return false;
+    coefficient = 1;
+    constant = 0;
+    return true;
+  }
+  if(integer_constant(expr, constant))
+  {
+    coefficient = 0;
+    return true;
+  }
+  if(expr.id() == ID_unary_minus && expr.operands().size() == 1)
+  {
+    if(!stream_refine_affine_form(
+         expr.op0(), variable, coefficient, constant))
+      return false;
+    coefficient = -coefficient;
+    constant = -constant;
+    return true;
+  }
+  if(
+    (expr.id() == ID_plus || expr.id() == ID_minus) &&
+    expr.operands().size() == 2)
+  {
+    mp_integer lhs_coefficient;
+    mp_integer lhs_constant;
+    mp_integer rhs_coefficient;
+    mp_integer rhs_constant;
+    if(
+      !stream_refine_affine_form(
+        expr.op0(), variable, lhs_coefficient, lhs_constant) ||
+      !stream_refine_affine_form(
+        expr.op1(), variable, rhs_coefficient, rhs_constant))
+      return false;
+    coefficient =
+      expr.id() == ID_plus ?
+        lhs_coefficient + rhs_coefficient :
+        lhs_coefficient - rhs_coefficient;
+    constant =
+      expr.id() == ID_plus ?
+        lhs_constant + rhs_constant :
+        lhs_constant - rhs_constant;
+    return true;
+  }
+  if(expr.id() == ID_mult && expr.operands().size() == 2)
+  {
+    mp_integer lhs;
+    mp_integer rhs;
+    if(integer_constant(expr.op0(), lhs))
+    {
+      if(!stream_refine_affine_form(
+           expr.op1(), variable, coefficient, constant))
+        return false;
+      coefficient *= lhs;
+      constant *= lhs;
+      return true;
+    }
+    if(integer_constant(expr.op1(), rhs))
+    {
+      if(!stream_refine_affine_form(
+           expr.op0(), variable, coefficient, constant))
+        return false;
+      coefficient *= rhs;
+      constant *= rhs;
+      return true;
+    }
+  }
+  return false;
+}
+
 bool stream_refine_stage(
   const goto_modelt &model,
   const namespacet &ns,
   const irep_idt &worker,
   stream_refine_staget &result,
-  std::string &reason)
+  std::string &reason,
+  const bool allow_affine_forward = false)
 {
   const auto &program =
     model.goto_functions.function_map.at(worker).body;
@@ -7503,16 +7597,28 @@ bool stream_refine_stage(
   {
     result.forwards = true;
     result.publish = publishes.front();
+    result.transform = strip(result.publish.token);
+    mp_integer affine_coefficient;
+    mp_integer affine_constant;
     if(
-      strip(result.publish.token).id() != ID_symbol ||
       !contains_symbol(
         result.publish.token, result.consume.temporary) ||
-      strip(result.publish.token) !=
-        symbol_exprt(
-          result.consume.temporary,
-          lookup(result.consume.temporary, ns)->type))
+      (allow_affine_forward &&
+       !stream_refine_affine_form(
+         result.publish.token,
+         result.consume.temporary,
+         affine_coefficient,
+         affine_constant)) ||
+      (!allow_affine_forward &&
+       (strip(result.publish.token).id() != ID_symbol ||
+        strip(result.publish.token) !=
+          symbol_exprt(
+            result.consume.temporary,
+            lookup(result.consume.temporary, ns)->type))))
     {
-      reason = "stream_refine_nonidentity_forward";
+      reason = allow_affine_forward ?
+        "stream_refine_forward_dependency" :
+        "stream_refine_nonidentity_forward";
       return false;
     }
     result.writes.insert(
@@ -7537,9 +7643,14 @@ bool stream_refine_stage(
     if(
       instruction->is_goto() &&
       stream_refine_sentinel_exit(
-        *instruction, loop, result.consume.temporary))
+        *instruction,
+        loop,
+        result.consume.temporary,
+        allow_affine_forward))
     {
       ++exits;
+      result.nonpositive_exit =
+        strip(instruction->condition()).id() == ID_le;
       exit_location = instruction->location_number;
       continue;
     }
@@ -7603,7 +7714,10 @@ bool stream_refine_stage(
     return false;
   }
   if(
-    folds != 1 || accounts > 1 || exits != 1 ||
+    ((!allow_affine_forward && folds != 1) ||
+     (allow_affine_forward &&
+      ((!result.forwards && folds != 1) || folds > 1))) ||
+    accounts > 1 || exits != 1 ||
     exit_location <= last_effect_location ||
     (result.forwards &&
      (result.publish.first_location <=
@@ -7643,7 +7757,10 @@ bool stream_refine_source(
   const namespacet &ns,
   const irep_idt &worker,
   stream_refine_sourcet &result,
-  std::string &reason)
+  std::string &reason,
+  const bool allow_sink_role = false,
+  stream_refine_consumet *sink_consume = nullptr,
+  irep_idt *sink_fold = nullptr)
 {
   const auto &program =
     model.goto_functions.function_map.at(worker).body;
@@ -7671,7 +7788,9 @@ bool stream_refine_source(
   if(
     !stream_refine_transactions(
       program, loop, ns, publishes, consumes, reason) ||
-    publishes.size() != 2 || !consumes.empty())
+    publishes.size() != 2 ||
+    ((!allow_sink_role && !consumes.empty()) ||
+     (allow_sink_role && consumes.size() > 1)))
   {
     if(reason.empty())
       reason = "stream_refine_source_transactions";
@@ -7707,8 +7826,20 @@ bool stream_refine_source(
     result.data.writes.begin(), result.data.writes.end());
   result.writes.insert(
     result.sentinel.writes.begin(), result.sentinel.writes.end());
+  if(allow_sink_role && !consumes.empty())
+  {
+    if(sink_consume == nullptr || sink_fold == nullptr)
+    {
+      reason = "stream_refine_sink_output";
+      return false;
+    }
+    *sink_consume = consumes.front();
+    result.writes.insert(
+      sink_consume->writes.begin(), sink_consume->writes.end());
+  }
 
   std::size_t zero_initializations = 0;
+  std::size_t sink_folds = 0;
   std::size_t induction_updates = 0;
   std::size_t backedges = 0;
   std::size_t loop_accounts = 0;
@@ -7747,6 +7878,28 @@ bool stream_refine_source(
     irep_idt lhs;
     exprt delta;
     if(
+      allow_sink_role && !consumes.empty() &&
+      sink_fold != nullptr &&
+      stream_refine_addition(*instruction, lhs, delta))
+    {
+      irep_idt token;
+      if(
+        symbol_id(delta, token) &&
+        token == consumes.front().temporary &&
+        shared_signed(lhs, ns))
+      {
+        if(!sink_fold->empty() && *sink_fold != lhs)
+        {
+          reason = "stream_refine_sink_fold_ownership";
+          return false;
+        }
+        *sink_fold = lhs;
+        ++sink_folds;
+        result.writes.insert(&*instruction);
+        continue;
+      }
+    }
+    if(
       stream_refine_addition(*instruction, lhs, delta) &&
       shared_unsigned32(lhs, ns))
     {
@@ -7779,6 +7932,597 @@ bool stream_refine_source(
     reason = "stream_refine_source_control";
     return false;
   }
+  if(allow_sink_role)
+  {
+    std::size_t sink_zero_initializations = 0;
+    if(sink_fold != nullptr && !sink_fold->empty())
+    {
+      for(const auto &instruction : program.instructions)
+      {
+        irep_idt lhs;
+        if(
+          instruction.is_assign() &&
+          symbol_id(instruction.assign_lhs(), lhs) &&
+          lhs == *sink_fold &&
+          value_is(instruction.assign_rhs(), 0))
+        {
+          ++sink_zero_initializations;
+          result.writes.insert(&instruction);
+        }
+      }
+    }
+    if(
+      consumes.size() != 1 || sink_fold == nullptr ||
+      sink_fold->empty() || sink_folds != 1 ||
+      sink_zero_initializations != 1 ||
+      !consumes.front().in_loop ||
+      consumes.front().channel.storage == result.data.channel.storage)
+    {
+      reason = "stream_refine_sink_role";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool role_split_local_atomic_region(
+  const std::vector<const goto_programt::instructiont *> &region,
+  const namespacet &ns)
+{
+  for(const auto *instruction : region)
+  {
+    if(
+      instruction->is_decl() || instruction->is_dead() ||
+      instruction->is_location() || instruction->is_skip())
+      continue;
+    irep_idt lhs;
+    if(
+      instruction->is_assign() &&
+      symbol_id(instruction->assign_lhs(), lhs))
+    {
+      const symbolt *symbol = lookup(lhs, ns);
+      if(
+        symbol != nullptr && !symbol->is_static_lifetime &&
+        !symbol->is_type)
+        continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+bool role_split_consume_fold_region(
+  const std::vector<const goto_programt::instructiont *> &region,
+  const namespacet &ns,
+  stream_refine_consumet &consume,
+  irep_idt &fold,
+  std::set<const goto_programt::instructiont *> &writes)
+{
+  for(std::size_t omitted = 0; omitted < region.size(); ++omitted)
+  {
+    irep_idt candidate_fold;
+    exprt delta;
+    if(
+      !stream_refine_addition(
+        *region[omitted], candidate_fold, delta) ||
+      !shared_signed(candidate_fold, ns))
+      continue;
+    std::vector<const goto_programt::instructiont *> filtered;
+    for(std::size_t index = 0; index < region.size(); ++index)
+    {
+      if(index != omitted)
+        filtered.push_back(region[index]);
+    }
+    stream_refine_consumet candidate_consume;
+    if(
+      !stream_refine_consume_region(
+        filtered, ns, candidate_consume, true))
+      continue;
+    irep_idt token;
+    if(
+      !symbol_id(delta, token) ||
+      token != candidate_consume.temporary)
+      continue;
+    consume = candidate_consume;
+    fold = candidate_fold;
+    writes = consume.writes;
+    writes.insert(region[omitted]);
+    return true;
+  }
+  return false;
+}
+
+bool role_split_guarded_data_commit(
+  const goto_programt &program,
+  const natural_loopst::natural_loopt &loop,
+  const std::vector<const goto_programt::instructiont *> &region,
+  const namespacet &ns,
+  const irep_idt &induction,
+  stream_refine_publisht &publish)
+{
+  if(region.empty())
+    return false;
+  irep_idt back;
+  std::size_t back_updates = 0;
+  std::size_t induction_updates = 0;
+  for(const auto *instruction : region)
+  {
+    if(
+      instruction->is_decl() || instruction->is_dead() ||
+      instruction->is_location() || instruction->is_skip())
+      continue;
+    irep_idt lhs;
+    if(
+      instruction->is_assign() &&
+      symbol_id(instruction->assign_lhs(), lhs) &&
+      unit_increment(*instruction, lhs))
+    {
+      if(lhs == induction)
+      {
+        ++induction_updates;
+        publish.writes.insert(instruction);
+        continue;
+      }
+      if(shared_signed(lhs, ns))
+      {
+        if(!back.empty() && back != lhs)
+          return false;
+        back = lhs;
+        ++back_updates;
+        publish.writes.insert(instruction);
+        continue;
+      }
+    }
+    return false;
+  }
+  if(
+    back.empty() || back_updates != 1 ||
+    induction_updates != 1)
+    return false;
+
+  std::vector<exprt> preceding_assumptions;
+  const goto_programt::instructiont *guard = nullptr;
+  irep_idt storage;
+  exprt token;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(
+      instruction->location_number >= region.front()->location_number)
+      break;
+    if(!loop.contains(instruction))
+      continue;
+    irep_idt callee;
+    if(
+      call_id(*instruction, callee) && is_assume(callee) &&
+      instruction->call_arguments().size() == 1)
+    {
+      flatten_and(
+        instruction->call_arguments().front(),
+        preceding_assumptions);
+      continue;
+    }
+    if(
+      !instruction->is_goto() || instruction->targets.size() != 1 ||
+      instruction->get_target()->location_number <=
+        region.back()->location_number)
+      continue;
+    const exprt &condition = strip(instruction->condition());
+    if(
+      condition.id() != ID_not ||
+      condition.operands().size() != 1)
+      continue;
+    irep_idt candidate_storage;
+    irep_idt candidate_back;
+    exprt candidate_token;
+    if(
+      !array_equality_term(
+        condition.op0(),
+        candidate_storage,
+        candidate_back,
+        candidate_token) ||
+      candidate_back != back)
+      continue;
+    if(guard != nullptr)
+      return false;
+    guard = &*instruction;
+    storage = candidate_storage;
+    token = strip(candidate_token);
+  }
+  irep_idt bound;
+  mp_integer data_token;
+  const symbolt *queue = lookup(storage, ns);
+  if(
+    guard == nullptr ||
+    !stream_refine_bounds(preceding_assumptions, back, bound) ||
+    !shared_signed(bound, ns) ||
+    !integer_constant(token, data_token) || data_token <= 0 ||
+    queue == nullptr || !queue->is_static_lifetime ||
+    queue->type.id() != ID_pointer ||
+    to_pointer_type(queue->type).base_type().id() != ID_signedbv)
+    return false;
+
+  publish.channel.storage = storage;
+  publish.channel.back = back;
+  publish.channel.bound = bound;
+  publish.token = token;
+  publish.in_loop = true;
+  publish.first_location = region.front()->location_number;
+  publish.last_location = region.back()->location_number;
+  return true;
+}
+
+bool role_split_guarded_consume_fold_region(
+  const goto_programt &program,
+  const natural_loopst::natural_loopt &loop,
+  const std::vector<const goto_programt::instructiont *> &region,
+  const namespacet &ns,
+  stream_refine_consumet &consume,
+  irep_idt &fold,
+  std::set<const goto_programt::instructiont *> &writes)
+{
+  std::vector<exprt> terms;
+  const goto_programt::instructiont *assume = nullptr;
+  const goto_programt::instructiont *read = nullptr;
+  const goto_programt::instructiont *increment = nullptr;
+  const goto_programt::instructiont *fold_instruction = nullptr;
+  irep_idt storage;
+  irep_idt front;
+  for(const auto *instruction : region)
+  {
+    irep_idt callee;
+    if(
+      call_id(*instruction, callee) && is_assume(callee) &&
+      instruction->call_arguments().size() == 1)
+    {
+      if(assume != nullptr)
+        return false;
+      assume = instruction;
+      flatten_and(instruction->call_arguments().front(), terms);
+      continue;
+    }
+    if(instruction->is_assign())
+    {
+      irep_idt lhs;
+      irep_idt candidate_storage;
+      irep_idt candidate_front;
+      if(
+        symbol_id(instruction->assign_lhs(), lhs) &&
+        array_symbol_index(
+          instruction->assign_rhs(),
+          candidate_storage,
+          candidate_front))
+      {
+        if(
+          read != nullptr || !local_signed(lhs, ns))
+          return false;
+        consume.temporary = lhs;
+        storage = candidate_storage;
+        front = candidate_front;
+        read = instruction;
+        writes.insert(instruction);
+        continue;
+      }
+      if(
+        symbol_id(instruction->assign_lhs(), lhs) &&
+        unit_increment(*instruction, lhs) &&
+        (front.empty() || lhs == front))
+      {
+        front = lhs;
+        increment = instruction;
+        writes.insert(instruction);
+        continue;
+      }
+      exprt delta;
+      if(
+        stream_refine_addition(*instruction, lhs, delta) &&
+        shared_signed(lhs, ns))
+      {
+        irep_idt token;
+        if(
+          !symbol_id(delta, token) ||
+          token != consume.temporary ||
+          fold_instruction != nullptr)
+          return false;
+        fold = lhs;
+        fold_instruction = instruction;
+        writes.insert(instruction);
+        continue;
+      }
+      return false;
+    }
+    if(
+      instruction->is_decl() || instruction->is_dead() ||
+      instruction->is_location() || instruction->is_skip())
+      continue;
+    return false;
+  }
+  irep_idt bound;
+  const symbolt *queue = lookup(storage, ns);
+  if(
+    assume == nullptr || read == nullptr || increment == nullptr ||
+    fold_instruction == nullptr ||
+    assume->location_number >= read->location_number ||
+    read->location_number >= increment->location_number ||
+    increment->location_number >= fold_instruction->location_number ||
+    !stream_refine_bounds(terms, front, bound) ||
+    !shared_signed(front, ns) || !shared_signed(bound, ns) ||
+    queue == nullptr || !queue->is_static_lifetime ||
+    queue->type.id() != ID_pointer ||
+    to_pointer_type(queue->type).base_type().id() != ID_signedbv)
+    return false;
+
+  irep_idt availability_flag;
+  irep_idt back;
+  const goto_programt::instructiont *availability_definition = nullptr;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(
+      instruction->location_number >= region.front()->location_number)
+      break;
+    if(!loop.contains(instruction) || !instruction->is_assign())
+      continue;
+    irep_idt flag;
+    if(
+      !symbol_id(instruction->assign_lhs(), flag) ||
+      !local_boolean(flag, ns))
+      continue;
+    const exprt &rhs = strip(instruction->assign_rhs());
+    irep_idt candidate_back;
+    irep_idt candidate_front;
+    if(
+      rhs.id() != ID_gt || rhs.operands().size() != 2 ||
+      !symbol_id(rhs.op0(), candidate_back) ||
+      !symbol_id(rhs.op1(), candidate_front) ||
+      candidate_front != front ||
+      !shared_signed(candidate_back, ns))
+      continue;
+    if(availability_definition != nullptr)
+      return false;
+    availability_definition = &*instruction;
+    availability_flag = flag;
+    back = candidate_back;
+  }
+  bool guarded = false;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(
+      availability_definition == nullptr ||
+      instruction->location_number <=
+        availability_definition->location_number)
+      continue;
+    if(
+      instruction->location_number >= region.front()->location_number)
+      break;
+    irep_idt rewritten;
+    if(
+      instruction->is_assign() &&
+      symbol_id(instruction->assign_lhs(), rewritten) &&
+      rewritten == availability_flag)
+      return false;
+    if(
+      !loop.contains(instruction) || !instruction->is_goto() ||
+      instruction->targets.size() != 1 ||
+      instruction->get_target()->location_number <=
+        region.back()->location_number)
+      continue;
+    const exprt &condition = strip(instruction->condition());
+    if(
+      condition.id() != ID_not ||
+      condition.operands().size() != 1)
+      continue;
+    const exprt &test = strip(condition.op0());
+    irep_idt flag;
+    if(
+      test.id() == ID_notequal &&
+      test.operands().size() == 2 &&
+      symbol_id(test.op0(), flag) &&
+      flag == availability_flag &&
+      value_is(test.op1(), 0))
+    {
+      if(guarded)
+        return false;
+      guarded = true;
+    }
+  }
+  if(!guarded || back.empty())
+    return false;
+
+  consume.channel.storage = storage;
+  consume.channel.front = front;
+  consume.channel.back = back;
+  consume.channel.bound = bound;
+  consume.in_loop = true;
+  consume.first_location = region.front()->location_number;
+  consume.last_location = region.back()->location_number;
+  consume.writes.insert(writes.begin(), writes.end());
+  return true;
+}
+
+bool role_split_guarded_source_sink(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  stream_refine_sourcet &source,
+  stream_refine_consumet &sink_consume,
+  irep_idt &sink_fold,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  natural_loopst loops;
+  loops(program);
+  if(loops.loop_map.size() != 1)
+  {
+    reason = "role_split_guarded_loop_count";
+    return false;
+  }
+  const auto loop_head = loops.loop_map.begin()->first;
+  const auto &loop = loops.loop_map.begin()->second;
+  irep_idt induction;
+  exprt bound;
+  if(
+    !parse_loop_exit(*loop_head, induction, bound) ||
+    !symbol_id(bound, source.count) ||
+    !shared_signed(source.count, ns))
+  {
+    reason = "role_split_guarded_loop_guard";
+    return false;
+  }
+
+  bool in_atomic = false;
+  bool region_in_loop = false;
+  std::vector<const goto_programt::instructiont *> region;
+  std::size_t local_regions = 0;
+  std::size_t data_commits = 0;
+  std::size_t sink_regions = 0;
+  std::size_t sentinels = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_atomic_begin())
+    {
+      if(in_atomic)
+      {
+        reason = "role_split_guarded_atomic_nesting";
+        return false;
+      }
+      in_atomic = true;
+      region_in_loop = loop.contains(instruction);
+      region.clear();
+      continue;
+    }
+    if(instruction->is_atomic_end())
+    {
+      if(!in_atomic || loop.contains(instruction) != region_in_loop)
+      {
+        reason = "role_split_guarded_atomic_balance";
+        return false;
+      }
+      stream_refine_publisht publish;
+      if(
+        !region_in_loop &&
+        stream_refine_publish_region(region, ns, false, publish))
+      {
+        source.sentinel = publish;
+        ++sentinels;
+      }
+      else if(
+        region_in_loop &&
+        role_split_guarded_data_commit(
+          program, loop, region, ns, induction, publish))
+      {
+        source.data = publish;
+        ++data_commits;
+      }
+      else
+      {
+        stream_refine_consumet consume;
+        irep_idt fold;
+        std::set<const goto_programt::instructiont *> writes;
+        if(
+          region_in_loop &&
+          role_split_consume_fold_region(
+            region, ns, consume, fold, writes))
+        {
+          sink_consume = consume;
+          sink_fold = fold;
+          source.writes.insert(writes.begin(), writes.end());
+          ++sink_regions;
+        }
+        else if(
+          region_in_loop &&
+          role_split_guarded_consume_fold_region(
+            program,
+            loop,
+            region,
+            ns,
+            consume,
+            fold,
+            writes))
+        {
+          sink_consume = consume;
+          sink_fold = fold;
+          source.writes.insert(writes.begin(), writes.end());
+          ++sink_regions;
+        }
+        else if(
+          region_in_loop &&
+          role_split_local_atomic_region(region, ns))
+          ++local_regions;
+        else
+        {
+          reason =
+            "role_split_guarded_atomic_region_" +
+            std::to_string(
+              region.empty() ? 0 :
+              region.front()->location_number);
+          return false;
+        }
+      }
+      in_atomic = false;
+      region.clear();
+      continue;
+    }
+    if(in_atomic)
+      region.push_back(&*instruction);
+  }
+  if(
+    in_atomic || local_regions != 1 || data_commits != 1 ||
+    sink_regions != 1 || sentinels != 1)
+  {
+    reason = "role_split_guarded_regions";
+    return false;
+  }
+  if(
+    source.data.channel.storage != source.sentinel.channel.storage ||
+    source.data.channel.back != source.sentinel.channel.back ||
+    source.data.channel.bound != source.sentinel.channel.bound ||
+    source.data.channel.storage == sink_consume.channel.storage)
+  {
+    reason = "role_split_guarded_channels";
+    return false;
+  }
+
+  std::size_t induction_zero = 0;
+  std::size_t induction_updates = 0;
+  std::size_t fold_zero = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(!instruction->is_assign())
+      continue;
+    irep_idt lhs;
+    if(!symbol_id(instruction->assign_lhs(), lhs))
+      continue;
+    if(lhs == induction && value_is(instruction->assign_rhs(), 0))
+      ++induction_zero;
+    if(loop.contains(instruction) &&
+       unit_increment(*instruction, induction))
+      ++induction_updates;
+    if(lhs == sink_fold && value_is(instruction->assign_rhs(), 0))
+    {
+      ++fold_zero;
+      source.writes.insert(&*instruction);
+    }
+  }
+  if(
+    induction_zero != 1 || induction_updates != 1 ||
+    fold_zero != 1)
+  {
+    reason = "role_split_guarded_initialization";
+    return false;
+  }
+
+  source.worker = worker;
+  source.writes.insert(
+    source.data.writes.begin(), source.data.writes.end());
+  source.writes.insert(
+    source.sentinel.writes.begin(), source.sentinel.writes.end());
+  source.writes.insert(
+    sink_consume.writes.begin(), sink_consume.writes.end());
   return true;
 }
 
@@ -13783,7 +14527,575 @@ bool extremum_homomorphism_proof_impl(
   reason = "hom_worker_partition";
   return false;
 }
+
+bool role_split_stream_global_writes(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const std::set<irep_idt> &queues,
+  const std::set<irep_idt> &protected_symbols,
+  const std::set<const goto_programt::instructiont *> &allowed,
+  std::string &reason)
+{
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      const exprt *lhs = nullptr;
+      if(instruction.is_assign())
+        lhs = &instruction.assign_lhs();
+      else if(
+        instruction.is_function_call() &&
+        !instruction.call_lhs().is_nil())
+        lhs = &instruction.call_lhs();
+      if(lhs == nullptr)
+        continue;
+      irep_idt direct;
+      irep_idt base;
+      const bool protected_write =
+        (symbol_id(*lhs, direct) &&
+         protected_symbols.count(direct) != 0) ||
+        (base_pointer(*lhs, base) && queues.count(base) != 0);
+      if(!protected_write)
+        continue;
+      if(
+        is_start_function(entry.first) && instruction.is_assign() &&
+        value_is(instruction.assign_rhs(), 0))
+        continue;
+      if(
+        entry.first == ID_main && life.first_create != nullptr &&
+        instruction.location_number <
+          life.first_create->location_number)
+        continue;
+      if(allowed.count(&instruction) == 0)
+      {
+        reason =
+          "role_split_external_writer_" +
+          id2string(entry.first) + "_" +
+          std::to_string(instruction.location_number);
+        return false;
+      }
+    }
+  }
+  for(const auto &queue : queues)
+  {
+    if(!flow_alias_free(model, queue, reason))
+      return false;
+  }
+  return no_addresses(model, protected_symbols, reason);
+}
+
+bool role_split_fold_equation(
+  const exprt &src,
+  const std::map<
+    irep_idt,
+    std::pair<mp_integer, mp_integer>> &equations,
+  mp_integer &slope,
+  mp_integer &intercept)
+{
+  const exprt &expr = strip(src);
+  irep_idt identifier;
+  if(symbol_id(expr, identifier))
+  {
+    const auto found = equations.find(identifier);
+    if(found == equations.end())
+      return false;
+    slope = found->second.first;
+    intercept = found->second.second;
+    return true;
+  }
+  if(integer_constant(expr, intercept))
+  {
+    slope = 0;
+    return true;
+  }
+  if(expr.id() == ID_unary_minus && expr.operands().size() == 1)
+  {
+    if(!role_split_fold_equation(
+         expr.op0(), equations, slope, intercept))
+      return false;
+    slope = -slope;
+    intercept = -intercept;
+    return true;
+  }
+  if(
+    (expr.id() == ID_plus || expr.id() == ID_minus) &&
+    expr.operands().size() == 2)
+  {
+    mp_integer left_slope;
+    mp_integer left_intercept;
+    mp_integer right_slope;
+    mp_integer right_intercept;
+    if(
+      !role_split_fold_equation(
+        expr.op0(), equations, left_slope, left_intercept) ||
+      !role_split_fold_equation(
+        expr.op1(), equations, right_slope, right_intercept))
+      return false;
+    slope =
+      expr.id() == ID_plus ?
+        left_slope + right_slope :
+        left_slope - right_slope;
+    intercept =
+      expr.id() == ID_plus ?
+        left_intercept + right_intercept :
+        left_intercept - right_intercept;
+    return true;
+  }
+  if(expr.id() == ID_mult && expr.operands().size() == 2)
+  {
+    mp_integer factor;
+    if(integer_constant(expr.op0(), factor))
+    {
+      if(!role_split_fold_equation(
+           expr.op1(), equations, slope, intercept))
+        return false;
+      slope *= factor;
+      intercept *= factor;
+      return true;
+    }
+    if(integer_constant(expr.op1(), factor))
+    {
+      if(!role_split_fold_equation(
+           expr.op0(), equations, slope, intercept))
+        return false;
+      slope *= factor;
+      intercept *= factor;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool role_split_stream_property(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const lifecyclet &life,
+  const stream_refine_sourcet &source,
+  const std::vector<const stream_refine_staget *> &ordered,
+  const bool source_has_sink_role,
+  const irep_idt &source_sink_fold,
+  std::string &reason)
+{
+  std::set<std::pair<irep_idt, irep_idt>> equalities;
+  irep_idt property_sink;
+  exprt expected;
+  const goto_programt::instructiont *assumption = nullptr;
+  const goto_programt::instructiont *error = nullptr;
+  if(
+    !stream_refine_property(
+      model,
+      ns,
+      life,
+      equalities,
+      property_sink,
+      expected,
+      assumption,
+      error,
+      reason) ||
+    !equalities.empty())
+  {
+    if(reason.empty())
+      reason = "role_split_property_shape";
+    return false;
+  }
+
+  mp_integer data_token;
+  mp_integer sentinel_token;
+  if(
+    !integer_constant(source.data.token, data_token) ||
+    !integer_constant(source.sentinel.token, sentinel_token))
+  {
+    reason = "role_split_source_tokens";
+    return false;
+  }
+  mp_integer transform_slope = 1;
+  mp_integer transform_intercept = 0;
+  std::map<
+    irep_idt,
+    std::pair<mp_integer, mp_integer>> fold_equations;
+  for(const auto *stage : ordered)
+  {
+    const mp_integer input_data =
+      transform_slope * data_token + transform_intercept;
+    const mp_integer input_sentinel =
+      transform_slope * sentinel_token + transform_intercept;
+    if(
+      input_data <= 0 ||
+      (stage->nonpositive_exit ?
+         input_sentinel > 0 :
+         input_sentinel != 0))
+    {
+      reason = "role_split_terminal_language";
+      return false;
+    }
+    if(!stage->fold.empty())
+    {
+      if(
+        !fold_equations.emplace(
+          stage->fold,
+          std::make_pair(input_data, input_sentinel)).second)
+      {
+        reason = "role_split_fold_ownership";
+        return false;
+      }
+    }
+    if(stage->forwards)
+    {
+      mp_integer stage_slope;
+      mp_integer stage_intercept;
+      if(
+        !stream_refine_affine_form(
+          stage->transform,
+          stage->consume.temporary,
+          stage_slope,
+          stage_intercept))
+      {
+        reason = "role_split_stage_affine";
+        return false;
+      }
+      transform_slope *= stage_slope;
+      transform_intercept =
+        stage_slope * transform_intercept + stage_intercept;
+    }
+  }
+
+  if(source_has_sink_role)
+  {
+    if(
+      property_sink != source_sink_fold ||
+      !value_is(expected, 0) ||
+      transform_slope * data_token + transform_intercept != 0)
+    {
+      reason = "role_split_prefix_zero_property";
+      return false;
+    }
+  }
+  else
+  {
+    const auto sink_equation = fold_equations.find(property_sink);
+    mp_integer expected_slope;
+    mp_integer expected_intercept;
+    if(
+      sink_equation == fold_equations.end() ||
+      !role_split_fold_equation(
+        expected,
+        fold_equations,
+        expected_slope,
+        expected_intercept) ||
+      sink_equation->second.first != expected_slope ||
+      sink_equation->second.second != expected_intercept)
+    {
+      reason = "role_split_complete_property";
+      return false;
+    }
+  }
+
+  flow_equality_propertyt control;
+  control.assumption = assumption;
+  control.error = error;
+  return flow_main_control(model, life, control, reason);
+}
+
+bool role_split_affine_stream_audit_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &reason,
+  std::size_t &source_roles,
+  std::size_t &stage_roles,
+  std::size_t &sink_roles)
+{
+  std::size_t signed_pointer_globals = 0;
+  for(const auto &entry : model.symbol_table.symbols)
+  {
+    const symbolt &symbol = entry.second;
+    if(
+      symbol.is_static_lifetime && !symbol.is_type &&
+      symbol.type.id() == ID_pointer &&
+      to_pointer_type(symbol.type).base_type().id() == ID_signedbv)
+      ++signed_pointer_globals;
+  }
+  if(signed_pointer_globals < 2)
+  {
+    reason = "role_split_channel_prefilter";
+    return false;
+  }
+
+  lifecyclet life;
+  std::vector<irep_idt> workers;
+  if(!stream_refine_lifecycle(model, life, workers, reason))
+    return false;
+  if(workers.size() < 2)
+  {
+    reason = "role_split_worker_prefilter";
+    return false;
+  }
+  std::size_t atomic_regions = 0;
+  for(const auto &worker : workers)
+  {
+    const auto &body =
+      model.goto_functions.function_map.at(worker).body;
+    atomic_regions += std::count_if(
+      body.instructions.begin(),
+      body.instructions.end(),
+      [](const goto_programt::instructiont &instruction) {
+        return instruction.is_atomic_begin();
+      });
+  }
+  if(atomic_regions < 3)
+  {
+    reason = "role_split_atomic_prefilter";
+    return false;
+  }
+
+  stream_refine_sourcet source;
+  stream_refine_consumet source_sink_consume;
+  irep_idt source_sink_fold;
+  bool source_has_sink_role = false;
+  std::vector<stream_refine_staget> stages;
+  for(const auto &worker : workers)
+  {
+    stream_refine_sourcet candidate_source;
+    std::string source_reason;
+    if(
+      stream_refine_source(
+        model, ns, worker, candidate_source, source_reason))
+    {
+      if(!source.worker.empty())
+      {
+        reason = "role_split_multiple_sources";
+        return false;
+      }
+      source = candidate_source;
+      continue;
+    }
+    source_reason.clear();
+    stream_refine_consumet candidate_sink_consume;
+    irep_idt candidate_sink_fold;
+    if(
+      stream_refine_source(
+        model,
+        ns,
+        worker,
+        candidate_source,
+        source_reason,
+        true,
+        &candidate_sink_consume,
+        &candidate_sink_fold))
+    {
+      if(!source.worker.empty())
+      {
+        reason = "role_split_multiple_sources";
+        return false;
+      }
+      source = candidate_source;
+      source_sink_consume = candidate_sink_consume;
+      source_sink_fold = candidate_sink_fold;
+      source_has_sink_role = true;
+      continue;
+    }
+    source_reason.clear();
+    if(
+      role_split_guarded_source_sink(
+        model,
+        ns,
+        worker,
+        candidate_source,
+        candidate_sink_consume,
+        candidate_sink_fold,
+        source_reason))
+    {
+      if(!source.worker.empty())
+      {
+        reason = "role_split_multiple_sources";
+        return false;
+      }
+      source = candidate_source;
+      source_sink_consume = candidate_sink_consume;
+      source_sink_fold = candidate_sink_fold;
+      source_has_sink_role = true;
+      continue;
+    }
+
+    stream_refine_staget stage;
+    std::string stage_reason;
+    if(
+      stream_refine_stage(
+        model, ns, worker, stage, stage_reason, true))
+    {
+      stages.push_back(stage);
+      continue;
+    }
+    reason =
+      "role_split_worker_shape_source_" + source_reason +
+      "_stage_" + stage_reason;
+    return false;
+  }
+  if(source.worker.empty() || stages.empty())
+  {
+    reason = "role_split_missing_roles";
+    return false;
+  }
+
+  stream_refine_channelt channel = source.data.channel;
+  std::set<irep_idt> used_workers;
+  std::vector<const stream_refine_staget *> ordered;
+  std::size_t connected = 0;
+  while(connected != stages.size())
+  {
+    const stream_refine_staget *next = nullptr;
+    for(const auto &stage : stages)
+    {
+      if(
+        used_workers.count(stage.worker) == 0 &&
+        stage.consume.channel.storage == channel.storage &&
+        stage.consume.channel.back == channel.back &&
+        stage.consume.channel.bound == channel.bound)
+      {
+        if(next != nullptr)
+        {
+          reason = "role_split_branching";
+          return false;
+        }
+        next = &stage;
+      }
+    }
+    if(next == nullptr)
+    {
+      reason = "role_split_disconnected";
+      return false;
+    }
+    ++connected;
+    ordered.push_back(next);
+    used_workers.insert(next->worker);
+    if(connected != stages.size())
+    {
+      if(!next->forwards)
+      {
+        reason = "role_split_early_sink";
+        return false;
+      }
+      channel = next->publish.channel;
+    }
+    else if(next->forwards && source_has_sink_role)
+      channel = next->publish.channel;
+    else if(next->forwards)
+    {
+      reason = "role_split_open_output";
+      return false;
+    }
+  }
+  if(source_has_sink_role)
+  {
+    if(
+      channel.storage != source_sink_consume.channel.storage ||
+      channel.back != source_sink_consume.channel.back ||
+      channel.bound != source_sink_consume.channel.bound)
+    {
+      reason = "role_split_sink_channel";
+      return false;
+    }
+  }
+
+  std::set<stream_refine_channelt> channels;
+  stream_refine_channelt source_channel = source.data.channel;
+  source_channel.front = ordered.front()->consume.channel.front;
+  channels.insert(source_channel);
+  for(std::size_t index = 0; index < ordered.size(); ++index)
+  {
+    if(!ordered[index]->forwards)
+      continue;
+    stream_refine_channelt composed = ordered[index]->publish.channel;
+    if(index + 1 < ordered.size())
+      composed.front = ordered[index + 1]->consume.channel.front;
+    else if(source_has_sink_role)
+      composed.front = source_sink_consume.channel.front;
+    else
+    {
+      reason = "role_split_unconsumed_output";
+      return false;
+    }
+    channels.insert(composed);
+  }
+  std::set<irep_idt> queues;
+  std::set<irep_idt> protected_symbols = {source.count};
+  std::set<const goto_programt::instructiont *> allowed =
+    source.writes;
+  if(source_has_sink_role)
+    protected_symbols.insert(source_sink_fold);
+  for(const auto *stage : ordered)
+  {
+    allowed.insert(stage->writes.begin(), stage->writes.end());
+    if(!stage->fold.empty())
+      protected_symbols.insert(stage->fold);
+  }
+  for(const auto &entry : channels)
+  {
+    if(!stream_refine_initial_channel(model, life, entry))
+    {
+      reason = "role_split_initial_channel";
+      return false;
+    }
+    queues.insert(entry.storage);
+    protected_symbols.insert(entry.storage);
+    protected_symbols.insert(entry.front);
+    protected_symbols.insert(entry.back);
+    protected_symbols.insert(entry.bound);
+  }
+  if(
+    !stream_refine_fresh_queues(
+      model, ns, life, queues, reason) ||
+    !role_split_stream_global_writes(
+      model,
+      life,
+      queues,
+      protected_symbols,
+      allowed,
+      reason) ||
+    !role_split_stream_property(
+      model,
+      ns,
+      life,
+      source,
+      ordered,
+      source_has_sink_role,
+      source_sink_fold,
+      reason))
+    return false;
+
+  source_roles = 1;
+  stage_roles = stages.size();
+  sink_roles = source_has_sink_role ? 1 : 0;
+  return true;
+}
 } // namespace
+
+void role_split_affine_stream_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  const namespacet ns(goto_model.symbol_table);
+  std::string reason;
+  std::size_t source_roles = 0;
+  std::size_t stage_roles = 0;
+  std::size_t sink_roles = 0;
+  const bool candidate =
+    role_split_affine_stream_audit_impl(
+      goto_model,
+      ns,
+      reason,
+      source_roles,
+      stage_roles,
+      sink_roles);
+  std::cout << "NATIVE_ROLE_SPLIT_STREAM_AUDIT candidate="
+            << (candidate ? 1 : 0)
+            << " source_roles=" << source_roles
+            << " stage_roles=" << stage_roles
+            << " sink_roles=" << sink_roles;
+  if(!candidate)
+    std::cout << " reason=" << reason;
+  std::cout << '\n';
+}
 
 bool extremum_cone_proof(
   const goto_modelt &goto_model,
@@ -13862,6 +15174,27 @@ bool extremum_cone_proof(
   if(extremum_homomorphism_proof_impl(goto_model, ns, reason))
     return true;
   std::cout << "NATIVE_EXTREMUM_HOMOMORPHISM applied=0 reason="
+            << reason << '\n';
+  reason.clear();
+  std::size_t source_roles = 0;
+  std::size_t stage_roles = 0;
+  std::size_t sink_roles = 0;
+  if(
+    role_split_affine_stream_audit_impl(
+      goto_model,
+      ns,
+      reason,
+      source_roles,
+      stage_roles,
+      sink_roles))
+  {
+    std::cout << "NATIVE_ROLE_SPLIT_STREAM applied=1"
+              << " source_roles=" << source_roles
+              << " stage_roles=" << stage_roles
+              << " sink_roles=" << sink_roles << '\n';
+    return true;
+  }
+  std::cout << "NATIVE_ROLE_SPLIT_STREAM applied=0 reason="
             << reason << '\n';
   reason.clear();
   propertyt property;

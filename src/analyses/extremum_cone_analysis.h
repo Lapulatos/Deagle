@@ -14,4 +14,8 @@ bool extremum_cone_proof(
   const goto_modelt &goto_model,
   message_handlert &message_handler);
 
+void role_split_affine_stream_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 #endif

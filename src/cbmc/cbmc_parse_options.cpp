@@ -554,6 +554,9 @@ int cbmc_parse_optionst::doit()
   if(cmdline.isset("native-property-affine-audit"))
     property_directed_affine_audit(goto_model, ui_message_handler);
 
+  if(cmdline.isset("native-role-split-stream-audit"))
+    role_split_affine_stream_audit(goto_model, ui_message_handler);
+
   if(
     cmdline.isset("native-property-affine-proof") &&
     property_directed_affine_proof(goto_model, ui_message_handler))
