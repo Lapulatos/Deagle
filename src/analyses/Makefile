@@ -39,6 +39,7 @@ SRC = ai.cpp \
       relational_order_analysis.cpp \
       sese_regions.cpp \
       static_analysis.cpp \
+      thread_local_cutoff_analysis.cpp \
       uncaught_exceptions_analysis.cpp \
       uninitialized_domain.cpp \
       variable-sensitivity/abstract_environment.cpp \
