@@ -272,6 +272,8 @@ struct analysist
   namespacet ns;
   std::set<std::string> shared_roots;
   std::map<irep_idt, std::string> aliases;
+  std::set<irep_idt> congruence_aliases;
+  std::set<irep_idt> static_initialized_aliases;
   std::map<irep_idt, std::vector<alias_contextt>> function_contexts;
   const alias_contextt *active_aliases;
   std::map<std::string, intervalt> initial;
@@ -304,6 +306,17 @@ struct analysist
   {
     const std::size_t split = key.find('#');
     return shared_roots.count(key.substr(0, split)) != 0;
+  }
+
+  bool data_pointer(const irep_idt &identifier) const
+  {
+    const auto symbol = model.symbol_table.symbols.find(identifier);
+    if(symbol == model.symbol_table.symbols.end())
+      return false;
+    const typet &type = ns.follow(symbol->second.type);
+    return
+      type.id() == ID_pointer &&
+      ns.follow(to_pointer_type(type).base_type()).id() != ID_code;
   }
 
   bool atom(const exprt &src, std::string &key) const
@@ -401,6 +414,31 @@ struct analysist
   {
     std::map<irep_idt, std::set<std::string>> candidates;
     std::set<irep_idt> incompatible;
+    std::vector<std::pair<irep_idt, irep_idt>> copies;
+    for(const auto &entry : model.symbol_table.symbols)
+    {
+      const symbolt &symbol = entry.second;
+      if(
+        !data_pointer(entry.first) || symbol.value.is_nil())
+        continue;
+      const exprt &value = strip(symbol.value);
+      if(value.id() != ID_address_of)
+      {
+        incompatible.insert(entry.first);
+        continue;
+      }
+      std::string target;
+      if(
+        atom(to_address_of_expr(value).object(), target) &&
+        shared(target))
+      {
+        candidates[entry.first].insert(target);
+        congruence_aliases.insert(entry.first);
+        static_initialized_aliases.insert(entry.first);
+      }
+      else
+        incompatible.insert(entry.first);
+    }
     for(const auto &function_entry : model.goto_functions.function_map)
     {
       for(const auto &instruction :
@@ -412,10 +450,7 @@ struct analysist
           const exprt &rhs = strip(instruction.assign_rhs());
           if(symbol_id(instruction.assign_lhs(), pointer))
           {
-            const auto symbol = model.symbol_table.symbols.find(pointer);
-            if(
-              symbol != model.symbol_table.symbols.end() &&
-              ns.follow(symbol->second.type).id() == ID_pointer)
+            if(data_pointer(pointer))
             {
               if(rhs.id() == ID_address_of)
               {
@@ -423,12 +458,39 @@ struct analysist
                 if(
                   atom(to_address_of_expr(rhs).object(), target) &&
                   shared(target))
+                {
                   candidates[pointer].insert(target);
+                  if(
+                    function_entry.first ==
+                    INITIALIZE_FUNCTION)
+                  {
+                    congruence_aliases.insert(pointer);
+                    static_initialized_aliases.insert(pointer);
+                  }
+                }
                 else
                   incompatible.insert(pointer);
               }
+              else if(
+                function_entry.first == INITIALIZE_FUNCTION &&
+                rhs.is_zero())
+              {
+                // Static null initialization establishes no pointee. A later
+                // dominating assignment may establish the unique target.
+              }
               else
-                incompatible.insert(pointer);
+              {
+                irep_idt source;
+                if(
+                  symbol_id(rhs, source) &&
+                  data_pointer(source))
+                {
+                  copies.push_back({pointer, source});
+                  congruence_aliases.insert(pointer);
+                }
+                else
+                  incompatible.insert(pointer);
+              }
             }
           }
           continue;
@@ -459,12 +521,44 @@ struct analysist
         }
       }
     }
+    bool changed = true;
+    while(changed)
+    {
+      changed = false;
+      for(const auto &copy : copies)
+      {
+        if(incompatible.count(copy.second) != 0)
+          changed |= incompatible.insert(copy.first).second;
+        auto &destination = candidates[copy.first];
+        const std::size_t old_size = destination.size();
+        const auto source = candidates.find(copy.second);
+        if(source != candidates.end())
+          destination.insert(
+            source->second.begin(), source->second.end());
+        changed |= destination.size() != old_size;
+      }
+    }
+    for(const auto &copy : copies)
+    {
+      const auto source = candidates.find(copy.second);
+      if(
+        source == candidates.end() || source->second.empty())
+        incompatible.insert(copy.first);
+    }
     for(const auto &entry : candidates)
     {
       if(
         entry.second.size() == 1 &&
         incompatible.count(entry.first) == 0)
         aliases[entry.first] = *entry.second.begin();
+    }
+    for(auto iterator = congruence_aliases.begin();
+        iterator != congruence_aliases.end();)
+    {
+      if(aliases.count(*iterator) == 0)
+        iterator = congruence_aliases.erase(iterator);
+      else
+        ++iterator;
     }
   }
 
@@ -770,6 +864,259 @@ bool validate_expression(
   for(const auto &operand : expr.operands())
   {
     if(!validate_expression(analysis, operand))
+      return false;
+  }
+  return true;
+}
+
+void collect_escaped_congruence_aliases(
+  const analysist &analysis,
+  const exprt &src,
+  std::set<irep_idt> &escaped)
+{
+  const exprt &expr = strip(src);
+  if(expr.id() == ID_address_of)
+  {
+    irep_idt identifier;
+    if(
+      symbol_id(to_address_of_expr(expr).object(), identifier) &&
+      analysis.congruence_aliases.count(identifier) != 0)
+      escaped.insert(identifier);
+  }
+  for(const auto &operand : expr.operands())
+    collect_escaped_congruence_aliases(
+      analysis, operand, escaped);
+}
+
+bool validate_congruence_alias_escapes(analysist &analysis)
+{
+  std::set<irep_idt> escaped;
+  for(const auto &function_entry :
+      analysis.model.goto_functions.function_map)
+  {
+    if(!analysis.user_function(function_entry.first))
+      continue;
+    for(const auto &instruction :
+        function_entry.second.body.instructions)
+    {
+      instruction.apply(
+        [&analysis, &escaped](const exprt &expr) {
+          collect_escaped_congruence_aliases(
+            analysis, expr, escaped);
+        });
+    }
+  }
+  if(escaped.empty())
+    return true;
+  analysis.reason = "pointer_alias_escape";
+  return false;
+}
+
+bool initialized_alias_uses(
+  analysist &analysis,
+  const exprt &src,
+  const std::set<irep_idt> &initialized)
+{
+  const exprt &expr = strip(src);
+  if(expr.id() == ID_dereference)
+  {
+    irep_idt pointer;
+    if(
+      symbol_id(to_dereference_expr(expr).pointer(), pointer) &&
+      analysis.congruence_aliases.count(pointer) != 0 &&
+      initialized.count(pointer) == 0)
+    {
+      analysis.reason = "pointer_not_initialized";
+      return false;
+    }
+  }
+  for(const auto &operand : expr.operands())
+  {
+    if(!initialized_alias_uses(
+         analysis, operand, initialized))
+      return false;
+  }
+  return true;
+}
+
+bool audit_alias_initialization_in_function(
+  analysist &analysis,
+  const irep_idt &function_id,
+  const std::set<irep_idt> &entry,
+  bool collect_publication,
+  std::set<irep_idt> &published,
+  bool &publication_seen)
+{
+  auto &program =
+    analysis.model.goto_functions.function_map.at(function_id).body;
+  std::vector<goto_programt::targett> order;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  for(auto iterator = program.instructions.begin();
+      iterator != program.instructions.end(); ++iterator)
+  {
+    positions[&*iterator] = order.size();
+    order.push_back(iterator);
+  }
+  if(order.empty())
+    return true;
+  std::vector<bool> reached(order.size(), false);
+  std::vector<std::set<irep_idt>> states(order.size());
+  std::deque<std::size_t> work;
+  reached[0] = true;
+  states[0] = entry;
+  work.push_back(0);
+  while(!work.empty())
+  {
+    const std::size_t index = work.front();
+    work.pop_front();
+    std::set<irep_idt> after = states[index];
+    const auto &instruction = *order[index];
+    bool valid_uses = true;
+    instruction.apply(
+      [&analysis, &after, &valid_uses](const exprt &expr) {
+        if(
+          valid_uses &&
+          !initialized_alias_uses(
+            analysis, expr, after))
+          valid_uses = false;
+      });
+    if(!valid_uses)
+      return false;
+
+    if(instruction.is_assign())
+    {
+      irep_idt lhs;
+      if(
+        symbol_id(instruction.assign_lhs(), lhs) &&
+        analysis.aliases.count(lhs) != 0)
+      {
+        bool established = false;
+        const exprt &rhs = strip(instruction.assign_rhs());
+        if(rhs.id() == ID_address_of)
+        {
+          std::string target;
+          established =
+            analysis.atom(
+              to_address_of_expr(rhs).object(), target) &&
+            target == analysis.aliases.at(lhs);
+        }
+        else
+        {
+          irep_idt source;
+          established =
+            symbol_id(rhs, source) &&
+            analysis.aliases.count(source) != 0 &&
+            analysis.aliases.at(source) ==
+              analysis.aliases.at(lhs) &&
+            after.count(source) != 0;
+        }
+        if(established)
+          after.insert(lhs);
+        else
+          after.erase(lhs);
+      }
+    }
+
+    irep_idt callee;
+    if(
+      collect_publication &&
+      call_id(instruction, callee) &&
+      is_create(callee))
+    {
+      if(!publication_seen)
+      {
+        published = after;
+        publication_seen = true;
+      }
+      else
+      {
+        std::set<irep_idt> intersection;
+        std::set_intersection(
+          published.begin(), published.end(),
+          after.begin(), after.end(),
+          std::inserter(
+            intersection, intersection.begin()));
+        published = std::move(intersection);
+      }
+    }
+
+    std::vector<std::size_t> successors;
+    if(instruction.is_goto())
+    {
+      for(const auto &target : instruction.targets)
+        successors.push_back(positions.at(&*target));
+      if(
+        !instruction.condition().is_true() &&
+        index + 1 < order.size())
+        successors.push_back(index + 1);
+    }
+    else if(
+      !instruction.is_end_function() &&
+      index + 1 < order.size())
+      successors.push_back(index + 1);
+    for(const std::size_t successor : successors)
+    {
+      if(!reached[successor])
+      {
+        reached[successor] = true;
+        states[successor] = after;
+        work.push_back(successor);
+      }
+      else
+      {
+        std::set<irep_idt> intersection;
+        std::set_intersection(
+          states[successor].begin(),
+          states[successor].end(),
+          after.begin(), after.end(),
+          std::inserter(
+            intersection, intersection.begin()));
+        if(intersection != states[successor])
+        {
+          states[successor] = std::move(intersection);
+          work.push_back(successor);
+        }
+      }
+    }
+  }
+  return true;
+}
+
+bool validate_congruence_alias_initialization(
+  analysist &analysis)
+{
+  std::set<irep_idt> published;
+  bool publication_seen = false;
+  const auto main_function =
+    analysis.model.goto_functions.function_map.find(ID_main);
+  if(
+    main_function !=
+      analysis.model.goto_functions.function_map.end() &&
+    !audit_alias_initialization_in_function(
+      analysis, ID_main,
+      analysis.static_initialized_aliases, true,
+      published, publication_seen))
+    return false;
+  if(!publication_seen)
+    published = analysis.static_initialized_aliases;
+
+  for(const auto &entry :
+      analysis.model.goto_functions.function_map)
+  {
+    if(
+      entry.first == ID_main ||
+      !analysis.user_function(entry.first))
+      continue;
+    std::set<irep_idt> initial =
+      analysis.static_initialized_aliases;
+    if(
+      analysis.pre_spawn_functions.count(entry.first) == 0)
+      initial.insert(published.begin(), published.end());
+    std::set<irep_idt> ignored_publication;
+    bool ignored_seen = false;
+    if(!audit_alias_initialization_in_function(
+         analysis, entry.first, initial, false,
+         ignored_publication, ignored_seen))
       return false;
   }
   return true;
@@ -1729,8 +2076,8 @@ bool analyze_function(
       }
       if(immutable_pointer_assignment)
       {
-        // The pointer binding was checked globally by collect_aliases();
-        // it carries no numeric state in this abstract domain.
+        // The pointer binding was checked by pointer congruence. It carries
+        // no numeric state in this abstract domain.
       }
       else if(!analysis.atom(instruction.assign_lhs(), lhs))
       {
@@ -2031,6 +2378,8 @@ bool lock_relational_ai_transform(
   analysis.collect_initial();
   analysis.collect_pre_spawn();
   if(
+    !validate_congruence_alias_escapes(analysis) ||
+    !validate_congruence_alias_initialization(analysis) ||
     !validate_model(analysis) ||
     !collect_protection(analysis))
   {
