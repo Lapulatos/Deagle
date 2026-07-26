@@ -266,10 +266,14 @@ bool meet_interval(intervalt &dest, const intervalt &src)
 
 struct analysist
 {
+  using alias_contextt = std::map<irep_idt, std::string>;
+
   goto_modelt &model;
   namespacet ns;
   std::set<std::string> shared_roots;
   std::map<irep_idt, std::string> aliases;
+  std::map<irep_idt, std::vector<alias_contextt>> function_contexts;
+  const alias_contextt *active_aliases;
   std::map<std::string, intervalt> initial;
   std::set<std::string> locks;
   std::set<std::pair<std::string, std::string>> lock_edges;
@@ -283,6 +287,7 @@ struct analysist
   explicit analysist(goto_modelt &goto_model)
     : model(goto_model),
       ns(goto_model.symbol_table),
+      active_aliases(nullptr),
       properties(0)
   {
     for(const auto &entry : model.symbol_table.symbols)
@@ -328,6 +333,15 @@ struct analysist
       {
         const irep_idt identifier =
           to_symbol_expr(pointer).get_identifier();
+        if(active_aliases != nullptr)
+        {
+          const auto contextual = active_aliases->find(identifier);
+          if(contextual != active_aliases->end())
+          {
+            key = contextual->second;
+            return true;
+          }
+        }
         const auto alias = aliases.find(identifier);
         if(alias != aliases.end())
         {
@@ -347,15 +361,32 @@ struct analysist
     if(instruction.call_arguments().empty())
       return false;
     const exprt &argument = strip(instruction.call_arguments().front());
-    if(argument.id() != ID_address_of)
+    if(argument.id() == ID_address_of)
+      return atom(to_address_of_expr(argument).object(), lock) &&
+             shared(lock);
+    irep_idt identifier;
+    if(!symbol_id(argument, identifier))
       return false;
-    return atom(to_address_of_expr(argument).object(), lock) &&
-           shared(lock);
+    if(active_aliases != nullptr)
+    {
+      const auto contextual = active_aliases->find(identifier);
+      if(contextual != active_aliases->end())
+      {
+        lock = contextual->second;
+        return shared(lock);
+      }
+    }
+    const auto alias = aliases.find(identifier);
+    if(alias == aliases.end())
+      return false;
+    lock = alias->second;
+    return shared(lock);
   }
 
   void collect_aliases()
   {
     std::map<irep_idt, std::set<std::string>> candidates;
+    std::set<irep_idt> incompatible;
     for(const auto &function_entry : model.goto_functions.function_map)
     {
       for(const auto &instruction :
@@ -365,15 +396,26 @@ struct analysist
         {
           irep_idt pointer;
           const exprt &rhs = strip(instruction.assign_rhs());
-          if(
-            symbol_id(instruction.assign_lhs(), pointer) &&
-            rhs.id() == ID_address_of)
+          if(symbol_id(instruction.assign_lhs(), pointer))
           {
-            std::string target;
+            const auto symbol = model.symbol_table.symbols.find(pointer);
             if(
-              atom(to_address_of_expr(rhs).object(), target) &&
-              shared(target))
-              candidates[pointer].insert(target);
+              symbol != model.symbol_table.symbols.end() &&
+              ns.follow(symbol->second.type).id() == ID_pointer)
+            {
+              if(rhs.id() == ID_address_of)
+              {
+                std::string target;
+                if(
+                  atom(to_address_of_expr(rhs).object(), target) &&
+                  shared(target))
+                  candidates[pointer].insert(target);
+                else
+                  incompatible.insert(pointer);
+              }
+              else
+                incompatible.insert(pointer);
+            }
           }
           continue;
         }
@@ -405,9 +447,109 @@ struct analysist
     }
     for(const auto &entry : candidates)
     {
-      if(entry.second.size() == 1)
+      if(
+        entry.second.size() == 1 &&
+        incompatible.count(entry.first) == 0)
         aliases[entry.first] = *entry.second.begin();
     }
+  }
+
+  bool resolve_context_argument(
+    const exprt &src,
+    std::string &target) const
+  {
+    const exprt &argument = strip(src);
+    if(argument.id() == ID_address_of)
+      return
+        atom(to_address_of_expr(argument).object(), target) &&
+        shared(target);
+    irep_idt identifier;
+    if(!symbol_id(argument, identifier))
+      return false;
+    if(active_aliases != nullptr)
+    {
+      const auto contextual = active_aliases->find(identifier);
+      if(contextual != active_aliases->end())
+      {
+        target = contextual->second;
+        return shared(target);
+      }
+    }
+    const auto alias = aliases.find(identifier);
+    if(alias == aliases.end())
+      return false;
+    target = alias->second;
+    return shared(target);
+  }
+
+  bool collect_function_contexts()
+  {
+    for(const auto &caller_entry : model.goto_functions.function_map)
+    {
+      if(!user_function(caller_entry.first))
+        continue;
+      for(const auto &instruction :
+          caller_entry.second.body.instructions)
+      {
+        irep_idt callee;
+        if(!call_id(instruction, callee) || !user_function(callee))
+          continue;
+        const auto symbol = model.symbol_table.symbols.find(callee);
+        if(
+          symbol == model.symbol_table.symbols.end() ||
+          symbol->second.type.id() != ID_code)
+          continue;
+        const auto &parameters =
+          to_code_type(symbol->second.type).parameters();
+        const auto &arguments = instruction.call_arguments();
+        if(parameters.size() != arguments.size())
+        {
+          reason = "context_arity";
+          return false;
+        }
+        alias_contextt context;
+        for(std::size_t index = 0; index < parameters.size(); ++index)
+        {
+          const typet &parameter_type =
+            ns.follow(parameters[index].type());
+          if(parameter_type.id() != ID_pointer)
+            continue;
+          if(
+            ns.follow(
+              to_pointer_type(parameter_type).base_type()).id() ==
+            ID_code)
+            continue;
+          const irep_idt parameter =
+            parameters[index].get_identifier();
+          std::string target;
+          if(
+            parameter.empty() ||
+            !resolve_context_argument(arguments[index], target))
+          {
+            reason = "context_argument";
+            return false;
+          }
+          context[parameter] = target;
+        }
+        if(context.empty())
+          continue;
+        auto &contexts = function_contexts[callee];
+        if(
+          std::find(contexts.begin(), contexts.end(), context) ==
+          contexts.end())
+          contexts.push_back(std::move(context));
+      }
+    }
+    return true;
+  }
+
+  std::vector<alias_contextt> contexts_for(
+    const irep_idt &function) const
+  {
+    const auto found = function_contexts.find(function);
+    if(found != function_contexts.end() && !found->second.empty())
+      return found->second;
+    return {alias_contextt{}};
   }
 
   void collect_initial_expr(
@@ -534,6 +676,15 @@ void collect_expr_atoms(
   // remains fail-closed at the assignment/call transfer sites.
   if(strip(expr).id() == ID_address_of)
     return;
+  irep_idt pointer;
+  if(
+    symbol_id(strip(expr), pointer) &&
+    analysis.aliases.count(pointer) != 0)
+  {
+    // Reading an immutable pointer value does not read its pointee.  Uses
+    // which dereference it are resolved by atom().
+    return;
+  }
   std::string key;
   if(analysis.atom(expr, key))
   {
@@ -551,6 +702,13 @@ bool validate_expression(
 {
   const exprt &expr = strip(src);
   if(expr.id() == ID_address_of)
+    return true;
+  irep_idt pointer;
+  if(
+    symbol_id(expr, pointer) &&
+    (analysis.aliases.count(pointer) != 0 ||
+     (analysis.active_aliases != nullptr &&
+      analysis.active_aliases->count(pointer) != 0)))
     return true;
   if(expr.id() == ID_dereference)
   {
@@ -615,85 +773,106 @@ bool validate_model(analysist &analysis)
   {
     if(!analysis.user_function(function_entry.first))
       continue;
-    for(const auto &instruction :
-        function_entry.second.body.instructions)
+    const auto contexts =
+      analysis.contexts_for(function_entry.first);
+    for(const auto &context : contexts)
     {
-      if(
-        instruction.is_atomic_begin() ||
-        instruction.is_atomic_end())
+      analysis.active_aliases = &context;
+      for(const auto &instruction :
+          function_entry.second.body.instructions)
       {
-        analysis.reason = "unsupported_atomic_region";
-        return false;
-      }
-      if(instruction.is_assign())
-      {
-        const exprt &rhs = strip(instruction.assign_rhs());
-        if(rhs.id() == ID_address_of)
+        if(
+          instruction.is_atomic_begin() ||
+          instruction.is_atomic_end())
         {
-          const exprt &object =
-            to_address_of_expr(rhs).object();
-          std::string addressed;
-          if(
-            analysis.atom(object, addressed) &&
-            analysis.shared(addressed) &&
-            analysis.ns.follow(object.type()).id() ==
-              ID_signedbv)
+          analysis.reason = "unsupported_atomic_region";
+          return false;
+        }
+        if(instruction.is_assign())
+        {
+          const exprt &rhs = strip(instruction.assign_rhs());
+          if(rhs.id() == ID_address_of)
           {
-            analysis.reason = "scalar_address_taken";
-            return false;
+            const exprt &object =
+              to_address_of_expr(rhs).object();
+            std::string addressed;
+            if(
+              analysis.atom(object, addressed) &&
+              analysis.shared(addressed) &&
+              analysis.ns.follow(object.type()).id() ==
+                ID_signedbv)
+            {
+              irep_idt pointer;
+              if(
+                !symbol_id(
+                  instruction.assign_lhs(), pointer) ||
+                analysis.aliases.count(pointer) == 0 ||
+                analysis.aliases.at(pointer) != addressed)
+              {
+                analysis.reason = "scalar_address_taken";
+                return false;
+              }
+            }
           }
+          if(
+            !validate_expression(
+              analysis, instruction.assign_lhs()) ||
+            !validate_expression(
+              analysis, instruction.assign_rhs()))
+            return false;
+        }
+        else if(
+          instruction.is_goto() || instruction.is_assume() ||
+          instruction.is_assert())
+        {
+          if(
+            !validate_expression(
+              analysis, instruction.condition()))
+            return false;
+        }
+        if(!instruction.is_function_call())
+          continue;
+        irep_idt callee;
+        if(!call_id(instruction, callee))
+        {
+          analysis.reason = "indirect_call";
+          return false;
+        }
+        if(is_error(callee))
+        {
+          analysis.reason = "unproved_error_call";
+          return false;
+        }
+        for(const auto &argument :
+            instruction.call_arguments())
+        {
+          if(!validate_expression(analysis, argument))
+            return false;
         }
         if(
-          !validate_expression(analysis, instruction.assign_lhs()) ||
-          !validate_expression(analysis, instruction.assign_rhs()))
+          is_lock(callee) || is_unlock(callee) ||
+          is_mutex_init(callee) || is_create(callee) ||
+          is_join(callee) || is_property(callee) ||
+          named(callee, "sleep") || named(callee, "abort") ||
+          named(callee, "__CPROVER_assume"))
+          continue;
+        const auto target =
+          analysis.model.goto_functions.function_map.find(callee);
+        if(
+          target ==
+            analysis.model.goto_functions.function_map.end() ||
+          !target->second.body_available() ||
+          !analysis.user_function(callee))
+        {
+          analysis.reason =
+            "unsupported_call_" + id2string(callee);
           return false;
+        }
+        call_edges[function_entry.first].insert(callee);
       }
-      else if(
-        instruction.is_goto() || instruction.is_assume() ||
-        instruction.is_assert())
-      {
-        if(!validate_expression(analysis, instruction.condition()))
-          return false;
-      }
-      if(!instruction.is_function_call())
-        continue;
-      irep_idt callee;
-      if(!call_id(instruction, callee))
-      {
-        analysis.reason = "indirect_call";
-        return false;
-      }
-      if(is_error(callee))
-      {
-        analysis.reason = "unproved_error_call";
-        return false;
-      }
-      for(const auto &argument : instruction.call_arguments())
-      {
-        if(!validate_expression(analysis, argument))
-          return false;
-      }
-      if(
-        is_lock(callee) || is_unlock(callee) ||
-        is_mutex_init(callee) || is_create(callee) ||
-        is_join(callee) || is_property(callee) ||
-        named(callee, "sleep") || named(callee, "abort") ||
-        named(callee, "__CPROVER_assume"))
-        continue;
-      const auto target =
-        analysis.model.goto_functions.function_map.find(callee);
-      if(
-        target == analysis.model.goto_functions.function_map.end() ||
-        !target->second.body_available() ||
-        !analysis.user_function(callee))
-      {
-        analysis.reason =
-          "unsupported_call_" + id2string(callee);
-        return false;
-      }
-      call_edges[function_entry.first].insert(callee);
     }
   }
+  analysis.active_aliases = nullptr;
   std::set<irep_idt> active;
   std::set<irep_idt> done;
   for(const auto &entry : call_edges)
@@ -836,94 +1015,108 @@ bool collect_protection(analysist &analysis)
   {
     if(!analysis.user_function(entry.first))
       continue;
-    std::vector<std::vector<std::string>> locksets;
-    std::vector<goto_programt::targett> order;
-    if(!compute_locksets(analysis, entry.first, locksets, order))
-      return false;
-    const bool initializer =
-      analysis.pre_spawn_functions.count(entry.first) != 0;
-    for(std::size_t index = 0; index < order.size(); ++index)
+    const auto contexts = analysis.contexts_for(entry.first);
+    for(const auto &context : contexts)
     {
-      const auto &instruction = *order[index];
-      irep_idt callee;
+      analysis.active_aliases = &context;
+      std::vector<std::vector<std::string>> locksets;
+      std::vector<goto_programt::targett> order;
       if(
-        call_id(instruction, callee) &&
-        (is_lock(callee) || is_unlock(callee) ||
-         is_mutex_init(callee) || is_create(callee) ||
-         is_join(callee)))
-        continue;
-      if(
-        initializer && locksets[index].empty() &&
-        instruction.is_assign())
+        !compute_locksets(
+          analysis, entry.first, locksets, order))
+        return false;
+      const bool initializer =
+        analysis.pre_spawn_functions.count(entry.first) != 0;
+      for(std::size_t index = 0; index < order.size(); ++index)
       {
-        std::string lhs;
-        long long assigned;
+        const auto &instruction = *order[index];
+        irep_idt callee;
         if(
-          analysis.atom(instruction.assign_lhs(), lhs) &&
-          analysis.shared(lhs) &&
-          integer_constant(instruction.assign_rhs(), assigned))
-        {
-          const auto initial = analysis.initial.find(lhs);
-          if(
-            initial != analysis.initial.end() &&
-            initial->second.lower_set &&
-            initial->second.upper_set &&
-            initial->second.lower == assigned &&
-            initial->second.upper == assigned)
-            continue;
-        }
-      }
-      std::set<std::string> atoms;
-      if(instruction.is_assign())
-      {
-        collect_expr_atoms(analysis, instruction.assign_lhs(), atoms);
-        collect_expr_atoms(analysis, instruction.assign_rhs(), atoms);
-      }
-      else if(instruction.is_goto() || instruction.is_assume())
-        collect_expr_atoms(analysis, instruction.condition(), atoms);
-      else if(instruction.is_function_call())
-      {
-        const auto direct =
-          call_id(instruction, callee)
-            ? analysis.model.goto_functions.function_map.find(callee)
-            : analysis.model.goto_functions.function_map.end();
-        // A direct call to a body-available user function transfers no shared
-        // value merely by passing an address.  The callee body is analysed
-        // separately after formal-to-actual alias resolution.  Counting
-        // `helper(&shared)` as an unlocked read here would reject sound
-        // encapsulated mutex APIs such as queue_get(&queue).
-        if(
-          direct != analysis.model.goto_functions.function_map.end() &&
-          direct->second.body_available() &&
-          !ignored_external(callee))
+          call_id(instruction, callee) &&
+          (is_lock(callee) || is_unlock(callee) ||
+           is_mutex_init(callee) || is_create(callee) ||
+           is_join(callee)))
           continue;
-        for(const auto &argument : instruction.call_arguments())
-          collect_expr_atoms(analysis, argument, atoms);
-      }
-      for(const auto &atom : atoms)
-      {
-        if(locksets[index].empty())
+        if(
+          initializer && locksets[index].empty() &&
+          instruction.is_assign())
         {
-          analysis.reason = "unprotected_shared";
-          return false;
+          std::string lhs;
+          long long assigned;
+          if(
+            analysis.atom(instruction.assign_lhs(), lhs) &&
+            analysis.shared(lhs) &&
+            integer_constant(
+              instruction.assign_rhs(), assigned))
+          {
+            const auto initial = analysis.initial.find(lhs);
+            if(
+              initial != analysis.initial.end() &&
+              initial->second.lower_set &&
+              initial->second.upper_set &&
+              initial->second.lower == assigned &&
+              initial->second.upper == assigned)
+              continue;
+          }
         }
-        std::set<std::string> held(
-          locksets[index].begin(), locksets[index].end());
-        auto found = candidates.find(atom);
-        if(found == candidates.end())
-          candidates[atom] = held;
-        else
+        std::set<std::string> atoms;
+        if(instruction.is_assign())
         {
-          std::set<std::string> intersection;
-          std::set_intersection(
-            found->second.begin(), found->second.end(),
-            held.begin(), held.end(),
-            std::inserter(intersection, intersection.begin()));
-          found->second = intersection;
+          collect_expr_atoms(
+            analysis, instruction.assign_lhs(), atoms);
+          collect_expr_atoms(
+            analysis, instruction.assign_rhs(), atoms);
+        }
+        else if(
+          instruction.is_goto() || instruction.is_assume())
+          collect_expr_atoms(
+            analysis, instruction.condition(), atoms);
+        else if(instruction.is_function_call())
+        {
+          const auto direct =
+            call_id(instruction, callee)
+              ? analysis.model.goto_functions.function_map.find(
+                  callee)
+              : analysis.model.goto_functions.function_map.end();
+          // Direct user calls are analyzed in each instantiated callee
+          // context; passing an address is not itself a shared read.
+          if(
+            direct !=
+              analysis.model.goto_functions.function_map.end() &&
+            direct->second.body_available() &&
+            !ignored_external(callee))
+            continue;
+          for(const auto &argument :
+              instruction.call_arguments())
+            collect_expr_atoms(analysis, argument, atoms);
+        }
+        for(const auto &atom : atoms)
+        {
+          if(locksets[index].empty())
+          {
+            analysis.reason = "unprotected_shared";
+            return false;
+          }
+          std::set<std::string> held(
+            locksets[index].begin(), locksets[index].end());
+          auto found = candidates.find(atom);
+          if(found == candidates.end())
+            candidates[atom] = held;
+          else
+          {
+            std::set<std::string> intersection;
+            std::set_intersection(
+              found->second.begin(), found->second.end(),
+              held.begin(), held.end(),
+              std::inserter(
+                intersection, intersection.begin()));
+            found->second = intersection;
+          }
         }
       }
     }
   }
+  analysis.active_aliases = nullptr;
   for(const auto &entry : candidates)
   {
     if(entry.second.empty())
@@ -1316,7 +1509,26 @@ bool analyze_function(
     {
       std::string lhs;
       intervalt value;
-      if(!analysis.atom(instruction.assign_lhs(), lhs))
+      irep_idt pointer;
+      const exprt &rhs = strip(instruction.assign_rhs());
+      bool immutable_pointer_assignment = false;
+      if(
+        symbol_id(instruction.assign_lhs(), pointer) &&
+        analysis.aliases.count(pointer) != 0 &&
+        rhs.id() == ID_address_of)
+      {
+        std::string target;
+        immutable_pointer_assignment =
+          analysis.atom(
+            to_address_of_expr(rhs).object(), target) &&
+          target == analysis.aliases.at(pointer);
+      }
+      if(immutable_pointer_assignment)
+      {
+        // The pointer binding was checked globally by collect_aliases();
+        // it carries no numeric state in this abstract domain.
+      }
+      else if(!analysis.atom(instruction.assign_lhs(), lhs))
       {
         std::set<std::string> atoms;
         collect_expr_atoms(
@@ -1554,12 +1766,19 @@ bool run_fixedpoint(analysist &analysis)
     analysis.properties = 0;
     for(const auto &entry : analysis.model.goto_functions.function_map)
     {
-      if(
-        analysis.user_function(entry.first) &&
-        !analyze_function(
-          analysis, entry.first, changed, all_properties))
-        return false;
+      if(!analysis.user_function(entry.first))
+        continue;
+      const auto contexts = analysis.contexts_for(entry.first);
+      for(const auto &context : contexts)
+      {
+        analysis.active_aliases = &context;
+        if(
+          !analyze_function(
+            analysis, entry.first, changed, all_properties))
+          return false;
+      }
     }
+    analysis.active_aliases = nullptr;
     stable_properties = all_properties;
     if(!changed)
       return stable_properties && analysis.properties != 0;
@@ -1599,6 +1818,12 @@ bool lock_relational_ai_transform(
   (void)message_handler;
   analysist analysis(goto_model);
   analysis.collect_aliases();
+  if(!analysis.collect_function_contexts())
+  {
+    std::cout << "NATIVE_LOCK_RELATIONAL_AI applied=0 reason="
+              << analysis.reason << '\n';
+    return false;
+  }
   analysis.collect_initial();
   analysis.collect_pre_spawn();
   if(
