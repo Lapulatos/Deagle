@@ -10,6 +10,19 @@ Module: Join-Scoped Compositional Effect Summary
 class goto_modelt;
 class message_handlert;
 
+/// Audit a single canonical same-worker create loop whose omitted symmetric
+/// workers may remain dormant before the first join.
+bool dormant_spawn_cutoff_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// Materialize two symmetric workers in a counterexample-only model and
+/// discard main from its first join onward. Unsupported programs are
+/// unchanged.
+bool dormant_spawn_cutoff_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 /// Audit constant-bound, zero-based, straight-line lifecycle loops in main.
 /// Such loops initialize an indexed thread descriptor and execute exactly one
 /// pthread_create or pthread_join per iteration.

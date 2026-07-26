@@ -7211,6 +7211,266 @@ struct indexed_lifecycle_loopt
   irep_idt operation;
 };
 
+struct dormant_spawn_cutofft
+{
+  goto_programt::const_targett head;
+  goto_programt::const_targett exit;
+  const goto_programt::instructiont *create_instruction = nullptr;
+  const goto_programt::instructiont *first_join = nullptr;
+  irep_idt induction;
+  irep_idt thread_ids;
+  irep_idt worker;
+  mp_integer bound;
+};
+
+void collect_symbol_identifiers(
+  const exprt &expr,
+  std::set<irep_idt> &identifiers)
+{
+  const exprt &value = without_cast(expr);
+  if(value.id() == ID_symbol)
+    identifiers.insert(to_symbol_expr(value).get_identifier());
+  for(const auto &operand : value.operands())
+    collect_symbol_identifiers(operand, identifiers);
+}
+
+bool dormant_spawn_thread_array(
+  const exprt &handle,
+  const irep_idt &induction,
+  const namespacet &ns,
+  irep_idt &thread_ids)
+{
+  std::set<irep_idt> identifiers;
+  collect_symbol_identifiers(handle, identifiers);
+  if(identifiers.erase(induction) != 1 || identifiers.size() != 1)
+    return false;
+  thread_ids = *identifiers.begin();
+  const symbolt *symbol = nullptr;
+  return
+    !ns.lookup(thread_ids, symbol) &&
+    symbol->type.id() == ID_array &&
+    contains_symbol(handle, {induction, thread_ids});
+}
+
+bool dormant_spawn_loop(
+  const goto_modelt &goto_model,
+  const namespacet &ns,
+  const std::map<const goto_programt::instructiont *, std::size_t> &positions,
+  goto_programt::const_targett backedge,
+  dormant_spawn_cutofft &summary,
+  std::string &reason)
+{
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != goto_model.goto_functions.function_map.end() &&
+    main->second.body_available(),
+    "dormant spawn loop requires main");
+  const auto &program = main->second.body;
+  if(
+    !backedge->is_goto() || !backedge->condition().is_true() ||
+    backedge->targets.size() != 1)
+  {
+    reason = "dormant_not_backedge";
+    return false;
+  }
+  const auto head = backedge->get_target();
+  const auto exit = std::next(backedge);
+  if(
+    exit == program.instructions.end() ||
+    positions.at(&*head) >= positions.at(&*backedge) ||
+    !head->is_goto() || head->targets.size() != 1 ||
+    head->get_target() != exit)
+  {
+    reason = "dormant_not_canonical";
+    return false;
+  }
+
+  exprt bound;
+  if(
+    !parse_exit_guard(*head, summary.induction, bound) ||
+    !constant_eval(without_cast(bound), {}, summary.bound) ||
+    summary.bound <= 2)
+  {
+    reason = "dormant_bound";
+    return false;
+  }
+  if(
+    head == program.instructions.begin() ||
+    !parse_zero_initialization(
+      *std::prev(head), summary.induction))
+  {
+    reason = "dormant_initialization";
+    return false;
+  }
+  const auto update = std::prev(backedge);
+  irep_idt update_induction;
+  if(
+    !parse_unit_increment(*update, update_induction) ||
+    update_induction != summary.induction)
+  {
+    reason = "dormant_update";
+    return false;
+  }
+
+  std::size_t creates = 0;
+  for(auto instruction = std::next(head); instruction != backedge;
+      ++instruction)
+  {
+    if(instruction == update)
+      continue;
+    if(
+      instruction->is_skip() || instruction->is_location() ||
+      instruction->is_decl() || instruction->is_dead())
+      continue;
+    irep_idt callee;
+    if(
+      !instruction->is_function_call() ||
+      !direct_call_identifier(*instruction, callee) ||
+      callee != "pthread_create" ||
+      !instruction->call_lhs().is_nil() ||
+      instruction->call_arguments().size() != 4 ||
+      !is_zero_constant(instruction->call_arguments()[1]) ||
+      !addressed_symbol(
+        instruction->call_arguments()[2], summary.worker) ||
+      !is_zero_constant(instruction->call_arguments()[3]) ||
+      !dormant_spawn_thread_array(
+        instruction->call_arguments()[0],
+        summary.induction,
+        ns,
+        summary.thread_ids) ||
+      ++creates != 1)
+    {
+      reason = "dormant_loop_effect";
+      return false;
+    }
+    summary.create_instruction = &*instruction;
+  }
+  if(creates != 1)
+  {
+    reason = "dormant_create_count";
+    return false;
+  }
+
+  const auto head_position = positions.at(&*head);
+  const auto exit_position = positions.at(&*exit);
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_goto())
+    {
+      const auto source_position = positions.at(&*instruction);
+      for(const auto &target : instruction->targets)
+      {
+        const auto target_position = positions.at(&*target);
+        if(
+          target_position >= head_position &&
+          target_position < exit_position &&
+          (source_position < head_position ||
+           source_position >= exit_position))
+        {
+          reason = "dormant_alternate_entry";
+          return false;
+        }
+      }
+    }
+    if(
+      positions.at(&*instruction) >= exit_position &&
+      instruction_mentions_any(
+        *instruction, {summary.induction}))
+    {
+      reason = "dormant_induction_observed";
+      return false;
+    }
+  }
+
+  bool after_create_loop = false;
+  for(const auto &entry : goto_model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    if(entry.first == "main")
+      after_create_loop = false;
+    for(auto instruction = entry.second.body.instructions.begin();
+        instruction != entry.second.body.instructions.end(); ++instruction)
+    {
+      if(entry.first == "main" && instruction == exit)
+        after_create_loop = true;
+      irep_idt callee;
+      const bool direct_call =
+        direct_call_identifier(*instruction, callee);
+      if(
+        direct_call && callee == "pthread_create" &&
+        &*instruction != summary.create_instruction)
+      {
+        reason = "dormant_other_create";
+        return false;
+      }
+      if(
+        !instruction_mentions_any(
+          *instruction, {summary.thread_ids}) ||
+        &*instruction == summary.create_instruction ||
+        instruction->is_decl() || instruction->is_dead())
+        continue;
+      if(
+        entry.first == "main" && after_create_loop &&
+        direct_call && callee == "pthread_join")
+      {
+        if(summary.first_join == nullptr)
+          summary.first_join = &*instruction;
+        continue;
+      }
+      reason = "dormant_thread_ids_observed";
+      return false;
+    }
+  }
+
+  summary.head = head;
+  summary.exit = exit;
+  return true;
+}
+
+std::vector<dormant_spawn_cutofft> dormant_spawn_cutoffs(
+  const goto_modelt &goto_model,
+  std::string &last_reason)
+{
+  std::vector<dormant_spawn_cutofft> result;
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  if(
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+  {
+    last_reason = "dormant_missing_main";
+    return result;
+  }
+  const namespacet ns(goto_model.symbol_table);
+  const auto &program = main->second.body;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : program.instructions)
+    positions.emplace(&instruction, position++);
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(
+      !instruction->is_goto() || !instruction->condition().is_true() ||
+      instruction->targets.size() != 1 ||
+      positions.at(&*instruction->get_target()) >=
+        positions.at(&*instruction))
+      continue;
+    dormant_spawn_cutofft summary;
+    std::string reason;
+    if(
+      dormant_spawn_loop(
+        goto_model, ns, positions, instruction, summary, reason))
+      result.push_back(std::move(summary));
+    else
+      last_reason = std::move(reason);
+  }
+  return result;
+}
+
 bool constant_lifecycle_bound(const exprt &expr, unsigned &bound)
 {
   const exprt &value = without_cast(expr);
@@ -8219,6 +8479,98 @@ bool alternating_phase_pair(
     model, creates, joins, producer, consumer, reason);
 }
 } // namespace
+
+bool dormant_spawn_cutoff_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  std::string reason;
+  const auto candidates = dormant_spawn_cutoffs(goto_model, reason);
+  std::cout
+    << "NATIVE_DORMANT_SPAWN_CUTOFF_AUDIT applicable="
+    << (candidates.size() == 1 ? 1 : 0)
+    << " candidates=" << candidates.size();
+  if(candidates.size() == 1)
+  {
+    std::cout
+      << " worker=" << candidates.front().worker
+      << " bound=" << candidates.front().bound
+      << " thread_ids=" << candidates.front().thread_ids
+      << " join=" << (candidates.front().first_join != nullptr ? 1 : 0);
+  }
+  else
+    std::cout
+      << " reason="
+      << (candidates.empty() ? reason : "dormant_candidate_count");
+  std::cout << '\n';
+  (void)message_handler;
+  return candidates.size() == 1;
+}
+
+bool dormant_spawn_cutoff_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  std::string reason;
+  auto candidates = dormant_spawn_cutoffs(goto_model, reason);
+  if(candidates.size() != 1)
+  {
+    std::cout
+      << "NATIVE_DORMANT_SPAWN_CUTOFF applied=0"
+      << " reason="
+      << (candidates.empty() ? reason : "dormant_candidate_count")
+      << " candidates=" << candidates.size() << '\n';
+    return false;
+  }
+  const auto &summary = candidates.front();
+  auto main =
+    goto_model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != goto_model.goto_functions.function_map.end() &&
+    main->second.body_available(),
+    "dormant spawn cutoff requires main");
+  const namespacet ns(goto_model.symbol_table);
+  const symbolt *induction_symbol = nullptr;
+  INVARIANT(
+    !ns.lookup(summary.induction, induction_symbol),
+    "dormant spawn induction exists");
+  auto head =
+    main->second.body.const_cast_target(summary.head);
+  symbol_exprt induction(
+    summary.induction, induction_symbol->type);
+  head->condition_nonconst() = not_exprt(
+    binary_relation_exprt(
+      induction,
+      ID_lt,
+      from_integer(2, induction_symbol->type)));
+
+  bool truncated = false;
+  if(summary.first_join != nullptr)
+  {
+    bool at_join = false;
+    for(auto instruction = main->second.body.instructions.begin();
+        instruction != main->second.body.instructions.end();
+        ++instruction)
+    {
+      if(&*instruction == summary.first_join)
+        at_join = true;
+      if(!at_join || instruction->is_end_function())
+        continue;
+      instruction->turn_into_skip();
+      truncated = true;
+    }
+  }
+  goto_model.goto_functions.update();
+  std::cout
+    << "NATIVE_DORMANT_SPAWN_CUTOFF applied=1"
+    << " worker=" << summary.worker
+    << " original_bound=" << summary.bound
+    << " cutoff=2"
+    << " truncated=" << (truncated ? 1 : 0)
+    << '\n';
+  (void)message_handler;
+  return true;
+}
 
 bool indexed_lifecycle_prefix_audit(
   const goto_modelt &goto_model,

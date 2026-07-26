@@ -576,6 +576,14 @@ int cbmc_parse_optionst::doit()
     indexed_lifecycle_prefix_audit(
       goto_model, ui_message_handler);
 
+  if(cmdline.isset("native-dormant-spawn-cutoff-audit"))
+    dormant_spawn_cutoff_audit(
+      goto_model, ui_message_handler);
+
+  if(cmdline.isset("native-dormant-spawn-cutoff"))
+    dormant_spawn_cutoff_transform(
+      goto_model, ui_message_handler);
+
   if(cmdline.isset("native-indexed-lifecycle-prefix"))
     indexed_lifecycle_prefix_transform(
       goto_model, ui_message_handler);

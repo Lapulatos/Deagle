@@ -78,6 +78,9 @@ def get_result(remove = True):
                 or line.startswith(
                     "NATIVE_INDEXED_LIFECYCLE_PREFIX "
                 )
+                or line.startswith(
+                    "NATIVE_DORMANT_SPAWN_CUTOFF "
+                )
                 or line.startswith("COUNTERFACTUAL_UIP_PROFILE ")
                 or line.startswith("COUNTERFACTUAL_UIP_DOMAIN ")
                 or line.startswith("COUNTERFACTUAL_UIP_DOMAIN_SOURCE ")
@@ -212,6 +215,8 @@ def try_large_unwind_counterexample_rescue(program_path, flags):
         if shallow_bound == 1:
             rescue_args.append("--native-homogeneous-spawn-witness")
             rescue_args.append("--native-alternating-phase-recurrence")
+        if shallow_bound == 3:
+            rescue_args.append("--native-dormant-spawn-cutoff")
         try:
             with open("deagle_tmp_output", "w") as rescue_output:
                 subprocess.run(
