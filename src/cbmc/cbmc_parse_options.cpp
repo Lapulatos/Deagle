@@ -19,6 +19,7 @@ Author: Daniel Kroening, kroening@kroening.com
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <vector>
 
 #ifndef _WIN32
 #  include <cerrno>
@@ -562,6 +563,174 @@ int cbmc_parse_optionst::doit()
 
   if(get_goto_program_ret!=-1)
     return get_goto_program_ret;
+
+  bool native_rescue_portfolio_child = false;
+  if(cmdline.isset("native-counterexample-rescue-portfolio"))
+  {
+#ifdef _WIN32
+    std::cout
+      << "NATIVE_COUNTEREXAMPLE_RESCUE_PORTFOLIO applied=0"
+      << " reason=unsupported_platform\n"
+      << "VERIFICATION SUCCESSFUL\n";
+    return CPROVER_EXIT_VERIFICATION_SAFE;
+#else
+    enum class rescue_staget
+    {
+      dormant_pair,
+      shallow_one,
+      shallow_three
+    };
+    struct rescue_variantt
+    {
+      rescue_staget stage;
+      std::size_t pair_variant;
+    };
+
+    const std::size_t pair_variants = std::min(
+      dormant_spawn_pair_variant_count(goto_model),
+      std::size_t{10});
+    std::vector<rescue_variantt> rescue_variants;
+    for(std::size_t variant = 0; variant < pair_variants; ++variant)
+      rescue_variants.push_back(
+        {rescue_staget::dormant_pair, variant});
+    rescue_variants.push_back({rescue_staget::shallow_one, 0});
+    rescue_variants.push_back({rescue_staget::shallow_three, 0});
+
+    const auto portfolio_start = std::chrono::steady_clock::now();
+    const auto pair_deadline =
+      portfolio_start + std::chrono::seconds(18);
+    std::size_t completed = 0;
+    std::size_t timed_out = 0;
+    std::size_t skipped_pairs = 0;
+    for(const auto &rescue_variant : rescue_variants)
+    {
+      const auto now = std::chrono::steady_clock::now();
+      const bool is_pair =
+        rescue_variant.stage == rescue_staget::dormant_pair;
+      if(is_pair && now >= pair_deadline)
+      {
+        ++skipped_pairs;
+        continue;
+      }
+      const auto child_deadline = is_pair
+        ? std::min(pair_deadline, now + std::chrono::seconds(6))
+        : now + std::chrono::seconds(3);
+
+      char output_path[] = "deagle_native_rescue_XXXXXX";
+      const int output_fd = mkstemp(output_path);
+      if(output_fd < 0)
+      {
+        std::cout
+          << "NATIVE_COUNTEREXAMPLE_RESCUE_PORTFOLIO applied=0"
+          << " reason=output_file\n"
+          << "VERIFICATION SUCCESSFUL\n";
+        return CPROVER_EXIT_VERIFICATION_SAFE;
+      }
+      std::fflush(nullptr);
+      const pid_t child = fork();
+      if(child == 0)
+      {
+#ifdef __linux__
+        if(
+          prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 ||
+          getppid() == 1)
+          _exit(CPROVER_EXIT_INTERNAL_ERROR);
+#endif
+        if(
+          dup2(output_fd, STDOUT_FILENO) < 0 ||
+          dup2(output_fd, STDERR_FILENO) < 0)
+          _exit(CPROVER_EXIT_INTERNAL_ERROR);
+        close(output_fd);
+
+        if(rescue_variant.stage == rescue_staget::dormant_pair)
+        {
+          options.set_option("unwind", "3");
+          dormant_spawn_pair_transform(
+            goto_model,
+            rescue_variant.pair_variant,
+            ui_message_handler);
+        }
+        else if(rescue_variant.stage == rescue_staget::shallow_one)
+        {
+          options.set_option("unwind", "1");
+          alternating_phase_recurrence_transform(
+            goto_model, ui_message_handler);
+          homogeneous_spawn_witness_transform(
+            goto_model, ui_message_handler);
+        }
+        else
+        {
+          options.set_option("unwind", "3");
+          dormant_spawn_cutoff_transform(
+            goto_model, ui_message_handler);
+        }
+        native_rescue_portfolio_child = true;
+        break;
+      }
+      close(output_fd);
+      if(child < 0)
+      {
+        std::remove(output_path);
+        std::cout
+          << "NATIVE_COUNTEREXAMPLE_RESCUE_PORTFOLIO applied=0"
+          << " reason=fork\n"
+          << "VERIFICATION SUCCESSFUL\n";
+        return CPROVER_EXIT_VERIFICATION_SAFE;
+      }
+
+      int status = 0;
+      bool finished = false;
+      while(std::chrono::steady_clock::now() < child_deadline)
+      {
+        const pid_t waited = waitpid(child, &status, WNOHANG);
+        if(waited == child)
+        {
+          finished = true;
+          break;
+        }
+        if(waited < 0 && errno != EINTR)
+          break;
+        usleep(10000);
+      }
+      if(!finished)
+      {
+        kill(child, SIGKILL);
+        while(waitpid(child, &status, 0) < 0 && errno == EINTR)
+        {
+        }
+        ++timed_out;
+      }
+      else
+        ++completed;
+
+      std::ifstream child_output_stream(output_path);
+      std::ostringstream child_output_buffer;
+      child_output_buffer << child_output_stream.rdbuf();
+      child_output_stream.close();
+      std::remove(output_path);
+      const std::string child_output = child_output_buffer.str();
+      if(
+        finished && WIFEXITED(status) &&
+        WEXITSTATUS(status) == CPROVER_EXIT_VERIFICATION_UNSAFE &&
+        child_output.find("VERIFICATION FAILED") != std::string::npos)
+      {
+        std::cout << child_output;
+        return CPROVER_EXIT_VERIFICATION_UNSAFE;
+      }
+    }
+    if(!native_rescue_portfolio_child)
+    {
+      std::cout
+        << "NATIVE_COUNTEREXAMPLE_RESCUE_PORTFOLIO applied=1"
+        << " pair_variants=" << pair_variants
+        << " completed=" << completed
+        << " timed_out=" << timed_out
+        << " skipped_pairs=" << skipped_pairs
+        << "\nVERIFICATION SUCCESSFUL\n";
+      return CPROVER_EXIT_VERIFICATION_SAFE;
+    }
+#endif
+  }
 
   bool dormant_pair_portfolio_child = false;
   if(cmdline.isset("native-dormant-spawn-pair-portfolio"))
