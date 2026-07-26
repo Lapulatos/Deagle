@@ -3490,8 +3490,7 @@ bool lock_relational_ai_transform(
     !validate_congruence_alias_escapes(analysis) ||
     !validate_congruence_alias_initialization(analysis) ||
     !validate_model(analysis) ||
-    !collect_protection(analysis) ||
-    !validate_region_lock_congruence(analysis))
+    !collect_protection(analysis))
   {
     std::cout << "NATIVE_LOCK_RELATIONAL_AI applied=0 reason="
               << analysis.reason

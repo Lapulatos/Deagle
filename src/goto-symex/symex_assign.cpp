@@ -19,6 +19,8 @@ Author: Daniel Kroening, kroening@kroening.com
 
 #include "symex_config.h"
 
+#include <algorithm>
+
 // We can either use with_exprt or update_exprt when building expressions that
 // modify components of an array or a struct. Set USE_UPDATE to use
 // update_exprt.
@@ -32,6 +34,22 @@ constexpr bool use_update()
   return false;
 #endif
 }
+
+namespace
+{
+bool has_dereference_event_guard_marker(const exprt &expr)
+{
+  if(expr.get_bool("#value_set_dereference_event_guard"))
+    return true;
+
+  for(const auto &operand : expr.operands())
+  {
+    if(has_dereference_event_guard_marker(operand))
+      return true;
+  }
+  return false;
+}
+} // namespace
 
 void symex_assignt::assign_rec(
   const exprt &lhs,
@@ -153,30 +171,83 @@ void symex_assignt::assign_non_struct_symbol(
   const exprt &rhs,
   const exprt::operandst &guard)
 {
-  exprt l2_rhs =
-    state
-      .rename(
-        // put assignment guard into the rhs
-        guard.empty()
-          ? rhs
-          : static_cast<exprt>(if_exprt{conjunction(guard), rhs, lhs}),
-        ns)
-      .get();
+  const bool dereference_guarded =
+    std::any_of(
+      guard.begin(),
+      guard.end(),
+      [](const exprt &guard_expr) {
+        return has_dereference_event_guard_marker(guard_expr);
+      });
+
+  const exprt assignment_guard = conjunction(guard);
+  exprt l2_rhs;
+  if(!dereference_guarded)
+  {
+    // Preserve the original Deagle event traversal and SSA expression for
+    // every assignment not produced by conditional dereference.
+    l2_rhs =
+      state
+        .rename(
+          guard.empty()
+            ? rhs
+            : static_cast<exprt>(if_exprt{assignment_guard, rhs, lhs}),
+          ns)
+        .get();
+  }
+  else if(guard.empty())
+    l2_rhs = state.rename(rhs, ns).get();
+  else
+  {
+    // Rename only the real RHS with event recording enabled. The old-LHS
+    // branch preserves the SSA value when this conditional assignment is
+    // inactive and is not a source-level memory access.
+    const exprt saved_event_guard = state.event_guard_context;
+    state.event_guard_context =
+      make_and(saved_event_guard, assignment_guard);
+    l2_rhs = state.rename(rhs, ns).get();
+    state.event_guard_context = saved_event_guard;
+
+    state.record_events.push(false);
+    exprt old_lhs = state.rename(lhs, ns).get();
+    state.record_events.pop();
+    l2_rhs = if_exprt{assignment_guard, l2_rhs, old_lhs};
+  }
 
   assignmentt assignment{lhs, full_lhs, l2_rhs};
 
   if(symex_config.simplify_opt)
     assignment.rhs = simplify_expr(std::move(assignment.rhs), ns);
 
-  const ssa_exprt l2_lhs = state
-                             .assignment(
-                               assignment.lhs,
-                               assignment.rhs,
-                               ns,
-                               symex_config.simplify_opt,
-                               symex_config.constant_propagation,
-                               symex_config.allow_pointer_unsoundness)
-                             .get();
+  const ssa_exprt l2_lhs = [&]() {
+    if(dereference_guarded)
+    {
+      const exprt saved_event_guard = state.event_guard_context;
+      state.event_guard_context =
+        make_and(saved_event_guard, assignment_guard);
+      const ssa_exprt result =
+        state
+          .assignment(
+            assignment.lhs,
+            assignment.rhs,
+            ns,
+            symex_config.simplify_opt,
+            symex_config.constant_propagation,
+            symex_config.allow_pointer_unsoundness)
+          .get();
+      state.event_guard_context = saved_event_guard;
+      return result;
+    }
+
+    return state
+      .assignment(
+        assignment.lhs,
+        assignment.rhs,
+        ns,
+        symex_config.simplify_opt,
+        symex_config.constant_propagation,
+        symex_config.allow_pointer_unsoundness)
+      .get();
+  }();
 
   state.record_events.push(false);
   // Note any other symbols mentioned in the skeleton are rvalues -- for example

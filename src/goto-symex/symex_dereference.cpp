@@ -27,6 +27,65 @@ Author: Daniel Kroening, kroening@kroening.com
 #include "symex_assign.h"
 #include "symex_dereference_state.h"
 
+namespace
+{
+const irep_idt dereference_event_guard_marker =
+  "#value_set_dereference_event_guard";
+
+bool has_dynamic_object_root(
+  const exprt &expr,
+  const std::set<symbol_exprt> &dynamic_objects)
+{
+  if(expr.id() == ID_symbol)
+  {
+    const auto &symbol = to_symbol_expr(expr);
+    const std::string identifier =
+      is_ssa_expr(symbol)
+        ? id2string(to_ssa_expr(symbol).get_original_name())
+        : id2string(symbol.get_identifier());
+
+    for(const auto &dynamic_object : dynamic_objects)
+    {
+      const std::string root = id2string(dynamic_object.get_identifier());
+      if(
+        identifier == root ||
+        (identifier.size() > root.size() &&
+         identifier.compare(0, root.size(), root) == 0 &&
+         (identifier[root.size()] == '.' || identifier[root.size()] == '[')))
+        return true;
+    }
+  }
+
+  for(const auto &operand : expr.operands())
+  {
+    if(has_dynamic_object_root(operand, dynamic_objects))
+      return true;
+  }
+  return false;
+}
+
+/// Mark only conditional alternatives synthesized while lowering a
+/// dereference that actually select a dynamically allocated object. Static
+/// array/pointer lowering remains on the original Deagle event path.
+void mark_dereference_event_guards(
+  exprt &expr,
+  const std::set<symbol_exprt> &dynamic_objects)
+{
+  for(auto &operand : expr.operands())
+    mark_dereference_event_guards(operand, dynamic_objects);
+
+  if(
+    expr.id() == ID_if &&
+    has_dynamic_object_root(expr, dynamic_objects))
+  {
+    expr.set(dereference_event_guard_marker, true);
+    // Conditional-LHS assignment recursion keeps only the condition in its
+    // guard vector, so preserve the same provenance there as well.
+    to_if_expr(expr).cond().set(dereference_event_guard_marker, true);
+  }
+}
+} // namespace
+
 /// Transforms an lvalue expression by replacing any dereference operations it
 /// contains with explicit references to the objects they may point to (using
 /// \ref goto_symext::dereference_rec), and translates `byte_extract,` `member`
@@ -335,6 +394,7 @@ void goto_symext::dereference_rec(
     // std::cout << "**** " << format(tmp1) << '\n';
     exprt tmp2 =
       dereference.dereference(tmp1, symex_config.show_points_to_sets);
+    mark_dereference_event_guards(tmp2, dynamic_objects);
     // std::cout << "**** " << format(tmp2) << '\n';
 
 

@@ -214,6 +214,12 @@ public:
 
   std::stack<bool> record_events;
 
+  // Additional expression-local condition for shared-memory events. Unlike
+  // `guard`, this does not change control-flow reachability or state merging;
+  // it only records which operand of a conditional expression caused an
+  // access.
+  exprt event_guard_context;
+
   const incremental_dirtyt *dirty = nullptr;
 
   goto_programt::const_targett saved_target;

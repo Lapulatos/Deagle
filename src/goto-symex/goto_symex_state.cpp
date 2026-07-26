@@ -40,6 +40,7 @@ goto_symex_statet::goto_symex_statet(
     symex_target(nullptr),
     field_sensitivity(max_field_sensitive_array_size, should_simplify),
     record_events({true}),
+    event_guard_context(true_exprt()),
     fresh_l2_name_provider(fresh_l2_name_provider)
 {
   threads.emplace_back(guard_manager);
@@ -278,6 +279,20 @@ goto_symex_statet::rename(exprt expr, const namespacet &ns)
     }
     // szh : for points-to ifthenelse: ptr = address_of(a) ? a : ptr = address_of(b) ? b : ...
     // we visit in the "if else then" order so that ptrs are together
+    else if(
+      expr.id() == ID_if &&
+      expr.get_bool("#value_set_dereference_event_guard"))
+    {
+      expr.op0() = rename<level>(std::move(expr.op0()), ns).get();
+      const exprt condition = expr.op0();
+      const exprt saved_event_guard = event_guard_context;
+      event_guard_context =
+        make_and(saved_event_guard, not_exprt(condition));
+      expr.op2() = rename<level>(std::move(expr.op2()), ns).get();
+      event_guard_context = make_and(saved_event_guard, condition);
+      expr.op1() = rename<level>(std::move(expr.op1()), ns).get();
+      event_guard_context = saved_event_guard;
+    }
     else if(expr.id() == ID_if)
     {
       expr.op0() = rename<level>(std::move(expr.op0()), ns).get();
@@ -423,7 +438,8 @@ bool goto_symex_statet::l2_thread_read_encoding(
 
   const ssa_exprt ssa_l1 = remove_level_2(expr);
   const irep_idt &l1_identifier=ssa_l1.get_identifier();
-  const exprt guard_as_expr = guard.as_expr();
+  const exprt guard_as_expr =
+    make_and(guard.as_expr(), event_guard_context);
 
   // see whether we are within an atomic section
   if(atomic_section_id!=0)
@@ -602,7 +618,7 @@ bool goto_symex_statet::l2_thread_write_encoding(
 
   // record a shared write
   symex_target->shared_write(
-    guard.as_expr(),
+    make_and(guard.as_expr(), event_guard_context),
     expr,
     atomic_section_id,
     source);
