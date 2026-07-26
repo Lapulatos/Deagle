@@ -107,6 +107,13 @@ bool is_join(const irep_idt &identifier)
   return named(identifier, "pthread_join");
 }
 
+bool is_allocator(const irep_idt &identifier)
+{
+  return
+    named(identifier, "malloc") ||
+    named(identifier, "calloc");
+}
+
 bool is_property(const irep_idt &identifier)
 {
   return named(identifier, "__VERIFIER_assert");
@@ -270,6 +277,21 @@ bool meet_interval(intervalt &dest, const intervalt &src)
     !(dest.lower_set && dest.upper_set && dest.lower > dest.upper);
 }
 
+struct region_selectort
+{
+  std::string container;
+  std::string selector;
+  irep_idt selector_symbol;
+
+  bool operator==(const region_selectort &other) const
+  {
+    return
+      container == other.container &&
+      selector == other.selector &&
+      selector_symbol == other.selector_symbol;
+  }
+};
+
 struct analysist
 {
   using alias_contextt = std::map<irep_idt, std::string>;
@@ -280,6 +302,14 @@ struct analysist
   std::map<irep_idt, std::string> aliases;
   std::set<irep_idt> congruence_aliases;
   std::set<irep_idt> static_initialized_aliases;
+  std::set<irep_idt> region_summary_functions;
+  std::set<irep_idt> region_initializers;
+  std::set<irep_idt> region_inserters;
+  std::map<irep_idt, std::size_t> region_return_parameters;
+  std::map<irep_idt, std::size_t> region_insert_node_parameters;
+  std::set<irep_idt> region_zero_fields;
+  std::map<irep_idt, region_selectort> region_selectors;
+  std::set<std::string> region_roots;
   std::map<irep_idt, std::vector<alias_contextt>> function_contexts;
   const alias_contextt *active_aliases;
   std::map<std::string, intervalt> initial;
@@ -323,6 +353,292 @@ struct analysist
     return
       type.id() == ID_pointer &&
       ns.follow(to_pointer_type(type).base_type()).id() != ID_code;
+  }
+
+  std::vector<irep_idt> data_pointer_parameters(
+    const irep_idt &function) const
+  {
+    std::vector<irep_idt> result;
+    const auto symbol = model.symbol_table.symbols.find(function);
+    if(
+      symbol == model.symbol_table.symbols.end() ||
+      symbol->second.type.id() != ID_code)
+      return result;
+    for(const auto &parameter :
+        to_code_type(symbol->second.type).parameters())
+    {
+      const irep_idt identifier = parameter.get_identifier();
+      if(!identifier.empty() && data_pointer(identifier))
+        result.push_back(identifier);
+    }
+    return result;
+  }
+
+  bool pointer_member_of(
+    const exprt &src,
+    irep_idt &pointer,
+    irep_idt &field) const
+  {
+    const exprt &expr = strip(src);
+    if(expr.id() != ID_member)
+      return false;
+    const member_exprt &member = to_member_expr(expr);
+    const exprt &compound = strip(member.compound());
+    if(compound.id() != ID_dereference)
+      return false;
+    if(
+      !symbol_id(
+        to_dereference_expr(compound).pointer(), pointer))
+      return false;
+    field = member.get_component_name();
+    return true;
+  }
+
+  bool discover_region_initializer(
+    const irep_idt &function,
+    const goto_programt &program)
+  {
+    const auto parameters = data_pointer_parameters(function);
+    if(parameters.size() != 1)
+      return false;
+    bool scalar_zero = false;
+    irep_idt scalar_field;
+    for(const auto &instruction : program.instructions)
+    {
+      if(
+        instruction.is_skip() || instruction.is_location() ||
+        instruction.is_decl() || instruction.is_dead() ||
+        instruction.is_end_function())
+        continue;
+      if(!instruction.is_assign())
+        return false;
+      irep_idt pointer;
+      irep_idt field;
+      if(
+        !pointer_member_of(
+          instruction.assign_lhs(), pointer, field) ||
+        pointer != parameters.front())
+        return false;
+      const typet &type =
+        ns.follow(instruction.assign_lhs().type());
+      if(type.id() == ID_signedbv)
+      {
+        long long value;
+        if(
+          !integer_constant(
+            instruction.assign_rhs(), value) ||
+          value != 0 ||
+          (scalar_zero && scalar_field != field))
+          return false;
+        scalar_zero = true;
+        scalar_field = field;
+      }
+      else if(
+        type.id() != ID_pointer ||
+        !strip(instruction.assign_rhs()).is_zero())
+        return false;
+    }
+    if(!scalar_zero)
+      return false;
+    region_zero_fields.insert(scalar_field);
+    return true;
+  }
+
+  bool discover_region_traversal(
+    const irep_idt &function,
+    const goto_programt &program,
+    std::size_t &parameter_index)
+  {
+    const auto symbol = model.symbol_table.symbols.find(function);
+    if(
+      symbol == model.symbol_table.symbols.end() ||
+      symbol->second.type.id() != ID_code)
+      return false;
+    const auto &parameters =
+      to_code_type(symbol->second.type).parameters();
+    std::vector<std::pair<std::size_t, irep_idt>> pointers;
+    for(std::size_t index = 0; index < parameters.size(); ++index)
+    {
+      const irep_idt identifier =
+        parameters[index].get_identifier();
+      if(!identifier.empty() && data_pointer(identifier))
+        pointers.push_back({index, identifier});
+    }
+    if(pointers.size() != 1)
+      return false;
+
+    std::set<irep_idt> derived{pointers.front().second};
+    bool changed = true;
+    while(changed)
+    {
+      changed = false;
+      for(const auto &instruction : program.instructions)
+      {
+        if(!instruction.is_assign())
+          continue;
+        irep_idt lhs;
+        if(
+          !symbol_id(instruction.assign_lhs(), lhs) ||
+          !data_pointer(lhs))
+          continue;
+        const exprt &rhs = strip(instruction.assign_rhs());
+        irep_idt source;
+        if(symbol_id(rhs, source) && derived.count(source) != 0)
+          changed |= derived.insert(lhs).second;
+        else
+        {
+          irep_idt base;
+          irep_idt field;
+          if(
+            pointer_member_of(rhs, base, field) &&
+            derived.count(base) != 0 &&
+            ns.follow(rhs.type()).id() == ID_pointer)
+            changed |= derived.insert(lhs).second;
+        }
+      }
+    }
+
+    bool returned = false;
+    bool traversed = false;
+    for(const auto &instruction : program.instructions)
+    {
+      irep_idt callee;
+      if(instruction.is_function_call())
+      {
+        if(
+          !call_id(instruction, callee) ||
+          (!is_lock(callee) && !is_unlock(callee)))
+          return false;
+        continue;
+      }
+      if(instruction.is_set_return_value())
+      {
+        irep_idt result;
+        if(
+          !symbol_id(instruction.return_value(), result) ||
+          derived.count(result) == 0)
+          return false;
+        returned = true;
+        continue;
+      }
+      if(!instruction.is_assign())
+        continue;
+      irep_idt pointer;
+      irep_idt field;
+      if(pointer_member_of(instruction.assign_lhs(), pointer, field))
+        return false;
+      if(pointer_member_of(instruction.assign_rhs(), pointer, field))
+      {
+        if(derived.count(pointer) == 0)
+          return false;
+        traversed = true;
+      }
+    }
+    if(!returned || !traversed)
+      return false;
+    parameter_index = pointers.front().first;
+    return true;
+  }
+
+  bool discover_region_inserter(
+    const irep_idt &function,
+    const goto_programt &program,
+    std::size_t &node_parameter_index)
+  {
+    const auto symbol = model.symbol_table.symbols.find(function);
+    if(
+      symbol == model.symbol_table.symbols.end() ||
+      symbol->second.type.id() != ID_code)
+      return false;
+    const auto &parameters =
+      to_code_type(symbol->second.type).parameters();
+    std::vector<std::pair<std::size_t, irep_idt>> pointers;
+    for(std::size_t index = 0; index < parameters.size(); ++index)
+    {
+      const irep_idt identifier =
+        parameters[index].get_identifier();
+      if(!identifier.empty() && data_pointer(identifier))
+        pointers.push_back({index, identifier});
+    }
+    if(pointers.size() != 2)
+      return false;
+    std::set<irep_idt> derived{
+      pointers[0].second, pointers[1].second};
+    bool link_write = false;
+    for(const auto &instruction : program.instructions)
+    {
+      irep_idt callee;
+      if(instruction.is_function_call())
+      {
+        if(
+          !call_id(instruction, callee) ||
+          (!is_lock(callee) && !is_unlock(callee)))
+          return false;
+        continue;
+      }
+      if(instruction.is_set_return_value())
+        return false;
+      if(!instruction.is_assign())
+        continue;
+      irep_idt lhs;
+      if(symbol_id(instruction.assign_lhs(), lhs))
+      {
+        if(data_pointer(lhs))
+          derived.insert(lhs);
+        continue;
+      }
+      irep_idt pointer;
+      irep_idt field;
+      if(
+        !pointer_member_of(
+          instruction.assign_lhs(), pointer, field) ||
+        derived.count(pointer) == 0 ||
+        ns.follow(instruction.assign_lhs().type()).id() !=
+          ID_pointer)
+        return false;
+      link_write = true;
+    }
+    if(!link_write)
+      return false;
+    node_parameter_index = pointers.front().first;
+    return true;
+  }
+
+  void discover_region_summaries()
+  {
+    for(const auto &entry : model.goto_functions.function_map)
+    {
+      if(!user_function(entry.first))
+        continue;
+      if(discover_region_initializer(entry.first, entry.second.body))
+      {
+        region_initializers.insert(entry.first);
+        region_summary_functions.insert(entry.first);
+      }
+    }
+    if(region_initializers.empty())
+      return;
+    for(const auto &entry : model.goto_functions.function_map)
+    {
+      if(!user_function(entry.first))
+        continue;
+      std::size_t parameter = 0;
+      if(
+        discover_region_traversal(
+          entry.first, entry.second.body, parameter))
+      {
+        region_return_parameters[entry.first] = parameter;
+        region_summary_functions.insert(entry.first);
+      }
+      else if(
+        discover_region_inserter(
+          entry.first, entry.second.body, parameter))
+      {
+        region_inserters.insert(entry.first);
+        region_insert_node_parameters[entry.first] = parameter;
+        region_summary_functions.insert(entry.first);
+      }
+    }
   }
 
   bool atom(const exprt &src, std::string &key) const
@@ -416,11 +732,48 @@ struct analysist
     return shared(lock);
   }
 
+  bool region_argument(
+    const exprt &src,
+    std::string &target,
+    region_selectort &selector) const
+  {
+    const exprt &argument = strip(src);
+    if(!atom(argument, target) || !shared(target))
+      return false;
+    selector = region_selectort{};
+    if(
+      argument.id() == ID_index &&
+      argument.operands().size() == 2)
+    {
+      std::string container;
+      if(!atom(argument.op0(), container) || !shared(container))
+        return false;
+      const exprt &index = strip(argument.op1());
+      selector.container = container;
+      if(index.id() == ID_symbol)
+      {
+        selector.selector_symbol =
+          to_symbol_expr(index).get_identifier();
+        selector.selector =
+          "s:" + id2string(selector.selector_symbol);
+      }
+      else if(index.id() == ID_constant)
+        selector.selector =
+          "c:" + id2string(index.get(ID_value));
+      else
+        return false;
+    }
+    target += "#<region>";
+    return true;
+  }
+
   void collect_aliases()
   {
     std::map<irep_idt, std::set<std::string>> candidates;
     std::set<irep_idt> incompatible;
+    std::set<irep_idt> noncopy_pointer_assignments;
     std::vector<std::pair<irep_idt, irep_idt>> copies;
+    std::vector<std::pair<irep_idt, irep_idt>> selector_copies;
     for(const auto &entry : model.symbol_table.symbols)
     {
       const symbolt &symbol = entry.second;
@@ -460,6 +813,7 @@ struct analysist
             {
               if(rhs.id() == ID_address_of)
               {
+                noncopy_pointer_assignments.insert(pointer);
                 std::string target;
                 if(
                   atom(to_address_of_expr(rhs).object(), target) &&
@@ -475,7 +829,10 @@ struct analysist
                   }
                 }
                 else
+                {
+                  noncopy_pointer_assignments.insert(pointer);
                   incompatible.insert(pointer);
+                }
               }
               else if(
                 function_entry.first == INITIALIZE_FUNCTION &&
@@ -492,10 +849,14 @@ struct analysist
                   data_pointer(source))
                 {
                   copies.push_back({pointer, source});
+                  selector_copies.push_back({pointer, source});
                   congruence_aliases.insert(pointer);
                 }
                 else
+                {
+                  noncopy_pointer_assignments.insert(pointer);
                   incompatible.insert(pointer);
+                }
               }
             }
           }
@@ -504,6 +865,36 @@ struct analysist
         irep_idt callee;
         if(!call_id(instruction, callee))
           continue;
+        const auto region_return =
+          region_return_parameters.find(callee);
+        if(region_return != region_return_parameters.end())
+        {
+          irep_idt lhs;
+          const auto &arguments = instruction.call_arguments();
+          if(
+            instruction.call_lhs().is_nil() ||
+            !symbol_id(instruction.call_lhs(), lhs) ||
+            region_return->second >= arguments.size())
+            continue;
+          std::string target;
+          region_selectort selector;
+          if(
+            region_argument(
+              arguments[region_return->second],
+              target, selector))
+          {
+            candidates[lhs].insert(target);
+            region_roots.insert(
+              target.substr(
+                0, target.size() -
+                     std::string("#<region>").size()));
+            if(!selector.selector.empty())
+              region_selectors[lhs] = std::move(selector);
+          }
+          else
+            incompatible.insert(lhs);
+          continue;
+        }
         const auto symbol = model.symbol_table.symbols.find(callee);
         if(
           symbol == model.symbol_table.symbols.end() ||
@@ -551,12 +942,61 @@ struct analysist
         source == candidates.end() || source->second.empty())
         incompatible.insert(copy.first);
     }
+    changed = true;
+    while(changed)
+    {
+      changed = false;
+      for(const auto &copy : selector_copies)
+      {
+        const auto source = region_selectors.find(copy.second);
+        if(source == region_selectors.end())
+          continue;
+        const auto destination = region_selectors.find(copy.first);
+        if(destination == region_selectors.end())
+        {
+          region_selectors[copy.first] = source->second;
+          changed = true;
+        }
+        else if(!(destination->second == source->second))
+        {
+          incompatible.insert(copy.first);
+          region_selectors.erase(copy.first);
+        }
+      }
+    }
     for(const auto &entry : candidates)
     {
       if(
         entry.second.size() == 1 &&
-        incompatible.count(entry.first) == 0)
+        (incompatible.count(entry.first) == 0 ||
+         (
+           noncopy_pointer_assignments.count(entry.first) == 0 &&
+           entry.second.begin()->size() >=
+             std::string("#<region>").size() &&
+           entry.second.begin()->compare(
+             entry.second.begin()->size() -
+               std::string("#<region>").size(),
+             std::string("#<region>").size(),
+             "#<region>") == 0)))
         aliases[entry.first] = *entry.second.begin();
+    }
+    for(const auto &entry : aliases)
+    {
+      if(
+        entry.second.size() >=
+          std::string("#<region>").size() &&
+        entry.second.compare(
+          entry.second.size() -
+            std::string("#<region>").size(),
+          std::string("#<region>").size(),
+          "#<region>") == 0)
+      {
+        congruence_aliases.erase(entry.first);
+        for(const auto &field : region_zero_fields)
+          initial[
+            entry.second + "#" + id2string(field)] =
+              intervalt::singleton(0);
+      }
     }
     for(auto iterator = congruence_aliases.begin();
         iterator != congruence_aliases.end();)
@@ -779,6 +1219,9 @@ struct analysist
       identifier == INITIALIZE_FUNCTION ||
       identifier == goto_functionst::entry_point() ||
       identifier == "__spawned_thread" ||
+      region_summary_functions.count(identifier) != 0 ||
+      (!region_return_parameters.empty() &&
+       is_allocator(identifier)) ||
       ignored_external(identifier) ||
       named(identifier, "pthread_"))
       return false;
@@ -794,6 +1237,252 @@ struct lock_nodet
   std::size_t index;
   std::vector<std::string> stack;
 };
+
+bool validate_region_publication(analysist &analysis)
+{
+  if(analysis.region_return_parameters.empty())
+    return true;
+
+  for(auto &function_entry :
+      analysis.model.goto_functions.function_map)
+  {
+    if(
+      analysis.region_summary_functions.count(
+        function_entry.first) != 0)
+      continue;
+    auto &program = function_entry.second.body;
+    std::vector<goto_programt::targett> order;
+    std::map<const goto_programt::instructiont *, std::size_t>
+      positions;
+    for(auto iterator = program.instructions.begin();
+        iterator != program.instructions.end(); ++iterator)
+    {
+      positions[&*iterator] = order.size();
+      order.push_back(iterator);
+    }
+    if(order.empty())
+      continue;
+    std::vector<bool> reached(order.size(), false);
+    std::vector<std::set<irep_idt>> states(order.size());
+    std::deque<std::size_t> work;
+    reached[0] = true;
+    work.push_back(0);
+    while(!work.empty())
+    {
+      const std::size_t index = work.front();
+      work.pop_front();
+      std::set<irep_idt> after = states[index];
+      const auto &instruction = *order[index];
+      if(instruction.is_assign())
+      {
+        irep_idt member_pointer;
+        irep_idt member_field;
+        if(
+          analysis.pointer_member_of(
+            instruction.assign_lhs(),
+            member_pointer, member_field) &&
+          analysis.region_zero_fields.count(member_field) != 0)
+          after.erase(member_pointer);
+        irep_idt lhs;
+        if(
+          symbol_id(instruction.assign_lhs(), lhs) &&
+          analysis.data_pointer(lhs))
+        {
+          irep_idt rhs;
+          if(
+            symbol_id(instruction.assign_rhs(), rhs) &&
+            after.count(rhs) != 0)
+            after.insert(lhs);
+          else
+            after.erase(lhs);
+        }
+      }
+      irep_idt callee;
+      if(call_id(instruction, callee))
+      {
+        if(named(callee, "free") || named(callee, "realloc"))
+        {
+          analysis.reason = "region_deallocation";
+          return false;
+        }
+        if(
+          analysis.region_initializers.count(callee) != 0)
+        {
+          if(instruction.call_arguments().size() != 1)
+          {
+            analysis.reason = "region_initializer_arity";
+            return false;
+          }
+          irep_idt initialized;
+          if(
+            symbol_id(
+              instruction.call_arguments().front(),
+              initialized))
+            after.insert(initialized);
+          else
+          {
+            analysis.reason = "region_initializer_argument";
+            return false;
+          }
+        }
+        const auto inserter =
+          analysis.region_insert_node_parameters.find(callee);
+        if(inserter !=
+           analysis.region_insert_node_parameters.end())
+        {
+          if(
+            inserter->second >=
+              instruction.call_arguments().size())
+          {
+            analysis.reason = "region_inserter_arity";
+            return false;
+          }
+          irep_idt node;
+          if(
+            !symbol_id(
+              instruction.call_arguments()[inserter->second],
+              node) ||
+            after.count(node) == 0)
+          {
+            analysis.reason =
+              "region_publish_before_initialization";
+            return false;
+          }
+        }
+      }
+
+      std::vector<std::size_t> successors;
+      if(instruction.is_goto())
+      {
+        for(const auto &target : instruction.targets)
+          successors.push_back(positions.at(&*target));
+        if(
+          !instruction.condition().is_true() &&
+          index + 1 < order.size())
+          successors.push_back(index + 1);
+      }
+      else if(
+        !instruction.is_end_function() &&
+        index + 1 < order.size())
+        successors.push_back(index + 1);
+      for(const auto successor : successors)
+      {
+        if(!reached[successor])
+        {
+          reached[successor] = true;
+          states[successor] = after;
+          work.push_back(successor);
+        }
+        else
+        {
+          std::set<irep_idt> intersection;
+          std::set_intersection(
+            states[successor].begin(),
+            states[successor].end(),
+            after.begin(), after.end(),
+            std::inserter(
+              intersection, intersection.begin()));
+          if(intersection != states[successor])
+          {
+            states[successor] = std::move(intersection);
+            work.push_back(successor);
+          }
+        }
+      }
+    }
+  }
+
+  const auto main_function =
+    analysis.model.goto_functions.function_map.find(ID_main);
+  if(main_function ==
+     analysis.model.goto_functions.function_map.end())
+  {
+    analysis.reason = "region_main_missing";
+    return false;
+  }
+  std::set<irep_idt> initialized_pointers;
+  std::set<std::string> initialized_roots;
+  for(const auto &instruction :
+      main_function->second.body.instructions)
+  {
+    if(instruction.is_assign())
+    {
+      irep_idt member_pointer;
+      irep_idt member_field;
+      if(
+        analysis.pointer_member_of(
+          instruction.assign_lhs(),
+          member_pointer, member_field) &&
+        analysis.region_zero_fields.count(member_field) != 0)
+      {
+        initialized_pointers.erase(member_pointer);
+        initialized_roots.erase(
+          id2string(member_pointer));
+      }
+      irep_idt lhs;
+      if(
+        symbol_id(instruction.assign_lhs(), lhs) &&
+        analysis.data_pointer(lhs))
+      {
+        irep_idt rhs;
+        if(
+          symbol_id(instruction.assign_rhs(), rhs) &&
+          initialized_pointers.count(rhs) != 0)
+          initialized_pointers.insert(lhs);
+        else
+          initialized_pointers.erase(lhs);
+      }
+      std::string root;
+      if(
+        analysis.atom(instruction.assign_lhs(), root) &&
+        analysis.region_roots.count(root) != 0)
+      {
+        irep_idt source;
+        if(
+          symbol_id(instruction.assign_rhs(), source) &&
+          initialized_pointers.count(source) != 0)
+          initialized_roots.insert(root);
+        else
+          initialized_roots.erase(root);
+      }
+    }
+    irep_idt callee;
+    if(!call_id(instruction, callee))
+      continue;
+    if(analysis.region_initializers.count(callee) != 0)
+    {
+      if(instruction.call_arguments().size() != 1)
+      {
+        analysis.reason = "region_initializer_arity";
+        return false;
+      }
+      const exprt &argument =
+        instruction.call_arguments().front();
+      irep_idt initialized;
+      if(symbol_id(argument, initialized))
+        initialized_pointers.insert(initialized);
+      std::string root;
+      if(
+        analysis.atom(argument, root) &&
+        analysis.region_roots.count(root) != 0)
+        initialized_roots.insert(root);
+    }
+    if(is_create(callee))
+    {
+      for(const auto &root : analysis.region_roots)
+      {
+        if(initialized_roots.count(root) == 0)
+        {
+          analysis.reason =
+            "region_root_not_initialized";
+          return false;
+        }
+      }
+      break;
+    }
+  }
+  return true;
+}
 
 bool zero_test_when_true(
   const exprt &src,
@@ -849,6 +1538,10 @@ void collect_expr_atoms(
   std::string key;
   if(analysis.atom(expr, key))
   {
+    if(
+      analysis.region_roots.count(key) != 0 &&
+      analysis.ns.follow(expr.type()).id() == ID_pointer)
+      return;
     if(analysis.shared(key))
       atoms.insert(key);
     return;
@@ -876,7 +1569,14 @@ bool validate_expression(
     std::string resolved;
     if(!analysis.atom(expr, resolved))
     {
-      analysis.reason = "unresolved_dereference";
+      irep_idt unresolved_pointer;
+      analysis.reason =
+        symbol_id(
+          to_dereference_expr(expr).pointer(),
+          unresolved_pointer)
+          ? "unresolved_dereference_" +
+              id2string(unresolved_pointer)
+          : "unresolved_dereference_expression";
       return false;
     }
   }
@@ -885,10 +1585,20 @@ bool validate_expression(
   {
     const typet &type = analysis.ns.follow(expr.type());
     if(
+      type.id() == ID_pointer &&
+      analysis.region_roots.count(key) != 0)
+      return true;
+    if(
+      !analysis.region_return_parameters.empty() &&
+      key == "__CPROVER_max_malloc_size")
+      return true;
+    if(
       type.id() != ID_signedbv ||
       type.get_bool(ID_C_volatile))
     {
-      analysis.reason = "shared_scalar_type";
+      analysis.reason =
+        "shared_scalar_type_" + key + "_" +
+        id2string(type.id());
       return false;
     }
     return true;
@@ -1236,6 +1946,25 @@ void collect_indexed_origins(
     collect_indexed_origins(analysis, operand, origins);
 }
 
+void collect_region_pointer_uses(
+  const analysist &analysis,
+  const exprt &src,
+  std::set<irep_idt> &pointers)
+{
+  const exprt &expr = strip(src);
+  if(expr.id() == ID_dereference)
+  {
+    irep_idt pointer;
+    if(
+      symbol_id(
+        to_dereference_expr(expr).pointer(), pointer) &&
+      analysis.region_selectors.count(pointer) != 0)
+      pointers.insert(pointer);
+  }
+  for(const auto &operand : expr.operands())
+    collect_region_pointer_uses(analysis, operand, pointers);
+}
+
 bool validate_index_relations(
   analysist &analysis,
   const goto_programt &program)
@@ -1243,6 +1972,8 @@ bool validate_index_relations(
   std::vector<indexed_origint> held_indexed_locks;
   std::map<irep_idt, indexed_origint> captured;
   std::set<std::pair<std::string, irep_idt>> drifted;
+  std::set<irep_idt> drifted_region_pointers;
+  std::set<irep_idt> active_region_pointers;
 
   for(const auto &instruction : program.instructions)
   {
@@ -1295,6 +2026,14 @@ bool validate_index_relations(
       irep_idt lhs;
       if(symbol_id(instruction.assign_lhs(), lhs))
       {
+        for(const auto &entry : analysis.region_selectors)
+        {
+          if(
+            active_region_pointers.count(entry.first) != 0 &&
+            !entry.second.selector_symbol.empty() &&
+            lhs == entry.second.selector_symbol)
+            drifted_region_pointers.insert(entry.first);
+        }
         for(const auto &entry : captured)
         {
           if(
@@ -1315,7 +2054,19 @@ bool validate_index_relations(
               origin))
             captured[lhs] = std::move(origin);
         }
+        if(analysis.region_selectors.count(lhs) != 0)
+          active_region_pointers.insert(lhs);
       }
+    }
+    if(
+      instruction.is_function_call() &&
+      !instruction.call_lhs().is_nil())
+    {
+      irep_idt lhs;
+      if(
+        symbol_id(instruction.call_lhs(), lhs) &&
+        analysis.region_selectors.count(lhs) != 0)
+        active_region_pointers.insert(lhs);
     }
 
     std::vector<indexed_origint> accesses;
@@ -1357,6 +2108,54 @@ bool validate_index_relations(
           analysis.reason = "indexed_lock_mismatch";
           return false;
         }
+      }
+    }
+
+    std::set<irep_idt> region_uses;
+    if(instruction.is_assign())
+    {
+      collect_region_pointer_uses(
+        analysis, instruction.assign_lhs(), region_uses);
+      collect_region_pointer_uses(
+        analysis, instruction.assign_rhs(), region_uses);
+    }
+    else if(
+      instruction.is_goto() || instruction.is_assume() ||
+      instruction.is_assert())
+      collect_region_pointer_uses(
+        analysis, instruction.condition(), region_uses);
+    else if(
+      call_id(instruction, callee) && is_property(callee))
+    {
+      for(const auto &argument : instruction.call_arguments())
+        collect_region_pointer_uses(
+          analysis, argument, region_uses);
+    }
+    for(const auto &pointer : region_uses)
+    {
+      const auto region = analysis.region_selectors.find(pointer);
+      if(
+        region == analysis.region_selectors.end() ||
+        drifted_region_pointers.count(pointer) != 0)
+      {
+        analysis.reason = "region_selector_drift";
+        return false;
+      }
+      bool matched = false;
+      for(const auto &lock : held_indexed_locks)
+      {
+        if(
+          !lock.selector.empty() &&
+          lock.selector == region->second.selector)
+        {
+          matched = true;
+          break;
+        }
+      }
+      if(!matched)
+      {
+        analysis.reason = "region_lock_selector_mismatch";
+        return false;
       }
     }
   }
@@ -1445,6 +2244,13 @@ bool validate_model(analysist &analysis)
           analysis.reason = "unproved_error_call";
           return false;
         }
+        if(
+          analysis.region_summary_functions.count(callee) != 0)
+          continue;
+        if(
+          !analysis.region_return_parameters.empty() &&
+          is_allocator(callee))
+          continue;
         for(const auto &argument :
             instruction.call_arguments())
         {
@@ -1855,6 +2661,59 @@ bool collect_protection(analysist &analysis)
     }
   }
   return !analysis.protection.empty();
+}
+
+bool validate_region_lock_congruence(analysist &analysis)
+{
+  if(analysis.region_return_parameters.empty())
+    return true;
+
+  std::set<std::string> indexed_roots;
+  for(const auto &entry : analysis.region_selectors)
+  {
+    if(!entry.second.container.empty())
+      indexed_roots.insert(
+        entry.second.container + "#[]");
+  }
+
+  std::set<std::string> scalar_roots;
+  std::set<std::string> scalar_locks;
+  for(const auto &root : analysis.region_roots)
+  {
+    if(indexed_roots.count(root) != 0)
+      continue;
+    scalar_roots.insert(root);
+    std::set<std::string> root_locks;
+    for(const auto &field : analysis.region_zero_fields)
+    {
+      const auto protected_field =
+        analysis.protection.find(
+          root + "#<region>#" + id2string(field));
+      if(protected_field != analysis.protection.end())
+        root_locks.insert(protected_field->second);
+    }
+    if(root_locks.size() != 1)
+    {
+      analysis.reason =
+        "scalar_region_lock_not_functional";
+      return false;
+    }
+    scalar_locks.insert(*root_locks.begin());
+  }
+
+  if(scalar_roots.empty())
+    return true;
+  if(scalar_roots.size() < 2)
+  {
+    analysis.reason = "scalar_region_lock_unidentifiable";
+    return false;
+  }
+  if(scalar_locks.size() != scalar_roots.size())
+  {
+    analysis.reason = "scalar_region_lock_not_injective";
+    return false;
+  }
+  return true;
 }
 
 bool add_checked(long long left, long long right, long long &result)
@@ -2593,11 +3452,36 @@ bool lock_relational_ai_transform(
 {
   (void)message_handler;
   analysist analysis(goto_model);
+  analysis.discover_region_summaries();
   analysis.collect_aliases();
   if(!analysis.collect_function_contexts())
   {
     std::cout << "NATIVE_LOCK_RELATIONAL_AI applied=0 reason="
-              << analysis.reason << '\n';
+              << analysis.reason
+              << " region_initializers="
+              << analysis.region_initializers.size()
+              << " region_inserters="
+              << analysis.region_inserters.size()
+              << " region_traversals="
+              << analysis.region_return_parameters.size()
+              << " region_aliases="
+              << analysis.region_selectors.size()
+              << " aliases=" << analysis.aliases.size()
+              << " roots=" << analysis.region_roots.size()
+              << '\n';
+    return false;
+  }
+  if(!validate_region_publication(analysis))
+  {
+    std::cout << "NATIVE_LOCK_RELATIONAL_AI applied=0 reason="
+              << analysis.reason
+              << " region_initializers="
+              << analysis.region_initializers.size()
+              << " region_inserters="
+              << analysis.region_inserters.size()
+              << " region_traversals="
+              << analysis.region_return_parameters.size()
+              << '\n';
     return false;
   }
   analysis.collect_initial();
@@ -2606,10 +3490,22 @@ bool lock_relational_ai_transform(
     !validate_congruence_alias_escapes(analysis) ||
     !validate_congruence_alias_initialization(analysis) ||
     !validate_model(analysis) ||
-    !collect_protection(analysis))
+    !collect_protection(analysis) ||
+    !validate_region_lock_congruence(analysis))
   {
     std::cout << "NATIVE_LOCK_RELATIONAL_AI applied=0 reason="
-              << analysis.reason << '\n';
+              << analysis.reason
+              << " region_initializers="
+              << analysis.region_initializers.size()
+              << " region_inserters="
+              << analysis.region_inserters.size()
+              << " region_traversals="
+              << analysis.region_return_parameters.size()
+              << " region_aliases="
+              << analysis.region_selectors.size()
+              << " aliases=" << analysis.aliases.size()
+              << " roots=" << analysis.region_roots.size()
+              << '\n';
     return false;
   }
   if(!run_fixedpoint(analysis))
