@@ -323,6 +323,20 @@ struct analysist
       key = base + "#" + id2string(member.get_component_name());
       return true;
     }
+    if(expr.id() == ID_index && expr.operands().size() == 2)
+    {
+      std::string base;
+      if(!atom(expr.op0(), base) || !shared(base))
+        return false;
+      const exprt &index = strip(expr.op1());
+      if(index.id() != ID_symbol && index.id() != ID_constant)
+        return false;
+      // The selector is retained and checked separately by the indexed-lock
+      // correlation audit.  The value domain uses one parametric family
+      // representing an arbitrary but fixed element.
+      key = base + "#[]";
+      return true;
+    }
     if(expr.id() == ID_dereference)
     {
       const exprt &pointer =
@@ -564,6 +578,27 @@ struct analysist
       return;
     }
     const typet &resolved_type = ns.follow(type);
+    if(resolved_type.id() == ID_array)
+    {
+      if(value.operands().empty())
+        return;
+      const exprt &representative = value.operands().front();
+      if(value.id() == ID_array)
+      {
+        for(const auto &element : value.operands())
+        {
+          if(element != representative)
+            return;
+        }
+      }
+      else if(value.id() != ID_array_of)
+        return;
+      collect_initial_expr(
+        base + "#[]",
+        to_array_type(resolved_type).element_type(),
+        representative);
+      return;
+    }
     if(
       resolved_type.id() != ID_struct ||
       value.operands().empty())
@@ -765,6 +800,171 @@ bool call_graph_acyclic(
   return true;
 }
 
+struct indexed_origint
+{
+  std::string base;
+  std::string selector;
+  irep_idt selector_symbol;
+};
+
+bool indexed_origin(
+  const analysist &analysis,
+  const exprt &src,
+  indexed_origint &origin)
+{
+  const exprt &expr = strip(src);
+  if(expr.id() == ID_member)
+    return indexed_origin(
+      analysis, to_member_expr(expr).compound(), origin);
+  if(expr.id() != ID_index || expr.operands().size() != 2)
+    return false;
+  if(!analysis.atom(expr.op0(), origin.base) ||
+     !analysis.shared(origin.base))
+    return false;
+  const exprt &selector = strip(expr.op1());
+  if(selector.id() == ID_symbol)
+  {
+    origin.selector_symbol =
+      to_symbol_expr(selector).get_identifier();
+    origin.selector =
+      "s:" + id2string(origin.selector_symbol);
+    return true;
+  }
+  if(selector.id() == ID_constant)
+  {
+    origin.selector =
+      "c:" + id2string(selector.get(ID_value));
+    origin.selector_symbol.clear();
+    return true;
+  }
+  return false;
+}
+
+void collect_indexed_origins(
+  const analysist &analysis,
+  const exprt &expr,
+  std::vector<indexed_origint> &origins)
+{
+  indexed_origint origin;
+  if(indexed_origin(analysis, expr, origin))
+  {
+    origins.push_back(std::move(origin));
+    return;
+  }
+  if(strip(expr).id() == ID_address_of)
+    return;
+  for(const auto &operand : expr.operands())
+    collect_indexed_origins(analysis, operand, origins);
+}
+
+bool validate_index_relations(
+  analysist &analysis,
+  const goto_programt &program)
+{
+  std::vector<indexed_origint> held_indexed_locks;
+  std::map<irep_idt, indexed_origint> captured;
+  std::set<std::pair<std::string, irep_idt>> drifted;
+
+  for(const auto &instruction : program.instructions)
+  {
+    irep_idt callee;
+    if(call_id(instruction, callee) &&
+       (is_lock(callee) || is_unlock(callee)))
+    {
+      if(is_lock(callee))
+      {
+        indexed_origint origin;
+        if(
+          !instruction.call_arguments().empty() &&
+          strip(instruction.call_arguments().front()).id() ==
+            ID_address_of &&
+          indexed_origin(
+            analysis,
+            to_address_of_expr(
+              strip(instruction.call_arguments().front())).object(),
+            origin))
+          held_indexed_locks.push_back(std::move(origin));
+        else
+          held_indexed_locks.push_back(indexed_origint{});
+      }
+      else if(!held_indexed_locks.empty())
+        held_indexed_locks.pop_back();
+      continue;
+    }
+
+    if(instruction.is_assign())
+    {
+      irep_idt lhs;
+      if(symbol_id(instruction.assign_lhs(), lhs))
+      {
+        for(const auto &entry : captured)
+        {
+          if(
+            !entry.second.selector_symbol.empty() &&
+            lhs == entry.second.selector_symbol)
+            drifted.insert(
+              {entry.second.base,
+               entry.second.selector_symbol});
+        }
+        const exprt &rhs = strip(instruction.assign_rhs());
+        if(rhs.id() == ID_address_of)
+        {
+          indexed_origint origin;
+          if(
+            indexed_origin(
+              analysis,
+              to_address_of_expr(rhs).object(),
+              origin))
+            captured[lhs] = std::move(origin);
+        }
+      }
+    }
+
+    std::vector<indexed_origint> accesses;
+    if(instruction.is_assign())
+    {
+      collect_indexed_origins(
+        analysis, instruction.assign_lhs(), accesses);
+      collect_indexed_origins(
+        analysis, instruction.assign_rhs(), accesses);
+    }
+    else if(
+      instruction.is_goto() || instruction.is_assume() ||
+      instruction.is_assert())
+      collect_indexed_origins(
+        analysis, instruction.condition(), accesses);
+    else if(
+      call_id(instruction, callee) && is_property(callee))
+    {
+      for(const auto &argument : instruction.call_arguments())
+        collect_indexed_origins(analysis, argument, accesses);
+    }
+
+    for(const auto &access : accesses)
+    {
+      if(
+        !access.selector_symbol.empty() &&
+        drifted.count(
+          {access.base, access.selector_symbol}) != 0)
+      {
+        analysis.reason = "indexed_pointer_drift";
+        return false;
+      }
+      for(const auto &lock : held_indexed_locks)
+      {
+        if(
+          !lock.base.empty() && lock.base == access.base &&
+          lock.selector != access.selector)
+        {
+          analysis.reason = "indexed_lock_mismatch";
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
 bool validate_model(analysist &analysis)
 {
   std::map<irep_idt, std::set<irep_idt>> call_edges;
@@ -773,6 +973,10 @@ bool validate_model(analysist &analysis)
   {
     if(!analysis.user_function(function_entry.first))
       continue;
+    if(
+      !validate_index_relations(
+        analysis, function_entry.second.body))
+      return false;
     const auto contexts =
       analysis.contexts_for(function_entry.first);
     for(const auto &context : contexts)
