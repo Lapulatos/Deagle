@@ -37,6 +37,7 @@ SRC = ai.cpp \
       lock_relational_ai_analysis.cpp \
       predicate_stability_analysis.cpp \
       property_directed_affine_analysis.cpp \
+      protocol_capacity_analysis.cpp \
       reaching_definitions.cpp \
       relational_order_analysis.cpp \
       sese_regions.cpp \

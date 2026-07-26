@@ -54,6 +54,7 @@ Author: Daniel Kroening, kroening@kroening.com
 
 #include <analyses/interference_predicate_analysis.h>
 #include <analyses/interference_predicate_cube.h>
+#include <analyses/protocol_capacity_analysis.h>
 #include <analyses/cas_stability_analysis.h>
 #include <analyses/predicate_stability_analysis.h>
 #include <analyses/relational_order_analysis.h>
@@ -1107,6 +1108,19 @@ int cbmc_parse_optionst::doit()
     interference_predicate_fixedpoint(
       goto_model, ui_message_handler, true);
     return CPROVER_EXIT_SUCCESS;
+  }
+
+  if(cmdline.isset("protocol-induced-capacity-cutoff"))
+  {
+    const auto result =
+      protocol_capacity_cutoff(goto_model, ui_message_handler);
+    if(result == protocol_capacity_resultt::SAFE)
+    {
+      std::cout << "VERIFICATION SUCCESSFUL\n";
+      return CPROVER_EXIT_SUCCESS;
+    }
+    if(!cmdline.isset("unwind-suggest"))
+      return CPROVER_EXIT_SUCCESS;
   }
 
   if(cmdline.isset("show-claims") || // will go away

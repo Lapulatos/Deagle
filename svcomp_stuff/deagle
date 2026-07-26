@@ -158,8 +158,22 @@ def try_large_limit_native_proof(program_path, flags):
     return True
 
 
-def get_loop_info(program_path, flags, native_proof_flags=None):
-    cmd = "%s %s %s --unwind-suggest > deagle_tmp_unwind_suggest 2>&1" % (deagle_exe, program_path, flags)
+def get_loop_info(
+    program_path,
+    flags,
+    native_proof_flags=None,
+    protocol_capacity=False,
+):
+    fused_flag = (
+        " --protocol-induced-capacity-cutoff"
+        if protocol_capacity
+        else ""
+    )
+    cmd = (
+        "%s %s %s --unwind-suggest%s "
+        "> deagle_tmp_unwind_suggest 2>&1"
+        % (deagle_exe, program_path, flags, fused_flag)
+    )
     print(cmd)
     os.system(cmd)
 
@@ -169,6 +183,22 @@ def get_loop_info(program_path, flags, native_proof_flags=None):
     large_unwind_limit = None
     with open("deagle_tmp_unwind_suggest", "r") as output:
         lines = output.readlines()
+        protocol_marker = next(
+            (
+                line
+                for line in lines
+                if line.startswith(
+                    "PROTOCOL_CAPACITY_CUTOFF result=SAFE"
+                )
+            ),
+            None,
+        )
+        if protocol_marker is not None and any(
+            "VERIFICATION SUCCESSFUL" in line for line in lines
+        ):
+            print(protocol_marker, end="")
+            print("VERIFICATION SUCCESSFUL")
+            sys.exit(0)
         for i in range(len(lines)):
             obj = re.match(r"Loop (.+):", lines[i])
             if obj:
@@ -465,6 +495,9 @@ multi_template_worker_prepass = (
 lock_ego_prepass = (
     "--deagle-lock-ego-prepass" in sys.argv[3:]
 )
+protocol_capacity_prepass = (
+    "--deagle-protocol-capacity-prepass" in sys.argv[3:]
+)
 extra_args = [
     shlex.quote(arg) for arg in sys.argv[3:]
     if arg not in (
@@ -473,6 +506,7 @@ extra_args = [
         "--deagle-recursive-worker-prepass",
         "--deagle-multi-template-worker-prepass",
         "--deagle-lock-ego-prepass",
+        "--deagle-protocol-capacity-prepass",
     )
 ]
 flags = base_flags + " ".join(extra_args) + " "
@@ -516,6 +550,7 @@ else:
     sys.exit(0)
 
 cached_loop_info = None
+
 if (
     shallow_counterexample_prepass
     and "unreach-call.prp" in property_path
@@ -575,7 +610,10 @@ if multi_template_worker_prepass and "unreach-call.prp" in property_path:
     )
     if multi_template_result.returncode == 0:
         cached_loop_info = get_loop_info(
-            program_path, probe_flags, flags
+            program_path,
+            probe_flags,
+            flags,
+            protocol_capacity_prepass,
         )
         _, multi_template_limits, _, _ = cached_loop_info
         unwind_budget = 1
@@ -719,7 +757,10 @@ if lock_ego_prepass and "unreach-call.prp" in property_path:
 
 if cached_loop_info is None:
     loops_name, loops_limit, is_onlystatic, large_unwind_limit = get_loop_info(
-        program_path, probe_flags, flags
+        program_path,
+        probe_flags,
+        flags,
+        protocol_capacity_prepass,
     )
 else:
     (
