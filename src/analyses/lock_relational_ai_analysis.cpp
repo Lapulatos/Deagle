@@ -87,6 +87,11 @@ bool is_unlock(const irep_idt &identifier)
   return named(identifier, "pthread_mutex_unlock");
 }
 
+bool is_trylock(const irep_idt &identifier)
+{
+  return named(identifier, "pthread_mutex_trylock");
+}
+
 bool is_mutex_init(const irep_idt &identifier)
 {
   return named(identifier, "pthread_mutex_init");
@@ -118,6 +123,7 @@ bool ignored_external(const irep_idt &identifier)
 {
   return
     is_lock(identifier) || is_unlock(identifier) ||
+    is_trylock(identifier) ||
     is_mutex_init(identifier) || is_create(identifier) ||
     is_join(identifier) || is_property(identifier) ||
     is_error(identifier) || named(identifier, "sleep") ||
@@ -789,11 +795,37 @@ struct lock_nodet
   std::vector<std::string> stack;
 };
 
-bool same_stack(
-  const std::vector<std::string> &left,
-  const std::vector<std::string> &right)
+bool zero_test_when_true(
+  const exprt &src,
+  const irep_idt &symbol,
+  bool &zero_when_true)
 {
-  return left == right;
+  const exprt &expr = strip(src);
+  if(expr.id() == ID_not && expr.operands().size() == 1)
+  {
+    if(!zero_test_when_true(expr.op0(), symbol, zero_when_true))
+      return false;
+    zero_when_true = !zero_when_true;
+    return true;
+  }
+  if(
+    (expr.id() != ID_equal && expr.id() != ID_notequal) ||
+    expr.operands().size() != 2)
+    return false;
+  irep_idt compared;
+  long long constant;
+  if(
+    !(
+      symbol_id(expr.op0(), compared) &&
+      integer_constant(expr.op1(), constant)) &&
+    !(
+      symbol_id(expr.op1(), compared) &&
+      integer_constant(expr.op0(), constant)))
+    return false;
+  if(compared != symbol || constant != 0)
+    return false;
+  zero_when_true = expr.id() == ID_equal;
+  return true;
 }
 
 void collect_expr_atoms(
@@ -1215,6 +1247,25 @@ bool validate_index_relations(
   for(const auto &instruction : program.instructions)
   {
     irep_idt callee;
+    if(call_id(instruction, callee) && is_trylock(callee))
+    {
+      indexed_origint origin;
+      if(
+        !instruction.call_arguments().empty() &&
+        strip(instruction.call_arguments().front()).id() ==
+          ID_address_of &&
+        indexed_origin(
+          analysis,
+          to_address_of_expr(
+            strip(instruction.call_arguments().front())).object(),
+          origin) &&
+        !origin.selector.empty())
+      {
+        analysis.reason = "conditional_indexed_lock";
+        return false;
+      }
+      continue;
+    }
     if(call_id(instruction, callee) &&
        (is_lock(callee) || is_unlock(callee)))
     {
@@ -1402,6 +1453,7 @@ bool validate_model(analysist &analysis)
         }
         if(
           is_lock(callee) || is_unlock(callee) ||
+          is_trylock(callee) ||
           is_mutex_init(callee) || is_create(callee) ||
           is_join(callee) || is_property(callee) ||
           named(callee, "sleep") || named(callee, "abort") ||
@@ -1454,7 +1506,18 @@ bool compute_locksets(
   }
   if(order.empty())
     return true;
+  struct flow_statet
+  {
+    std::vector<std::string> stack;
+    std::map<irep_idt, std::string> pending;
+
+    bool operator==(const flow_statet &other) const
+    {
+      return stack == other.stack && pending == other.pending;
+    }
+  };
   std::vector<bool> reached(order.size(), false);
+  std::vector<flow_statet> states(order.size());
   at.resize(order.size());
   std::deque<std::size_t> work;
   reached[0] = true;
@@ -1463,70 +1526,145 @@ bool compute_locksets(
   {
     const std::size_t index = work.front();
     work.pop_front();
-    std::vector<std::string> after = at[index];
+    const flow_statet before = states[index];
+    at[index] = before.stack;
+    flow_statet after = before;
     irep_idt callee;
     if(call_id(*order[index], callee))
     {
       std::string lock;
       if(is_lock(callee))
       {
+        if(!after.pending.empty())
+        {
+          analysis.reason = "conditional_lock_unconsumed";
+          return false;
+        }
         if(!analysis.lock_argument(*order[index], lock))
         {
           analysis.reason = "lock_argument";
           return false;
         }
-        if(std::find(after.begin(), after.end(), lock) != after.end())
+        if(
+          std::find(
+            after.stack.begin(), after.stack.end(), lock) !=
+          after.stack.end())
         {
           analysis.reason = "recursive_lock";
           return false;
         }
-        if(!after.empty())
-          analysis.lock_edges.insert({after.back(), lock});
-        after.push_back(lock);
+        if(!after.stack.empty())
+          analysis.lock_edges.insert({after.stack.back(), lock});
+        after.stack.push_back(lock);
+        analysis.locks.insert(lock);
+      }
+      else if(is_trylock(callee))
+      {
+        irep_idt result;
+        if(
+          !after.pending.empty() ||
+          order[index]->call_lhs().is_nil() ||
+          !symbol_id(order[index]->call_lhs(), result) ||
+          !analysis.lock_argument(*order[index], lock) ||
+          std::find(
+            after.stack.begin(), after.stack.end(), lock) !=
+            after.stack.end())
+        {
+          analysis.reason = "conditional_lock_call";
+          return false;
+        }
+        after.pending[result] = lock;
         analysis.locks.insert(lock);
       }
       else if(is_unlock(callee))
       {
         if(
           !analysis.lock_argument(*order[index], lock) ||
-          after.empty() || after.back() != lock)
+          !after.pending.empty() || after.stack.empty() ||
+          after.stack.back() != lock)
         {
           analysis.reason = "lock_balance";
           return false;
         }
-        after.pop_back();
+        after.stack.pop_back();
       }
     }
-    std::vector<std::size_t> successors;
+    else if(
+      !after.pending.empty() && !order[index]->is_goto())
+    {
+      analysis.reason = "conditional_lock_unconsumed";
+      return false;
+    }
+    std::vector<std::pair<std::size_t, flow_statet>> successors;
     if(order[index]->is_goto())
     {
+      bool conditional_lock = !after.pending.empty();
+      bool zero_on_target = false;
+      std::string conditional_mutex;
+      if(conditional_lock)
+      {
+        if(
+          after.pending.size() != 1 ||
+          !zero_test_when_true(
+            order[index]->condition(),
+            after.pending.begin()->first,
+            zero_on_target))
+        {
+          analysis.reason = "conditional_lock_branch";
+          return false;
+        }
+        conditional_mutex = after.pending.begin()->second;
+      }
       for(const auto &target : order[index]->targets)
-        successors.push_back(positions.at(&*target));
+      {
+        flow_statet branch = after;
+        branch.pending.clear();
+        if(conditional_lock && zero_on_target)
+        {
+          if(!branch.stack.empty())
+            analysis.lock_edges.insert(
+              {branch.stack.back(), conditional_mutex});
+          branch.stack.push_back(conditional_mutex);
+        }
+        successors.push_back(
+          {positions.at(&*target), std::move(branch)});
+      }
       if(
         !order[index]->condition().is_true() &&
         index + 1 < order.size())
-        successors.push_back(index + 1);
+      {
+        flow_statet branch = after;
+        branch.pending.clear();
+        if(conditional_lock && !zero_on_target)
+        {
+          if(!branch.stack.empty())
+            analysis.lock_edges.insert(
+              {branch.stack.back(), conditional_mutex});
+          branch.stack.push_back(conditional_mutex);
+        }
+        successors.push_back({index + 1, std::move(branch)});
+      }
     }
     else if(
       !order[index]->is_end_function() &&
       index + 1 < order.size())
-      successors.push_back(index + 1);
+      successors.push_back({index + 1, after});
     else if(
       order[index]->is_end_function() &&
-      !after.empty())
+      (!after.stack.empty() || !after.pending.empty()))
     {
       analysis.reason = "lock_balance";
       return false;
     }
-    for(const std::size_t successor : successors)
+    for(auto &successor : successors)
     {
-      if(!reached[successor])
+      if(!reached[successor.first])
       {
-        reached[successor] = true;
-        at[successor] = after;
-        work.push_back(successor);
+        reached[successor.first] = true;
+        states[successor.first] = std::move(successor.second);
+        work.push_back(successor.first);
       }
-      else if(!same_stack(at[successor], after))
+      else if(!(states[successor.first] == successor.second))
       {
         analysis.reason = "lockset_join";
         return false;
@@ -1585,6 +1723,7 @@ bool collect_protection(analysist &analysis)
         if(
           call_id(instruction, callee) &&
           (is_lock(callee) || is_unlock(callee) ||
+           is_trylock(callee) ||
            is_mutex_init(callee) || is_create(callee) ||
            is_join(callee)))
           continue;
@@ -2001,12 +2140,15 @@ struct node_keyt
 {
   std::size_t index;
   std::vector<std::string> stack;
+  std::map<irep_idt, std::string> pending;
 
   bool operator<(const node_keyt &other) const
   {
     if(index != other.index)
       return index < other.index;
-    return stack < other.stack;
+    if(stack != other.stack)
+      return stack < other.stack;
+    return pending < other.pending;
   }
 };
 
@@ -2037,7 +2179,7 @@ bool analyze_function(
   std::map<node_keyt, statet> states;
   std::map<node_keyt, unsigned> merges;
   std::deque<node_keyt> work;
-  const node_keyt start{0, {}};
+  const node_keyt start{0, {}, {}};
   states[start] = entry;
   work.push_back(start);
   std::size_t visits = 0;
@@ -2055,6 +2197,29 @@ bool analyze_function(
       continue;
     const auto &instruction = *order[key.index];
     std::vector<std::string> after_stack = key.stack;
+    std::map<irep_idt, std::string> after_pending = key.pending;
+    auto acquire = [&analysis](
+      statet &target_state,
+      std::vector<std::string> &target_stack,
+      const std::string &lock) {
+      target_stack.push_back(lock);
+      const statet &invariant = analysis.lock_invariants[lock];
+      for(const auto &protected_entry : analysis.protection)
+      {
+        if(protected_entry.second != lock)
+          continue;
+        intervalt current =
+          target_state.get(protected_entry.first);
+        const intervalt imported =
+          invariant.get(protected_entry.first);
+        if(!meet_interval(current, imported))
+        {
+          target_state.bottom = true;
+          return;
+        }
+        target_state.set(protected_entry.first, current);
+      }
+    };
     irep_idt callee;
     if(instruction.is_assign())
     {
@@ -2109,29 +2274,34 @@ bool analyze_function(
       std::string lock;
       if(is_lock(callee))
       {
-        if(!analysis.lock_argument(instruction, lock))
+        if(
+          !after_pending.empty() ||
+          !analysis.lock_argument(instruction, lock))
           return false;
-        after_stack.push_back(lock);
-        const statet &invariant = analysis.lock_invariants[lock];
-        for(const auto &protected_entry : analysis.protection)
+        acquire(state, after_stack, lock);
+      }
+      else if(is_trylock(callee))
+      {
+        irep_idt result;
+        if(
+          !after_pending.empty() ||
+          instruction.call_lhs().is_nil() ||
+          !symbol_id(instruction.call_lhs(), result) ||
+          !analysis.lock_argument(instruction, lock) ||
+          std::find(
+            after_stack.begin(), after_stack.end(), lock) !=
+            after_stack.end())
         {
-          if(protected_entry.second != lock)
-            continue;
-          intervalt current = state.get(protected_entry.first);
-          const intervalt imported =
-            invariant.get(protected_entry.first);
-          if(!meet_interval(current, imported))
-          {
-            state.bottom = true;
-            break;
-          }
-          state.set(protected_entry.first, current);
+          analysis.reason = "conditional_lock_call";
+          return false;
         }
+        after_pending[result] = lock;
       }
       else if(is_unlock(callee))
       {
         if(
           !analysis.lock_argument(instruction, lock) ||
+          !after_pending.empty() ||
           after_stack.empty() || after_stack.back() != lock)
           return false;
         statet exported;
@@ -2207,6 +2377,12 @@ bool analyze_function(
         }
       }
     }
+    else if(
+      !after_pending.empty() && !instruction.is_goto())
+    {
+      analysis.reason = "conditional_lock_unconsumed";
+      return false;
+    }
     else if(instruction.is_assert())
     {
       ++analysis.properties;
@@ -2232,46 +2408,95 @@ bool analyze_function(
       }
     }
 
-    std::vector<std::pair<std::size_t, statet>> successors;
+    struct successort
+    {
+      std::size_t index;
+      statet state;
+      std::vector<std::string> stack;
+      std::map<irep_idt, std::string> pending;
+    };
+    std::vector<successort> successors;
     if(instruction.is_goto())
     {
+      bool conditional_lock = !after_pending.empty();
+      bool zero_on_target = false;
+      std::string conditional_mutex;
+      if(conditional_lock)
+      {
+        if(
+          after_pending.size() != 1 ||
+          !zero_test_when_true(
+            instruction.condition(),
+            after_pending.begin()->first,
+            zero_on_target))
+        {
+          analysis.reason = "conditional_lock_branch";
+          return false;
+        }
+        conditional_mutex = after_pending.begin()->second;
+      }
       for(const auto &target : instruction.targets)
       {
         statet branch = state;
+        std::vector<std::string> branch_stack = after_stack;
         assume_condition(
           analysis, branch, instruction.condition(), true);
-        successors.push_back({positions.at(&*target), branch});
+        if(
+          conditional_lock && zero_on_target &&
+          !branch.bottom)
+          acquire(branch, branch_stack, conditional_mutex);
+        successors.push_back(
+          {positions.at(&*target), std::move(branch),
+           std::move(branch_stack), {}});
       }
       if(
         !instruction.condition().is_true() &&
         key.index + 1 < order.size())
       {
         statet branch = state;
+        std::vector<std::string> branch_stack = after_stack;
         assume_condition(
           analysis, branch, instruction.condition(), false);
-        successors.push_back({key.index + 1, branch});
+        if(
+          conditional_lock && !zero_on_target &&
+          !branch.bottom)
+          acquire(branch, branch_stack, conditional_mutex);
+        successors.push_back(
+          {key.index + 1, std::move(branch),
+           std::move(branch_stack), {}});
       }
     }
     else if(
       !instruction.is_end_function() &&
       key.index + 1 < order.size())
-      successors.push_back({key.index + 1, state});
+      successors.push_back(
+        {key.index + 1, state, after_stack, after_pending});
+    else if(
+      instruction.is_end_function() &&
+      !after_pending.empty())
+    {
+      analysis.reason = "conditional_lock_unconsumed";
+      return false;
+    }
 
     for(auto &successor : successors)
     {
-      if(successor.second.bottom)
+      if(successor.state.bottom)
         continue;
-      const node_keyt next{successor.first, after_stack};
+      const node_keyt next{
+        successor.index,
+        std::move(successor.stack),
+        std::move(successor.pending)};
       const auto existing = states.find(next);
       if(existing == states.end())
       {
-        states[next] = successor.second;
+        states[next] = successor.state;
         work.push_back(next);
       }
       else
       {
         statet old = existing->second;
-        if(join_state(existing->second, successor.second))
+        if(join_state(existing->second, successor.state))
         {
           if(++merges[next] > 3)
             widen_state(existing->second, old);
