@@ -10,6 +10,20 @@ Module: Join-Scoped Compositional Effect Summary
 class goto_modelt;
 class message_handlert;
 
+/// Audit constant-bound, zero-based, straight-line lifecycle loops in main.
+/// Such loops initialize an indexed thread descriptor and execute exactly one
+/// pthread_create or pthread_join per iteration.
+bool indexed_lifecycle_prefix_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// Exactly unroll admitted indexed lifecycle loops before bounded
+/// counterexample search and, after a complete create/join prefix, stop the
+/// disposable model at the final join. Unsupported loops are unchanged.
+bool indexed_lifecycle_prefix_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 /// Audit two finite, fully joined producer/consumer loops whose condition
 /// variables enforce a one-token alternating execution. This does not mutate
 /// the GOTO model.

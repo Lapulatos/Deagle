@@ -75,6 +75,9 @@ def get_result(remove = True):
                 or line.startswith(
                     "NATIVE_ALTERNATING_PHASE_RECURRENCE "
                 )
+                or line.startswith(
+                    "NATIVE_INDEXED_LIFECYCLE_PREFIX "
+                )
                 or line.startswith("COUNTERFACTUAL_UIP_PROFILE ")
                 or line.startswith("COUNTERFACTUAL_UIP_DOMAIN ")
                 or line.startswith("COUNTERFACTUAL_UIP_DOMAIN_SOURCE ")
@@ -247,6 +250,20 @@ if "unreach-call.prp" in property_path:
         and re.search(
             r"assume_abort_if_not\s*\([^;]*(?:!=|==|<=|>=)[^;]*\)"
             r"\s*;\s*reach_error\s*\(\s*\)",
+            candidate_text,
+            re.S,
+        )
+    )
+    candidate_indexed_lifecycle = bool(
+        re.search(
+            r"\b(?:for|while)\s*\([^)]*\)\s*\{?"
+            r"[^{}]{0,2000}\bpthread_create\s*\(",
+            candidate_text,
+            re.S,
+        )
+        and re.search(
+            r"\b(?:for|while)\s*\([^)]*\)\s*\{?"
+            r"[^{}]{0,2000}\bpthread_join\s*\(",
             candidate_text,
             re.S,
         )
@@ -440,6 +457,51 @@ else:
     sys.exit(0)
 
 cached_loop_info = None
+if (
+    shallow_counterexample_prepass
+    and "unreach-call.prp" in property_path
+    and candidate_indexed_lifecycle
+):
+    print(
+        "Trying indexed-lifecycle counterexample prefix "
+        "(bound 1, 6 s)!",
+        flush=True,
+    )
+    lifecycle_args = (
+        [deagle_exe_path, program_path]
+        + shlex.split(flags)
+        + [
+            "--unwind",
+            "1",
+            "--native-indexed-lifecycle-prefix",
+        ]
+    )
+    try:
+        with open("deagle_tmp_output", "w") as lifecycle_output:
+            subprocess.run(
+                lifecycle_args,
+                stdout=lifecycle_output,
+                stderr=subprocess.STDOUT,
+                timeout=6,
+                check=False,
+            )
+    except subprocess.TimeoutExpired:
+        print(
+            "Indexed-lifecycle prefix timed out; "
+            "continuing with V170.",
+            flush=True,
+        )
+    lifecycle_result = inspect_result("deagle_tmp_output")
+    if lifecycle_result == "FAILURE":
+        print(
+            "Indexed-lifecycle prefix found a property violation.",
+            flush=True,
+        )
+        get_result()
+        print("FAILED")
+        sys.exit(0)
+    os.remove("deagle_tmp_output")
+
 if multi_template_worker_prepass and "unreach-call.prp" in property_path:
     multi_template_filter = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
@@ -620,9 +682,11 @@ elif is_onlystatic:
 elif force_experiment_direct:
     if shallow_counterexample_prepass:
         for shallow_bound in (1, 3):
+            shallow_timeout = 2
             print(
                 "Trying a counterexample-only shallow prepass "
-                "(bound %d, 2 s)!" % shallow_bound
+                "(bound %d, %d s)!"
+                % (shallow_bound, shallow_timeout)
             )
             prepass_args = (
                 [deagle_exe_path, program_path]
@@ -642,7 +706,7 @@ elif force_experiment_direct:
                         prepass_args,
                         stdout=prepass_output,
                         stderr=subprocess.STDOUT,
-                        timeout=2,
+                        timeout=shallow_timeout,
                         check=False,
                     )
             except subprocess.TimeoutExpired:

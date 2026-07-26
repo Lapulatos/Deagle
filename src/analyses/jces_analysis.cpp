@@ -7,6 +7,7 @@ Module: Join-Scoped Compositional Effect Summary
 #include "jces_analysis.h"
 
 #include <goto-programs/goto_model.h>
+#include <goto-instrument/unwind.h>
 
 #include <util/arith_tools.h>
 #include <util/bitvector_expr.h>
@@ -7201,6 +7202,202 @@ struct homogeneous_spawn_witnesst
   const goto_programt::instructiont *create_instruction = nullptr;
 };
 
+struct indexed_lifecycle_loopt
+{
+  goto_programt::const_targett head;
+  goto_programt::const_targett exit;
+  unsigned bound = 0;
+  irep_idt induction;
+  irep_idt operation;
+};
+
+bool constant_lifecycle_bound(const exprt &expr, unsigned &bound)
+{
+  const exprt &value = without_cast(expr);
+  if(value.id() != ID_constant)
+    return false;
+  mp_integer integer;
+  if(
+    to_integer(to_constant_expr(value), integer) || integer <= 0 ||
+    integer > 8)
+    return false;
+  bound = integer.to_ulong();
+  return true;
+}
+
+bool indexed_lifecycle_loop(
+  const goto_programt &program,
+  const std::map<const goto_programt::instructiont *, std::size_t> &positions,
+  goto_programt::const_targett backedge,
+  indexed_lifecycle_loopt &summary,
+  std::string &reason)
+{
+  if(
+    !backedge->is_goto() || !backedge->condition().is_true() ||
+    backedge->targets.size() != 1)
+  {
+    reason = "lifecycle_not_backedge";
+    return false;
+  }
+  const auto head = backedge->get_target();
+  const auto exit = std::next(backedge);
+  if(
+    exit == program.instructions.end() ||
+    positions.at(&*head) >= positions.at(&*backedge) ||
+    !head->is_goto() || head->targets.size() != 1 ||
+    head->get_target() != exit)
+  {
+    reason = "lifecycle_not_canonical";
+    return false;
+  }
+
+  irep_idt induction;
+  exprt bound_expr;
+  unsigned bound = 0;
+  if(
+    !parse_exit_guard(*head, induction, bound_expr) ||
+    !constant_lifecycle_bound(bound_expr, bound))
+  {
+    reason = "lifecycle_nonconstant_bound";
+    return false;
+  }
+  if(
+    head == program.instructions.begin() ||
+    !parse_zero_initialization(*std::prev(head), induction))
+  {
+    reason = "lifecycle_nonzero_init";
+    return false;
+  }
+  if(head == backedge)
+  {
+    reason = "lifecycle_empty_body";
+    return false;
+  }
+  const auto update = std::prev(backedge);
+  irep_idt update_induction;
+  if(
+    !parse_unit_increment(*update, update_induction) ||
+    update_induction != induction)
+  {
+    reason = "lifecycle_nonunit_update";
+    return false;
+  }
+
+  irep_idt operation;
+  std::size_t lifecycle_calls = 0;
+  for(auto instruction = std::next(head); instruction != backedge;
+      ++instruction)
+  {
+    if(instruction->is_goto())
+    {
+      reason = "lifecycle_nonlinear_body";
+      return false;
+    }
+    if(instruction->is_assign())
+    {
+      const exprt &lhs = without_cast(instruction->assign_lhs());
+      if(
+        lhs.id() == ID_symbol &&
+        to_symbol_expr(lhs).get_identifier() == induction &&
+        instruction != update)
+      {
+        reason = "lifecycle_induction_write";
+        return false;
+      }
+    }
+    if(instruction->is_function_call())
+    {
+      irep_idt callee;
+      if(
+        !direct_call_identifier(*instruction, callee) ||
+        (callee != "pthread_create" && callee != "pthread_join"))
+      {
+        reason = "lifecycle_other_call";
+        return false;
+      }
+      if(++lifecycle_calls != 1)
+      {
+        reason = "lifecycle_call_count";
+        return false;
+      }
+      operation = callee;
+    }
+  }
+  if(lifecycle_calls != 1)
+  {
+    reason = "lifecycle_missing_call";
+    return false;
+  }
+
+  const auto head_position = positions.at(&*head);
+  const auto exit_position = positions.at(&*exit);
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(!instruction->is_goto())
+      continue;
+    const auto source_position = positions.at(&*instruction);
+    for(const auto &target : instruction->targets)
+    {
+      const auto target_position = positions.at(&*target);
+      if(
+        target_position >= head_position && target_position < exit_position &&
+        (source_position < head_position || source_position >= exit_position))
+      {
+        reason = "lifecycle_alternate_entry";
+        return false;
+      }
+    }
+  }
+
+  summary.head = head;
+  summary.exit = exit;
+  summary.bound = bound;
+  summary.induction = induction;
+  summary.operation = operation;
+  return true;
+}
+
+std::vector<indexed_lifecycle_loopt> indexed_lifecycle_loops(
+  const goto_modelt &goto_model,
+  std::string &last_reason)
+{
+  std::vector<indexed_lifecycle_loopt> result;
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  if(
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+  {
+    last_reason = "lifecycle_missing_main";
+    return result;
+  }
+  const auto &program = main->second.body;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : program.instructions)
+    positions.emplace(&instruction, position++);
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(
+      !instruction->is_goto() || !instruction->condition().is_true() ||
+      instruction->targets.size() != 1 ||
+      positions.at(&*instruction->get_target()) >=
+        positions.at(&*instruction))
+      continue;
+    indexed_lifecycle_loopt summary;
+    std::string reason;
+    if(
+      indexed_lifecycle_loop(
+        program, positions, instruction, summary, reason))
+      result.push_back(std::move(summary));
+    else
+      last_reason = std::move(reason);
+  }
+  return result;
+}
+
 bool homogeneous_spawn_stable_bound(
   const exprt &bound,
   const goto_modelt &model,
@@ -8022,6 +8219,107 @@ bool alternating_phase_pair(
     model, creates, joins, producer, consumer, reason);
 }
 } // namespace
+
+bool indexed_lifecycle_prefix_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  std::string reason;
+  const auto loops = indexed_lifecycle_loops(goto_model, reason);
+  std::size_t creates = 0;
+  std::size_t joins = 0;
+  for(const auto &loop : loops)
+  {
+    creates += loop.operation == "pthread_create";
+    joins += loop.operation == "pthread_join";
+    std::cout
+      << "NATIVE_INDEXED_LIFECYCLE_LOOP operation=" << loop.operation
+      << " induction=" << loop.induction
+      << " bound=" << loop.bound << '\n';
+  }
+  std::cout
+    << "NATIVE_INDEXED_LIFECYCLE_AUDIT applicable="
+    << (!loops.empty() ? 1 : 0)
+    << " loops=" << loops.size()
+    << " creates=" << creates
+    << " joins=" << joins;
+  if(loops.empty())
+    std::cout << " reason=" << reason;
+  std::cout << '\n';
+  (void)message_handler;
+  return !loops.empty();
+}
+
+bool indexed_lifecycle_prefix_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  std::string reason;
+  auto loops = indexed_lifecycle_loops(goto_model, reason);
+  if(loops.empty())
+  {
+    std::cout
+      << "NATIVE_INDEXED_LIFECYCLE_PREFIX applied=0"
+      << " reason=" << reason << '\n';
+    return false;
+  }
+  auto main =
+    goto_model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != goto_model.goto_functions.function_map.end() &&
+    main->second.body_available(),
+    "indexed lifecycle loops require main");
+  goto_unwindt unroller;
+  goto_programt::const_targett prefix_exit =
+    main->second.body.instructions.end();
+  std::size_t creates = 0;
+  std::size_t joins = 0;
+  for(const auto &loop : loops)
+  {
+    if(loop.operation == "pthread_create")
+      ++creates;
+    else if(loop.operation == "pthread_join")
+    {
+      ++joins;
+      prefix_exit = loop.exit;
+    }
+  }
+  for(auto loop = loops.rbegin(); loop != loops.rend(); ++loop)
+  {
+    unroller.unwind(
+      "main",
+      main->second.body,
+      loop->head,
+      loop->exit,
+      loop->bound,
+      goto_unwindt::unwind_strategyt::ASSUME);
+  }
+  bool truncated = false;
+  if(
+    creates != 0 && joins != 0 &&
+    prefix_exit != main->second.body.instructions.end())
+  {
+    for(auto instruction =
+          main->second.body.const_cast_target(prefix_exit);
+        instruction != main->second.body.instructions.end();
+        ++instruction)
+    {
+      if(instruction->is_end_function())
+        break;
+      instruction->turn_into_skip();
+      truncated = true;
+    }
+  }
+  goto_model.goto_functions.update();
+  std::cout
+    << "NATIVE_INDEXED_LIFECYCLE_PREFIX applied=1"
+    << " loops=" << loops.size()
+    << " creates=" << creates
+    << " joins=" << joins
+    << " truncated=" << (truncated ? 1 : 0) << '\n';
+  (void)message_handler;
+  return true;
+}
 
 bool alternating_phase_recurrence_audit(
   goto_modelt &goto_model,

@@ -38,6 +38,7 @@ OBJ += ../ansi-c/ansi-c$(LIBEXT) \
       ../goto-instrument/nondet_static$(OBJEXT) \
       ../goto-instrument/nondet_bulk_init$(OBJEXT) \
       ../goto-instrument/full_slicer$(OBJEXT) \
+      ../goto-instrument/unwind$(OBJEXT) \
       ../goto-instrument/unwindset$(OBJEXT) \
       ../analyses/analyses$(LIBEXT) \
       ../langapi/langapi$(LIBEXT) \
