@@ -1040,8 +1040,12 @@ int cbmc_parse_optionst::doit()
       std::cout << "VERIFICATION SUCCESSFUL\n";
       return CPROVER_EXIT_SUCCESS;
     }
+    if(lock_relational_ai_transform(goto_model, ui_message_handler))
+    {
+      std::cout << "VERIFICATION SUCCESSFUL\n";
+      return CPROVER_EXIT_SUCCESS;
+    }
     const bool jces_model_transformed =
-      lock_relational_ai_transform(goto_model, ui_message_handler) ||
       homogeneous_thread_local_cutoff_transform(
         goto_model, ui_message_handler) ||
       predicate_stable_linearization_transform(

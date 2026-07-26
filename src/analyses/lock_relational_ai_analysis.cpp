@@ -663,7 +663,7 @@ bool validate_model(analysist &analysis)
         analysis.reason = "indirect_call";
         return false;
       }
-      if(is_error(callee) || named(callee, "abort"))
+      if(is_error(callee))
       {
         analysis.reason = "unproved_error_call";
         return false;
@@ -677,7 +677,7 @@ bool validate_model(analysist &analysis)
         is_lock(callee) || is_unlock(callee) ||
         is_mutex_init(callee) || is_create(callee) ||
         is_join(callee) || is_property(callee) ||
-        named(callee, "sleep") ||
+        named(callee, "sleep") || named(callee, "abort") ||
         named(callee, "__CPROVER_assume"))
         continue;
       const auto target =
@@ -687,7 +687,8 @@ bool validate_model(analysist &analysis)
         !target->second.body_available() ||
         !analysis.user_function(callee))
       {
-        analysis.reason = "unsupported_call";
+        analysis.reason =
+          "unsupported_call_" + id2string(callee);
         return false;
       }
       call_edges[function_entry.first].insert(callee);
@@ -925,12 +926,39 @@ bool collect_protection(analysist &analysis)
   }
   for(const auto &entry : candidates)
   {
-    if(entry.second.size() != 1)
+    if(entry.second.empty())
     {
       analysis.reason = "protection_set";
       return false;
     }
-    analysis.protection[entry.first] = *entry.second.begin();
+    // Every member of the intersection is a must-held protecting lock.
+    // Prefer an outermost candidate so that a relational invariant spans the
+    // complete nested-lock transaction.  Publishing at an inner lock can
+    // forget relations that are temporarily broken and restored before the
+    // outer unlock.  Requiring the intersection to be a singleton needlessly
+    // rejects consistently nested locking.
+    auto selected = entry.second.begin();
+    for(auto candidate = entry.second.begin();
+        candidate != entry.second.end(); ++candidate)
+    {
+      bool enclosed_by_other_candidate = false;
+      for(const auto &edge : analysis.lock_edges)
+      {
+        if(
+          edge.second == *candidate &&
+          entry.second.count(edge.first) != 0)
+        {
+          enclosed_by_other_candidate = true;
+          break;
+        }
+      }
+      if(!enclosed_by_other_candidate)
+      {
+        selected = candidate;
+        break;
+      }
+    }
+    analysis.protection[entry.first] = *selected;
   }
   std::set<std::string> active;
   std::set<std::string> done;
@@ -1390,10 +1418,18 @@ bool analyze_function(
         for(const auto &protected_entry : analysis.protection)
           state.set(protected_entry.first, intervalt());
       }
-      else if(is_error(callee) || named(callee, "abort"))
+      else if(is_error(callee))
       {
         analysis.reason = "unproved_error_call";
         return false;
+      }
+      else if(named(callee, "abort"))
+      {
+        // abort() terminates this path and therefore has the same abstract
+        // effect as assume(false).  Treating it as a verification failure
+        // rejects ordinary SV-COMP assume helpers, including unreachable
+        // helpers shipped in benchmark headers.
+        state.bottom = true;
       }
       else if(!ignored_external(callee))
       {

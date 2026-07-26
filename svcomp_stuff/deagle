@@ -139,13 +139,15 @@ def try_large_limit_native_proof(program_path, flags):
         return False
     with open(proof_output, "r") as output:
         lines = output.readlines()
+    accepted_markers = (
+        "NATIVE_RELATIONAL_BISIMULATION applied=1 ",
+        "NATIVE_LOCK_RELATIONAL_AI applied=1 ",
+    )
     marker = next(
         (
             line
             for line in lines
-            if line.startswith(
-                "NATIVE_RELATIONAL_BISIMULATION applied=1 "
-            )
+            if line.startswith(accepted_markers)
         ),
         None,
     )
