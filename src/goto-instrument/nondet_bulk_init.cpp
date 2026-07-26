@@ -20,6 +20,7 @@ Module: Exact pre-thread nondeterministic bulk initialization
 #include <util/std_types.h>
 
 #include <algorithm>
+#include <deque>
 #include <iterator>
 #include <map>
 #include <set>
@@ -233,7 +234,7 @@ std::set<irep_idt> spawn_capable_functions(const goto_modelt &model)
   return result;
 }
 
-bool called_only_before_threads(
+bool called_only_before_threads_source_closed(
   const goto_modelt &model,
   const irep_idt &candidate,
   const std::set<irep_idt> &spawn_capable)
@@ -300,11 +301,88 @@ bool called_only_before_threads(
   }
   return true;
 }
+
+bool called_only_before_threads_cfg(
+  const goto_modelt &model,
+  const irep_idt &candidate,
+  const std::set<irep_idt> &spawn_capable,
+  std::size_t &reachable_call_sites)
+{
+  reachable_call_sites = 0;
+  const auto main_it = model.goto_functions.function_map.find(ID_main);
+  if(main_it == model.goto_functions.function_map.end())
+    return false;
+
+  bool found = false;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(auto instruction = entry.second.body.instructions.begin();
+        instruction != entry.second.body.instructions.end();
+        ++instruction)
+    {
+      const auto callee = direct_callee(*instruction);
+      if(!callee.has_value() || *callee != candidate)
+        continue;
+      if(entry.first != ID_main)
+        return false;
+      found = true;
+    }
+  }
+
+  const auto &main_body = main_it->second.body;
+  if(!found || main_body.instructions.empty())
+    return false;
+
+  using instruction_ptrt = const goto_programt::instructiont *;
+  std::map<instruction_ptrt, bool> may_have_spawned;
+  std::deque<goto_programt::const_targett> worklist;
+  const auto entry = main_body.instructions.begin();
+  may_have_spawned.emplace(&*entry, false);
+  worklist.push_back(entry);
+  bool reached_candidate = false;
+  std::set<instruction_ptrt> candidate_calls;
+
+  while(!worklist.empty())
+  {
+    const auto instruction = worklist.front();
+    worklist.pop_front();
+    const bool incoming = may_have_spawned.at(&*instruction);
+    const auto callee = direct_callee(*instruction);
+
+    if(callee.has_value() && *callee == candidate)
+    {
+      reached_candidate = true;
+      if(incoming)
+        return false;
+      candidate_calls.insert(&*instruction);
+    }
+
+    const bool outgoing =
+      incoming || instruction->is_start_thread() ||
+      (callee.has_value() && is_thread_create(*callee)) ||
+      (callee.has_value() && spawn_capable.find(*callee) != spawn_capable.end());
+    for(const auto successor : main_body.get_successors(instruction))
+    {
+      const auto insertion = may_have_spawned.emplace(&*successor, outgoing);
+      if(insertion.second)
+        worklist.push_back(successor);
+      else if(outgoing && !insertion.first->second)
+      {
+        insertion.first->second = true;
+        worklist.push_back(successor);
+      }
+    }
+  }
+
+  reachable_call_sites = candidate_calls.size();
+  return reached_candidate;
+}
 } // namespace
 
 nondet_bulk_init_statst nondet_bulk_init(
   goto_modelt &goto_model,
-  message_handlert &message_handler)
+  message_handlert &message_handler,
+  const nondet_bulk_init_modet mode)
 {
   nondet_bulk_init_statst stats;
   const namespacet ns(goto_model.symbol_table);
@@ -312,9 +390,9 @@ nondet_bulk_init_statst nondet_bulk_init(
   havoc_slice_convertt converter(goto_model.symbol_table, message_handler);
   symbol_exprt havoc_function(
     CPROVER_PREFIX "havoc_slice", code_typet({}, empty_typet{}));
-
   std::set<irep_idt> candidate_source_files;
   std::size_t eligible_candidates = 0;
+
   for(auto &entry : goto_model.goto_functions.function_map)
   {
     auto &function = entry.second;
@@ -327,9 +405,26 @@ nondet_bulk_init_statst nondet_bulk_init(
           function.body, natural_loop.first, natural_loop.second, match))
         continue;
       ++stats.candidate_loops;
-      if(!called_only_before_threads(goto_model, entry.first, spawn_capable))
+      std::size_t reachable_call_sites = 0;
+      const bool called_prethread =
+        mode == nondet_bulk_init_modet::source_closed
+          ? called_only_before_threads_source_closed(
+              goto_model, entry.first, spawn_capable)
+          : called_only_before_threads_cfg(
+              goto_model,
+              entry.first,
+              spawn_capable,
+              reachable_call_sites);
+      if(!called_prethread)
       {
         ++stats.rejected_non_prethread;
+        continue;
+      }
+      if(
+        mode == nondet_bulk_init_modet::spawn_frontier_residual &&
+        reachable_call_sites > 2)
+      {
+        ++stats.rejected_region_budget;
         continue;
       }
       const irep_idt file = match.head->source_location().get_file();
@@ -343,29 +438,34 @@ nondet_bulk_init_statst nondet_bulk_init(
     }
   }
 
-  std::size_t source_loops = 0;
-  for(auto &entry : goto_model.goto_functions.function_map)
+  if(mode == nondet_bulk_init_modet::source_closed)
   {
-    natural_loops_mutablet natural_loops(entry.second.body);
-    for(const auto &natural_loop : natural_loops.loop_map)
+    std::size_t source_loops = 0;
+    for(auto &entry : goto_model.goto_functions.function_map)
     {
-      const irep_idt file =
-        natural_loop.first->source_location().get_file();
-      if(candidate_source_files.find(file) != candidate_source_files.end())
-        ++source_loops;
+      natural_loops_mutablet natural_loops(entry.second.body);
+      for(const auto &natural_loop : natural_loops.loop_map)
+      {
+        const irep_idt file =
+          natural_loop.first->source_location().get_file();
+        if(candidate_source_files.find(file) != candidate_source_files.end())
+          ++source_loops;
+      }
+    }
+
+    if(
+      eligible_candidates == 0 ||
+      source_loops != eligible_candidates ||
+      stats.rejected_non_prethread != 0 ||
+      stats.rejected_nonterminal != 0)
+    {
+      if(source_loops != eligible_candidates)
+        stats.rejected_nonterminal += eligible_candidates;
+      return stats;
     }
   }
-
-  if(
-    eligible_candidates == 0 ||
-    source_loops != eligible_candidates ||
-    stats.rejected_non_prethread != 0 ||
-    stats.rejected_nonterminal != 0)
-  {
-    if(source_loops != eligible_candidates)
-      stats.rejected_nonterminal += eligible_candidates;
+  else if(eligible_candidates == 0)
     return stats;
-  }
 
   for(auto &entry : goto_model.goto_functions.function_map)
   {
@@ -377,6 +477,22 @@ nondet_bulk_init_statst nondet_bulk_init(
       if(
         !match_loop(
           function.body, natural_loop.first, natural_loop.second, match))
+        continue;
+      std::size_t reachable_call_sites = 0;
+      const bool called_prethread =
+        mode == nondet_bulk_init_modet::source_closed
+          ? called_only_before_threads_source_closed(
+              goto_model, entry.first, spawn_capable)
+          : called_only_before_threads_cfg(
+              goto_model,
+              entry.first,
+              spawn_capable,
+              reachable_call_sites);
+      if(!called_prethread)
+        continue;
+      if(
+        mode == nondet_bulk_init_modet::spawn_frontier_residual &&
+        reachable_call_sites > 2)
         continue;
 
       const auto element_size = size_of_expr(match.element_type, ns);
@@ -394,6 +510,13 @@ nondet_bulk_init_statst nondet_bulk_init(
         {pointer, byte_count},
         replacement,
         goto_model.symbol_table.lookup_ref(entry.first).mode);
+      for(auto &instruction : replacement.instructions)
+      {
+        if(
+          mode == nondet_bulk_init_modet::spawn_frontier_residual &&
+          instruction.is_assert())
+          instruction.turn_into_assume();
+      }
       replacement.add(goto_programt::make_assignment(
         match.index, match.bound, match.head->source_location()));
       function.body.destructive_insert(match.first_body, replacement);

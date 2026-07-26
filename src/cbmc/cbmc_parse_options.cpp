@@ -564,6 +564,7 @@ int cbmc_parse_optionst::doit()
   if(get_goto_program_ret!=-1)
     return get_goto_program_ret;
 
+  bool native_model_transformed = false;
   bool native_rescue_portfolio_child = false;
   if(cmdline.isset("native-counterexample-rescue-portfolio"))
   {
@@ -893,8 +894,10 @@ int cbmc_parse_optionst::doit()
       goto_model, ui_message_handler);
 
   if(cmdline.isset("native-dormant-spawn-cutoff"))
-    dormant_spawn_cutoff_transform(
-      goto_model, ui_message_handler);
+    native_model_transformed =
+      dormant_spawn_cutoff_transform(
+        goto_model, ui_message_handler) ||
+      native_model_transformed;
 
   if(cmdline.isset("native-dormant-spawn-pair-audit"))
     dormant_spawn_pair_audit(
@@ -921,21 +924,29 @@ int cbmc_parse_optionst::doit()
         << messaget::eom;
       return CPROVER_EXIT_USAGE_ERROR;
     }
-    dormant_spawn_pair_transform(
-      goto_model, variant, ui_message_handler);
+    native_model_transformed =
+      dormant_spawn_pair_transform(
+        goto_model, variant, ui_message_handler) ||
+      native_model_transformed;
   }
 
   if(cmdline.isset("native-indexed-lifecycle-prefix"))
-    indexed_lifecycle_prefix_transform(
-      goto_model, ui_message_handler);
+    native_model_transformed =
+      indexed_lifecycle_prefix_transform(
+        goto_model, ui_message_handler) ||
+      native_model_transformed;
 
   if(cmdline.isset("native-alternating-phase-recurrence"))
-    alternating_phase_recurrence_transform(
-      goto_model, ui_message_handler);
+    native_model_transformed =
+      alternating_phase_recurrence_transform(
+        goto_model, ui_message_handler) ||
+      native_model_transformed;
 
   if(cmdline.isset("native-homogeneous-spawn-witness"))
-    homogeneous_spawn_witness_transform(
-      goto_model, ui_message_handler);
+    native_model_transformed =
+      homogeneous_spawn_witness_transform(
+        goto_model, ui_message_handler) ||
+      native_model_transformed;
 
   if(
     cmdline.isset("native-jces") &&
@@ -968,13 +979,18 @@ int cbmc_parse_optionst::doit()
   }
 
   if(cmdline.isset("native-prefix-affine-envelope"))
-    prefix_affine_envelope_transform(goto_model, ui_message_handler);
+    native_model_transformed =
+      prefix_affine_envelope_transform(
+        goto_model, ui_message_handler) ||
+      native_model_transformed;
 
   if(
     cmdline.isset("native-jces") &&
     !cmdline.isset("unwind-suggest"))
-    local_loop_acceleration_transform(
-      goto_model, ui_message_handler);
+    native_model_transformed =
+      local_loop_acceleration_transform(
+        goto_model, ui_message_handler) ||
+      native_model_transformed;
 
   if(cmdline.isset("native-property-affine-audit"))
     property_directed_affine_audit(goto_model, ui_message_handler);
@@ -1023,25 +1039,45 @@ int cbmc_parse_optionst::doit()
       std::cout << "VERIFICATION SUCCESSFUL\n";
       return CPROVER_EXIT_SUCCESS;
     }
-    if(
-      !lock_relational_ai_transform(goto_model, ui_message_handler) &&
-      !homogeneous_thread_local_cutoff_transform(
-        goto_model, ui_message_handler) &&
-      !predicate_stable_linearization_transform(
-        goto_model, ui_message_handler) &&
-      !cas_linearization_stability_transform(
-        goto_model, ui_message_handler) &&
-      !lock_linearization_stability_transform(
-        goto_model, ui_message_handler) &&
-      !lock_scoped_commutative_aggregation_transform(
-        goto_model, ui_message_handler) &&
-      !ticket_rank_serializability_transform(
-        goto_model, ui_message_handler) &&
-      !transition_word_equivalence_transform(
-        goto_model, ui_message_handler) &&
-      !join_scoped_commuting_sequentialization_transform(
-        goto_model, ui_message_handler))
+    const bool jces_model_transformed =
+      lock_relational_ai_transform(goto_model, ui_message_handler) ||
+      homogeneous_thread_local_cutoff_transform(
+        goto_model, ui_message_handler) ||
+      predicate_stable_linearization_transform(
+        goto_model, ui_message_handler) ||
+      cas_linearization_stability_transform(
+        goto_model, ui_message_handler) ||
+      lock_linearization_stability_transform(
+        goto_model, ui_message_handler) ||
+      lock_scoped_commutative_aggregation_transform(
+        goto_model, ui_message_handler) ||
+      ticket_rank_serializability_transform(
+        goto_model, ui_message_handler) ||
+      transition_word_equivalence_transform(
+        goto_model, ui_message_handler) ||
+      join_scoped_commuting_sequentialization_transform(
+        goto_model, ui_message_handler) ||
       jces_transform(goto_model, ui_message_handler);
+    native_model_transformed =
+      native_model_transformed || jces_model_transformed;
+  }
+
+  if(
+    options.get_bool_option("deagle-nondet-bulk-init") &&
+    !native_model_transformed &&
+    !options.is_set("property") && !options.is_set("subproperty"))
+  {
+    const auto stats = nondet_bulk_init(
+      goto_model,
+      ui_message_handler,
+      nondet_bulk_init_modet::spawn_frontier_residual);
+    std::cout
+      << "Deagle nondet bulk init: phase=residual candidates="
+      << stats.candidate_loops << " transformed="
+      << stats.transformed_loops << " rejected_non_prethread="
+      << stats.rejected_non_prethread << " rejected_nonterminal="
+      << stats.rejected_nonterminal << " rejected_region_budget="
+      << stats.rejected_region_budget << '\n';
   }
 
   if(cmdline.isset("interference-predicate-self-test"))
@@ -1330,13 +1366,18 @@ bool cbmc_parse_optionst::process_goto_program(
 
   if(options.get_bool_option("deagle-nondet-bulk-init"))
   {
-    const auto stats = nondet_bulk_init(goto_model, log.get_message_handler());
-    log.status() << "Deagle nondet bulk init: candidates="
+    const auto stats = nondet_bulk_init(
+      goto_model,
+      log.get_message_handler(),
+      nondet_bulk_init_modet::source_closed);
+    log.status() << "Deagle nondet bulk init: phase=source-closed candidates="
                  << stats.candidate_loops << " transformed="
                  << stats.transformed_loops << " rejected_non_prethread="
                  << stats.rejected_non_prethread
                  << " rejected_nonterminal="
-                 << stats.rejected_nonterminal << messaget::eom;
+                 << stats.rejected_nonterminal
+                 << " rejected_region_budget="
+                 << stats.rejected_region_budget << messaget::eom;
   }
 
   // Common removal of types and complex constructs
