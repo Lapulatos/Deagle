@@ -37,6 +37,9 @@ void partial_order_concurrencyt::add_init_writes(
       e_it!=equation.SSA_steps.end();
       e_it++)
   {
+    if(e_it->ignore)
+      continue;
+
     if(e_it->is_spawn())
     {
       spawn_seen=true;
@@ -85,6 +88,9 @@ void partial_order_concurrencyt::build_event_lists(
       e_it!=equation.SSA_steps.end();
       e_it++)
   {
+    if(e_it->ignore)
+      continue;
+
     if(e_it->is_shared_read() ||
        e_it->is_shared_write() ||
 // __SZH_ADD_BEGIN__

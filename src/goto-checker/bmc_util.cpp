@@ -11,7 +11,9 @@ Author: Daniel Kroening, Peter Schrammel
 
 #include "bmc_util.h"
 
+#include <algorithm>
 #include <iostream>
+#include <unordered_set>
 
 #include <goto-programs/graphml_witness.h>
 #include <goto-programs/json_goto_trace.h>
@@ -28,6 +30,7 @@ Author: Daniel Kroening, Peter Schrammel
 #include <solvers/decision_procedure.h>
 
 #include <util/json_stream.h>
+#include <util/find_symbols.h>
 #include <util/make_unique.h>
 #include <util/ui_message.h>
 
@@ -37,6 +40,181 @@ Author: Daniel Kroening, Peter Schrammel
 #include "symex_bmc.h"
 
 #include "util/std_code.h"
+
+namespace
+{
+void add_expression_symbols(
+  const exprt &expression,
+  find_symbols_sett &symbols)
+{
+  if(!expression.is_nil())
+    find_symbols(expression, symbols);
+}
+
+bool is_standard_synchronization_event(const SSA_stept &step)
+{
+  const std::string function = id2string(step.source.function_id);
+  return function.find("pthread_mutex") != std::string::npos ||
+         function.find("pthread_rwlock") != std::string::npos ||
+         function.find("pthread_spin") != std::string::npos ||
+         function.find("pthread_cond") != std::string::npos ||
+         function.find("pthread_barrier") != std::string::npos ||
+         function.find("pthread_join") != std::string::npos ||
+         function.find("sem_") != std::string::npos;
+}
+
+/// Audit a conservative property-rooted event closure without changing the
+/// equation. This is intentionally broader than a future slicer: locations
+/// are grouped by their L1 object and every write to a relevant object is
+/// retained.
+void property_event_cone(
+  symex_target_equationt &equation,
+  bool apply)
+{
+  using event_ptrt = const SSA_stept *;
+
+  std::vector<event_ptrt> reads;
+  std::vector<event_ptrt> writes;
+  find_symbols_sett needed_symbols;
+  std::unordered_set<irep_idt> relevant_locations;
+  std::unordered_set<event_ptrt> retained_events;
+  std::unordered_set<unsigned> retained_atomic_sections;
+  std::size_t synchronization_seeds = 0;
+
+  for(const auto &step : equation.SSA_steps)
+  {
+    if(step.is_shared_read())
+      reads.push_back(&step);
+    else if(step.is_shared_write())
+      writes.push_back(&step);
+
+    if(
+      (step.is_shared_read() || step.is_shared_write()) &&
+      is_standard_synchronization_event(step))
+    {
+      retained_events.insert(&step);
+      relevant_locations.insert(step.ssa_lhs.get_l1_object_identifier());
+      needed_symbols.insert(step.ssa_lhs.get_identifier());
+      add_expression_symbols(step.guard, needed_symbols);
+      if(step.atomic_section_id != 0)
+        retained_atomic_sections.insert(step.atomic_section_id);
+      ++synchronization_seeds;
+    }
+
+    if(step.is_assert() || step.is_assume() || step.is_constraint())
+    {
+      add_expression_symbols(step.cond_expr, needed_symbols);
+      add_expression_symbols(step.guard, needed_symbols);
+    }
+  }
+
+  std::size_t iterations = 0;
+  bool changed = true;
+  while(changed)
+  {
+    changed = false;
+    ++iterations;
+
+    for(const auto &step : equation.SSA_steps)
+    {
+      if(
+        (step.is_assignment() || step.is_decl()) &&
+        needed_symbols.find(step.ssa_lhs.get_identifier()) !=
+          needed_symbols.end())
+      {
+        const auto old_symbol_count = needed_symbols.size();
+        add_expression_symbols(step.ssa_rhs, needed_symbols);
+        add_expression_symbols(step.guard, needed_symbols);
+        add_expression_symbols(step.cond_expr, needed_symbols);
+        changed = changed || needed_symbols.size() != old_symbol_count;
+      }
+    }
+
+    for(const auto *read : reads)
+    {
+      if(
+        needed_symbols.find(read->ssa_lhs.get_identifier()) ==
+          needed_symbols.end() &&
+        (read->atomic_section_id == 0 ||
+         retained_atomic_sections.find(read->atomic_section_id) ==
+           retained_atomic_sections.end()))
+        continue;
+
+      if(retained_events.insert(read).second)
+        changed = true;
+      if(
+        relevant_locations.insert(
+          read->ssa_lhs.get_l1_object_identifier()).second)
+        changed = true;
+      if(
+        read->atomic_section_id != 0 &&
+        retained_atomic_sections.insert(read->atomic_section_id).second)
+        changed = true;
+
+      const auto old_symbol_count = needed_symbols.size();
+      add_expression_symbols(read->guard, needed_symbols);
+      changed = changed || needed_symbols.size() != old_symbol_count;
+    }
+
+    for(const auto *write : writes)
+    {
+      const bool location_is_relevant =
+        relevant_locations.find(write->ssa_lhs.get_l1_object_identifier()) !=
+        relevant_locations.end();
+      const bool atomic_section_is_relevant =
+        write->atomic_section_id != 0 &&
+        retained_atomic_sections.find(write->atomic_section_id) !=
+          retained_atomic_sections.end();
+      if(!location_is_relevant && !atomic_section_is_relevant)
+        continue;
+
+      if(retained_events.insert(write).second)
+        changed = true;
+      if(
+        write->atomic_section_id != 0 &&
+        retained_atomic_sections.insert(write->atomic_section_id).second)
+        changed = true;
+
+      const auto old_symbol_count = needed_symbols.size();
+      needed_symbols.insert(write->ssa_lhs.get_identifier());
+      add_expression_symbols(write->guard, needed_symbols);
+      changed = changed || needed_symbols.size() != old_symbol_count;
+    }
+  }
+
+  const std::size_t total_events = reads.size() + writes.size();
+  const std::size_t retained_reads = std::count_if(
+    reads.begin(), reads.end(), [&retained_events](const event_ptrt event) {
+      return retained_events.find(event) != retained_events.end();
+    });
+  const std::size_t retained_writes = std::count_if(
+    writes.begin(), writes.end(), [&retained_events](const event_ptrt event) {
+      return retained_events.find(event) != retained_events.end();
+    });
+
+  std::cout << "NATIVE_PROPERTY_EVENT_CONE total=" << total_events
+            << " reads=" << reads.size() << " writes=" << writes.size()
+            << " retained=" << retained_events.size()
+            << " retained_reads=" << retained_reads
+            << " retained_writes=" << retained_writes
+            << " removable=" << (total_events - retained_events.size())
+            << " locations=" << relevant_locations.size()
+            << " sync_seeds=" << synchronization_seeds
+            << " iterations=" << iterations
+            << " applied=" << (apply ? 1 : 0) << '\n';
+
+  if(apply)
+  {
+    for(auto &step : equation.SSA_steps)
+    {
+      if(
+        (step.is_shared_read() || step.is_shared_write()) &&
+        retained_events.find(&step) == retained_events.end())
+        step.ignore = true;
+    }
+  }
+}
+} // namespace
 
 void message_building_error_trace(messaget &log)
 {
@@ -371,6 +549,15 @@ void postprocess_equation(
 
   if(equation.has_threads())
   {
+    const std::string memory_model_name = options.get_option("mm");
+    const bool supported_memory_model =
+      memory_model_name.empty() || memory_model_name == "sc" ||
+      memory_model_name == "tso" || memory_model_name == "pso";
+    const bool apply_property_event_cone =
+      supported_memory_model && !options.get_bool_option("datarace") &&
+      !options.get_bool_option("deadlock");
+    property_event_cone(equation, apply_property_event_cone);
+
     std::unique_ptr<memory_model_baset> memory_model =
       get_memory_model(options, ns);
 

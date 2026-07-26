@@ -180,7 +180,7 @@ symbol_exprt memory_model_baset::register_read_from_choice_symbol(
 void memory_model_baset::build_guard_map_write(symex_target_equationt &equation)
 {
   for(eventst::const_iterator e_it=equation.SSA_steps.begin(); e_it!=equation.SSA_steps.end(); e_it++)
-    if(e_it->is_shared_write())
+    if(!e_it->ignore && e_it->is_shared_write())
     {
       equation.oc_guard_map.insert(e_it);
       id_to_guard[id(e_it).c_str()] = e_it->guard;
@@ -190,7 +190,10 @@ void memory_model_baset::build_guard_map_write(symex_target_equationt &equation)
 void memory_model_baset::build_guard_map_all(symex_target_equationt &equation)
 {
   for(eventst::const_iterator e_it=equation.SSA_steps.begin(); e_it!=equation.SSA_steps.end(); e_it++)
-    if(e_it->is_shared_write() || e_it->is_shared_read() || e_it->is_memory_barrier())
+    if(
+      !e_it->ignore &&
+      (e_it->is_shared_write() || e_it->is_shared_read() ||
+       e_it->is_memory_barrier()))
     {
       equation.oc_guard_map.insert(e_it);
       id_to_guard[id(e_it).c_str()] = e_it->guard;
@@ -499,6 +502,9 @@ void memory_model_baset::build_per_thread_map(
       e_it!=equation.SSA_steps.end();
       e_it++)
   {
+    if(e_it->ignore)
+      continue;
+
     // concurrency-related?
     if(!e_it->is_shared_read() &&
        !e_it->is_shared_write() &&
@@ -523,6 +529,9 @@ void memory_model_baset::build_per_loc_map(
       e_it!=equation.SSA_steps.end();
       e_it++)
   {
+    if(e_it->ignore)
+      continue;
+
     // concurrency-related?
     if(!e_it->is_shared_read() &&
        !e_it->is_shared_write()) continue;
