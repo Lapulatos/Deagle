@@ -31,6 +31,11 @@ bool dormant_spawn_pair_audit(
   const goto_modelt &goto_model,
   message_handlert &message_handler);
 
+/// Return the number of sound self/cross variants admitted by the dormant
+/// spawn-pair analysis, or zero when fewer than two classes are applicable.
+std::size_t dormant_spawn_pair_variant_count(
+  const goto_modelt &goto_model);
+
 /// Materialize one selected pair of worker roles and keep every omitted
 /// worker class dormant. Unsupported variants leave the model unchanged.
 bool dormant_spawn_pair_transform(

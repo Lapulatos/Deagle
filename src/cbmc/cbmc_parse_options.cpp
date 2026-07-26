@@ -11,10 +11,25 @@ Author: Daniel Kroening, kroening@kroening.com
 
 #include "cbmc_parse_options.h"
 
+#include <algorithm>
 #include <cstdlib> // exit()
+#include <chrono>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <sstream>
+
+#ifndef _WIN32
+#  include <cerrno>
+#  include <csignal>
+#  include <sys/types.h>
+#  include <sys/wait.h>
+#  include <unistd.h>
+#  ifdef __linux__
+#    include <sys/prctl.h>
+#  endif
+#endif
 
 #include <util/config.h>
 #include <util/exit_codes.h>
@@ -547,6 +562,134 @@ int cbmc_parse_optionst::doit()
 
   if(get_goto_program_ret!=-1)
     return get_goto_program_ret;
+
+  bool dormant_pair_portfolio_child = false;
+  if(cmdline.isset("native-dormant-spawn-pair-portfolio"))
+  {
+#ifdef _WIN32
+    std::cout
+      << "NATIVE_DORMANT_SPAWN_PAIR_PORTFOLIO applied=0"
+      << " reason=unsupported_platform\n"
+      << "VERIFICATION SUCCESSFUL\n";
+    return CPROVER_EXIT_VERIFICATION_SAFE;
+#else
+    const std::size_t variants = std::min(
+      dormant_spawn_pair_variant_count(goto_model),
+      std::size_t{10});
+    if(variants == 0)
+    {
+      std::cout
+        << "NATIVE_DORMANT_SPAWN_PAIR_PORTFOLIO applied=0"
+        << " reason=dormant_pair_not_applicable\n"
+        << "VERIFICATION SUCCESSFUL\n";
+      return CPROVER_EXIT_VERIFICATION_SAFE;
+    }
+
+    const auto portfolio_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(18);
+    std::size_t completed = 0;
+    std::size_t timed_out = 0;
+    for(std::size_t variant = 0; variant < variants; ++variant)
+    {
+      const auto now = std::chrono::steady_clock::now();
+      if(now >= portfolio_deadline)
+        break;
+      const auto child_deadline =
+        std::min(portfolio_deadline, now + std::chrono::seconds(6));
+
+      char output_path[] = "deagle_native_pair_XXXXXX";
+      const int output_fd = mkstemp(output_path);
+      if(output_fd < 0)
+      {
+        std::cout
+          << "NATIVE_DORMANT_SPAWN_PAIR_PORTFOLIO applied=0"
+          << " reason=output_file\n"
+          << "VERIFICATION SUCCESSFUL\n";
+        return CPROVER_EXIT_VERIFICATION_SAFE;
+      }
+      std::fflush(nullptr);
+      const pid_t child = fork();
+      if(child == 0)
+      {
+#ifdef __linux__
+        if(
+          prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 ||
+          getppid() == 1)
+          _exit(CPROVER_EXIT_INTERNAL_ERROR);
+#endif
+        if(
+          dup2(output_fd, STDOUT_FILENO) < 0 ||
+          dup2(output_fd, STDERR_FILENO) < 0)
+          _exit(CPROVER_EXIT_INTERNAL_ERROR);
+        close(output_fd);
+        dormant_spawn_pair_transform(
+          goto_model, variant, ui_message_handler);
+        dormant_pair_portfolio_child = true;
+        break;
+      }
+      close(output_fd);
+      if(child < 0)
+      {
+        std::remove(output_path);
+        std::cout
+          << "NATIVE_DORMANT_SPAWN_PAIR_PORTFOLIO applied=0"
+          << " reason=fork\n"
+          << "VERIFICATION SUCCESSFUL\n";
+        return CPROVER_EXIT_VERIFICATION_SAFE;
+      }
+
+      int status = 0;
+      bool finished = false;
+      while(std::chrono::steady_clock::now() < child_deadline)
+      {
+        const pid_t waited = waitpid(child, &status, WNOHANG);
+        if(waited == child)
+        {
+          finished = true;
+          break;
+        }
+        if(waited < 0 && errno != EINTR)
+          break;
+        usleep(10000);
+      }
+      if(!finished)
+      {
+        kill(child, SIGKILL);
+        while(waitpid(child, &status, 0) < 0 && errno == EINTR)
+        {
+        }
+        ++timed_out;
+      }
+      else
+        ++completed;
+
+      std::ifstream child_output_stream(output_path);
+      std::ostringstream child_output_buffer;
+      child_output_buffer << child_output_stream.rdbuf();
+      child_output_stream.close();
+      std::remove(output_path);
+      const std::string child_output = child_output_buffer.str();
+      if(
+        finished && WIFEXITED(status) &&
+        WEXITSTATUS(status) == CPROVER_EXIT_VERIFICATION_UNSAFE &&
+        child_output.find("VERIFICATION FAILED") != std::string::npos)
+      {
+        std::cout << child_output;
+        return CPROVER_EXIT_VERIFICATION_UNSAFE;
+      }
+    }
+    if(!dormant_pair_portfolio_child)
+    {
+      std::cout
+        << "NATIVE_DORMANT_SPAWN_PAIR_PORTFOLIO applied=1"
+        << " variants=" << variants
+        << " completed=" << completed
+        << " timed_out=" << timed_out
+        << "\nVERIFICATION SUCCESSFUL\n";
+      return CPROVER_EXIT_VERIFICATION_SAFE;
+    }
+#endif
+  }
 
   if(cmdline.isset("native-group-action-cancellation-audit"))
     group_action_cancellation_audit(

@@ -8664,6 +8664,16 @@ bool dormant_spawn_pair_audit(
   return applicable;
 }
 
+std::size_t dormant_spawn_pair_variant_count(
+  const goto_modelt &goto_model)
+{
+  std::string reason;
+  const auto candidates = dormant_spawn_cutoffs(goto_model, reason);
+  if(candidates.size() < 2)
+    return 0;
+  return candidates.size() * (candidates.size() + 1) / 2;
+}
+
 bool dormant_spawn_pair_transform(
   goto_modelt &goto_model,
   const std::size_t variant,
