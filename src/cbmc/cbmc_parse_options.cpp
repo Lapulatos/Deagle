@@ -584,6 +584,35 @@ int cbmc_parse_optionst::doit()
     dormant_spawn_cutoff_transform(
       goto_model, ui_message_handler);
 
+  if(cmdline.isset("native-dormant-spawn-pair-audit"))
+    dormant_spawn_pair_audit(
+      goto_model, ui_message_handler);
+
+  if(cmdline.isset("native-dormant-spawn-pair"))
+  {
+    const std::string value =
+      cmdline.get_value("native-dormant-spawn-pair");
+    std::size_t consumed = 0;
+    std::size_t variant = 0;
+    try
+    {
+      variant = std::stoul(value, &consumed);
+    }
+    catch(const std::exception &)
+    {
+      consumed = 0;
+    }
+    if(value.empty() || consumed != value.size())
+    {
+      log.error()
+        << "invalid dormant spawn pair variant: " << value
+        << messaget::eom;
+      return CPROVER_EXIT_USAGE_ERROR;
+    }
+    dormant_spawn_pair_transform(
+      goto_model, variant, ui_message_handler);
+  }
+
   if(cmdline.isset("native-indexed-lifecycle-prefix"))
     indexed_lifecycle_prefix_transform(
       goto_model, ui_message_handler);

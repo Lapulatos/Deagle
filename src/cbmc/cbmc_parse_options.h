@@ -39,7 +39,7 @@ class optionst;
   "(interference-predicate-fixedpoint)" \
   "(interference-predicate-recursive-worker-fixedpoint)" \
   "(native-lock-ego-abstraction)" \
-  "(native-jces)(native-prefix-affine-envelope)(native-property-affine-audit)(native-property-affine-proof)(native-role-split-stream-audit)(native-publication-frontier-audit)(native-relational-bisimulation-audit)(native-group-action-cancellation-audit)(native-segmented-fold-audit)(native-nested-iteration-audit)(native-local-loop-accel-audit)(native-homogeneous-spawn-witness-audit)(native-homogeneous-spawn-witness)(native-alternating-phase-audit)(native-alternating-phase-recurrence)(native-indexed-lifecycle-audit)(native-indexed-lifecycle-prefix)(native-dormant-spawn-cutoff-audit)(native-dormant-spawn-cutoff)" \
+  "(native-jces)(native-prefix-affine-envelope)(native-property-affine-audit)(native-property-affine-proof)(native-role-split-stream-audit)(native-publication-frontier-audit)(native-relational-bisimulation-audit)(native-group-action-cancellation-audit)(native-segmented-fold-audit)(native-nested-iteration-audit)(native-local-loop-accel-audit)(native-homogeneous-spawn-witness-audit)(native-homogeneous-spawn-witness)(native-alternating-phase-audit)(native-alternating-phase-recurrence)(native-indexed-lifecycle-audit)(native-indexed-lifecycle-prefix)(native-dormant-spawn-cutoff-audit)(native-dormant-spawn-cutoff)(native-dormant-spawn-pair-audit)(native-dormant-spawn-pair):" \
   OPT_BMC \
   "(preprocess)(slice-by-trace):" \
   OPT_FUNCTIONS \

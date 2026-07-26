@@ -7,6 +7,8 @@ Module: Join-Scoped Compositional Effect Summary
 #ifndef CPROVER_ANALYSES_JCES_ANALYSIS_H
 #define CPROVER_ANALYSES_JCES_ANALYSIS_H
 
+#include <cstddef>
+
 class goto_modelt;
 class message_handlert;
 
@@ -21,6 +23,19 @@ bool dormant_spawn_cutoff_audit(
 /// unchanged.
 bool dormant_spawn_cutoff_transform(
   goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// Audit two or more canonical homogeneous create loops for a
+/// counterexample-only self/cross worker-pair decomposition.
+bool dormant_spawn_pair_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// Materialize one selected pair of worker roles and keep every omitted
+/// worker class dormant. Unsupported variants leave the model unchanged.
+bool dormant_spawn_pair_transform(
+  goto_modelt &goto_model,
+  std::size_t variant,
   message_handlert &message_handler);
 
 /// Audit constant-bound, zero-based, straight-line lifecycle loops in main.

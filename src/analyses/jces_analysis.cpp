@@ -7400,13 +7400,6 @@ bool dormant_spawn_loop(
       const bool direct_call =
         direct_call_identifier(*instruction, callee);
       if(
-        direct_call && callee == "pthread_create" &&
-        &*instruction != summary.create_instruction)
-      {
-        reason = "dormant_other_create";
-        return false;
-      }
-      if(
         !instruction_mentions_any(
           *instruction, {summary.thread_ids}) ||
         &*instruction == summary.create_instruction ||
@@ -7468,7 +7461,112 @@ std::vector<dormant_spawn_cutofft> dormant_spawn_cutoffs(
     else
       last_reason = std::move(reason);
   }
+  std::set<const goto_programt::instructiont *> admitted_creates;
+  for(const auto &candidate : result)
+    admitted_creates.insert(candidate.create_instruction);
+  for(const auto &entry : goto_model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(
+        direct_call_identifier(instruction, callee) &&
+        callee == "pthread_create" &&
+        admitted_creates.count(&instruction) == 0)
+      {
+        last_reason = "dormant_other_create";
+        result.clear();
+        return result;
+      }
+    }
+  }
   return result;
+}
+
+bool dormant_spawn_pair_counts(
+  const std::size_t classes,
+  std::size_t variant,
+  std::vector<unsigned> &counts,
+  std::string &label)
+{
+  counts.assign(classes, 0);
+  for(std::size_t first = 0; first < classes; ++first)
+  {
+    for(std::size_t second = first + 1; second < classes; ++second)
+    {
+      if(variant == 0)
+      {
+        counts[first] = 1;
+        counts[second] = 1;
+        label =
+          "pair-" + std::to_string(first) + "-" + std::to_string(second);
+        return true;
+      }
+      --variant;
+    }
+  }
+  if(variant >= classes)
+    return false;
+  counts[variant] = 2;
+  label = "self-" + std::to_string(variant);
+  return true;
+}
+
+bool apply_dormant_spawn_counts(
+  goto_modelt &goto_model,
+  const std::vector<dormant_spawn_cutofft> &candidates,
+  const std::vector<unsigned> &counts,
+  bool &truncated)
+{
+  if(candidates.size() != counts.size())
+    return false;
+  auto main =
+    goto_model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != goto_model.goto_functions.function_map.end() &&
+    main->second.body_available(),
+    "dormant spawn cutoff requires main");
+  const namespacet ns(goto_model.symbol_table);
+  for(std::size_t index = 0; index < candidates.size(); ++index)
+  {
+    const auto &summary = candidates[index];
+    const symbolt *induction_symbol = nullptr;
+    INVARIANT(
+      !ns.lookup(summary.induction, induction_symbol),
+      "dormant spawn induction exists");
+    auto head =
+      main->second.body.const_cast_target(summary.head);
+    symbol_exprt induction(
+      summary.induction, induction_symbol->type);
+    head->condition_nonconst() = not_exprt(
+      binary_relation_exprt(
+        induction,
+        ID_lt,
+        from_integer(counts[index], induction_symbol->type)));
+  }
+
+  truncated = false;
+  bool at_join = false;
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != main->second.body.instructions.end();
+      ++instruction)
+  {
+    for(const auto &candidate : candidates)
+    {
+      if(
+        candidate.first_join != nullptr &&
+        &*instruction == candidate.first_join)
+        at_join = true;
+    }
+    if(!at_join || instruction->is_end_function())
+      continue;
+    instruction->turn_into_skip();
+    truncated = true;
+  }
+  goto_model.goto_functions.update();
+  return true;
 }
 
 bool constant_lifecycle_bound(const exprt &expr, unsigned &bound)
@@ -8523,49 +8621,96 @@ bool dormant_spawn_cutoff_transform(
     return false;
   }
   const auto &summary = candidates.front();
-  auto main =
-    goto_model.goto_functions.function_map.find("main");
-  INVARIANT(
-    main != goto_model.goto_functions.function_map.end() &&
-    main->second.body_available(),
-    "dormant spawn cutoff requires main");
-  const namespacet ns(goto_model.symbol_table);
-  const symbolt *induction_symbol = nullptr;
-  INVARIANT(
-    !ns.lookup(summary.induction, induction_symbol),
-    "dormant spawn induction exists");
-  auto head =
-    main->second.body.const_cast_target(summary.head);
-  symbol_exprt induction(
-    summary.induction, induction_symbol->type);
-  head->condition_nonconst() = not_exprt(
-    binary_relation_exprt(
-      induction,
-      ID_lt,
-      from_integer(2, induction_symbol->type)));
-
   bool truncated = false;
-  if(summary.first_join != nullptr)
+  if(!apply_dormant_spawn_counts(
+       goto_model, candidates, {2}, truncated))
   {
-    bool at_join = false;
-    for(auto instruction = main->second.body.instructions.begin();
-        instruction != main->second.body.instructions.end();
-        ++instruction)
-    {
-      if(&*instruction == summary.first_join)
-        at_join = true;
-      if(!at_join || instruction->is_end_function())
-        continue;
-      instruction->turn_into_skip();
-      truncated = true;
-    }
+    std::cout
+      << "NATIVE_DORMANT_SPAWN_CUTOFF applied=0"
+      << " reason=dormant_transform_failed\n";
+    return false;
   }
-  goto_model.goto_functions.update();
   std::cout
     << "NATIVE_DORMANT_SPAWN_CUTOFF applied=1"
     << " worker=" << summary.worker
     << " original_bound=" << summary.bound
     << " cutoff=2"
+    << " truncated=" << (truncated ? 1 : 0)
+    << '\n';
+  (void)message_handler;
+  return true;
+}
+
+bool dormant_spawn_pair_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  std::string reason;
+  const auto candidates = dormant_spawn_cutoffs(goto_model, reason);
+  const bool applicable = candidates.size() >= 2;
+  const std::size_t variants =
+    applicable ? candidates.size() * (candidates.size() + 1) / 2 : 0;
+  std::cout
+    << "NATIVE_DORMANT_SPAWN_PAIR_AUDIT applicable="
+    << (applicable ? 1 : 0)
+    << " classes=" << candidates.size()
+    << " variants=" << variants;
+  if(!applicable)
+    std::cout
+      << " reason="
+      << (candidates.empty() ? reason : "dormant_single_class");
+  std::cout << '\n';
+  (void)message_handler;
+  return applicable;
+}
+
+bool dormant_spawn_pair_transform(
+  goto_modelt &goto_model,
+  const std::size_t variant,
+  message_handlert &message_handler)
+{
+  std::string reason;
+  auto candidates = dormant_spawn_cutoffs(goto_model, reason);
+  std::vector<unsigned> counts;
+  std::string label;
+  if(
+    candidates.size() < 2 ||
+    !dormant_spawn_pair_counts(
+      candidates.size(), variant, counts, label))
+  {
+    std::cout
+      << "NATIVE_DORMANT_SPAWN_PAIR applied=0"
+      << " classes=" << candidates.size()
+      << " variant=" << variant
+      << " reason="
+      << (candidates.empty() ? reason : "dormant_pair_variant")
+      << '\n';
+    return false;
+  }
+  bool truncated = false;
+  if(!apply_dormant_spawn_counts(
+       goto_model, candidates, counts, truncated))
+  {
+    std::cout
+      << "NATIVE_DORMANT_SPAWN_PAIR applied=0"
+      << " classes=" << candidates.size()
+      << " variant=" << variant
+      << " reason=dormant_transform_failed\n";
+    return false;
+  }
+  std::cout
+    << "NATIVE_DORMANT_SPAWN_PAIR applied=1"
+    << " classes=" << candidates.size()
+    << " variant=" << variant
+    << " label=" << label
+    << " counts=";
+  for(std::size_t index = 0; index < counts.size(); ++index)
+  {
+    if(index != 0)
+      std::cout << ',';
+    std::cout << counts[index];
+  }
+  std::cout
     << " truncated=" << (truncated ? 1 : 0)
     << '\n';
   (void)message_handler;
