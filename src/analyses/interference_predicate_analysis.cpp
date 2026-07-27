@@ -10,14 +10,20 @@ Module: Interference-Closed Predicate Analysis
 #include <goto-programs/goto_inline.h>
 #include <goto-programs/goto_model.h>
 
+#include <langapi/language_util.h>
+
 #include <util/expr_util.h>
 #include <util/irep_hash.h>
 #include <util/message.h>
 #include <util/namespace.h>
 #include <util/pointer_expr.h>
+#include <util/replace_symbol.h>
+#include <util/simplify_expr.h>
 #include <util/std_expr.h>
 #include <util/std_code.h>
 
+#include <algorithm>
+#include <cstdlib>
 #include <deque>
 #include <iostream>
 #include <map>
@@ -176,13 +182,20 @@ bool is_ignored_synchronization_call(const irep_idt &identifier)
 {
   return identifier == "pthread_mutex_lock" ||
          identifier == "pthread_mutex_unlock" ||
+         identifier == "pthread_mutex_init" ||
+         identifier == "pthread_mutex_destroy" ||
          identifier == "pthread_cond_wait" ||
          identifier == "pthread_cond_signal" ||
          identifier == "pthread_cond_broadcast" ||
+         identifier == "pthread_cond_init" ||
+         identifier == "pthread_cond_destroy" ||
          identifier == "pthread_create" || identifier == "pthread_join";
 }
 
-void neutralize_synchronization_calls(goto_modelt &model)
+bool neutralize_synchronization_calls(
+  goto_modelt &model,
+  bool preserve_mutex_regions = false,
+  std::string *failure_reason = nullptr)
 {
   std::map<irep_idt, irep_idt> handle_entries;
   std::set<irep_idt> ambiguous_handles;
@@ -215,6 +228,7 @@ void neutralize_synchronization_calls(goto_modelt &model)
 
   for(auto &function_entry : model.goto_functions.function_map)
   {
+    std::vector<irep_idt> held_mutexes;
     for(auto &instruction : function_entry.second.body.instructions)
     {
       if(!instruction.is_function_call())
@@ -227,6 +241,57 @@ void neutralize_synchronization_calls(goto_modelt &model)
       {
         const irep_idt &identifier =
           to_symbol_expr(function).get_identifier();
+        if(
+          preserve_mutex_regions &&
+          (identifier == "pthread_mutex_lock" ||
+           identifier == "pthread_mutex_unlock"))
+        {
+          irep_idt mutex;
+          if(
+            instruction.call_arguments().empty() ||
+            !get_addressed_symbol(instruction.call_arguments()[0], mutex))
+          {
+            if(failure_reason != nullptr)
+              *failure_reason = "affine_unresolved_mutex";
+            return false;
+          }
+          if(identifier == "pthread_mutex_lock")
+          {
+            if(!held_mutexes.empty())
+            {
+              if(failure_reason != nullptr)
+                *failure_reason = "affine_nested_mutex";
+              return false;
+            }
+            held_mutexes.push_back(mutex);
+            const source_locationt source_location =
+              instruction.source_location();
+            instruction =
+              goto_programt::make_atomic_begin(source_location);
+          }
+          else
+          {
+            if(held_mutexes.empty() || held_mutexes.back() != mutex)
+            {
+              if(failure_reason != nullptr)
+                *failure_reason = "affine_unbalanced_mutex";
+              return false;
+            }
+            held_mutexes.pop_back();
+            const source_locationt source_location =
+              instruction.source_location();
+            instruction = goto_programt::make_atomic_end(source_location);
+          }
+          instruction.source_location_nonconst().set(
+            "v217_mutex", mutex);
+          continue;
+        }
+        if(preserve_mutex_regions && identifier == "pthread_cond_wait")
+        {
+          if(failure_reason != nullptr)
+            *failure_reason = "affine_cond_wait_requires_phase_summary";
+          return false;
+        }
         if(identifier == "pthread_create")
         {
           instruction.source_location_nonconst().set("v49_thread_spawn", true);
@@ -255,8 +320,15 @@ void neutralize_synchronization_calls(goto_modelt &model)
         instruction.turn_into_skip();
       }
     }
+    if(preserve_mutex_regions && !held_mutexes.empty())
+    {
+      if(failure_reason != nullptr)
+        *failure_reason = "affine_unbalanced_mutex";
+      return false;
+    }
   }
   model.goto_functions.update();
+  return true;
 }
 
 bool is_shared_scalar(const exprt &expr, const namespacet &ns)
@@ -728,6 +800,876 @@ std::vector<exprt> predicate_basis(
   return std::vector<exprt>(predicates.begin(), predicates.end());
 }
 
+bool affine_integer_expression(const exprt &expr)
+{
+  const exprt &value = skip_typecast(expr);
+  if(value.id() == ID_symbol || value.id() == ID_constant)
+    return value.type().id() != ID_pointer;
+  if(value.id() == ID_unary_minus && value.operands().size() == 1)
+    return affine_integer_expression(value.op0());
+  if(
+    (value.id() == ID_plus || value.id() == ID_minus) &&
+    !value.operands().empty())
+  {
+    for(const auto &operand : value.operands())
+    {
+      if(!affine_integer_expression(operand))
+        return false;
+    }
+    return true;
+  }
+  if(value.id() == ID_mult && value.operands().size() == 2)
+  {
+    const exprt &left = skip_typecast(value.op0());
+    const exprt &right = skip_typecast(value.op1());
+    return (
+      left.id() == ID_constant && affine_integer_expression(right)) ||
+           (right.id() == ID_constant && affine_integer_expression(left));
+  }
+  return false;
+}
+
+bool relational_template(const exprt &expr)
+{
+  if(expr.id() == ID_not && expr.operands().size() == 1)
+    return relational_template(expr.op0());
+  return expr.id() == ID_equal || expr.id() == ID_notequal ||
+         expr.id() == ID_lt || expr.id() == ID_le || expr.id() == ID_gt ||
+         expr.id() == ID_ge;
+}
+
+bool contains_shared_symbol(const exprt &expr, const namespacet &ns)
+{
+  if(expr.id() == ID_symbol)
+    return is_shared_scalar(expr, ns);
+  for(const auto &operand : expr.operands())
+  {
+    if(contains_shared_symbol(operand, ns))
+      return true;
+  }
+  return false;
+}
+
+exprt normalize_relational_template(exprt expr)
+{
+  if(expr.id() == ID_not && expr.operands().size() == 1)
+  {
+    const exprt &operand = expr.op0();
+    if(operand.id() == ID_equal && operand.operands().size() == 2)
+      return notequal_exprt(operand.op0(), operand.op1());
+    if(operand.id() == ID_notequal && operand.operands().size() == 2)
+      return equal_exprt(operand.op0(), operand.op1());
+  }
+  return expr;
+}
+
+void collect_signed_relational_templates(
+  const exprt &expr,
+  const namespacet &ns,
+  std::unordered_set<exprt, irep_hash> &templates)
+{
+  if(
+    relational_template(expr) && contains_shared_symbol(expr, ns) &&
+    uses_only_shared_symbols(expr, ns))
+  {
+    templates.insert(normalize_relational_template(expr));
+    return;
+  }
+  for(const auto &operand : expr.operands())
+    collect_signed_relational_templates(operand, ns, templates);
+}
+
+struct affine_regiont
+{
+  irep_idt entry;
+  irep_idt mutex;
+  unsigned begin_location = 0;
+  std::vector<std::pair<symbol_exprt, exprt>> assignments;
+};
+
+bool collect_affine_regions(
+  const goto_modelt &model,
+  const std::vector<irep_idt> &thread_ids,
+  std::vector<affine_regiont> &regions,
+  std::string &reason)
+{
+  for(const auto &thread_id : thread_ids)
+  {
+    const auto function =
+      model.goto_functions.function_map.find(thread_id);
+    if(
+      function == model.goto_functions.function_map.end() ||
+      !function->second.body_available())
+      continue;
+    const auto &program = function->second.body;
+    for(auto instruction = program.instructions.begin();
+        instruction != program.instructions.end(); ++instruction)
+    {
+      if(!instruction->is_atomic_begin() ||
+         instruction->source_location().get("v217_mutex") == irep_idt())
+        continue;
+      affine_regiont region;
+      region.entry = thread_id;
+      region.mutex = instruction->source_location().get("v217_mutex");
+      region.begin_location = instruction->location_number;
+      bool complete = false;
+      bool supported = true;
+      for(auto current = std::next(instruction);
+          current != program.instructions.end(); ++current)
+      {
+        if(current->is_atomic_end())
+        {
+          complete = true;
+          break;
+        }
+        if(current->is_assign())
+        {
+          if(
+            current->assign_lhs().id() != ID_symbol ||
+            !affine_integer_expression(current->assign_rhs()) ||
+            has_subexpr(current->assign_rhs(), ID_side_effect) ||
+            has_subexpr(current->assign_rhs(), ID_dereference))
+          {
+            supported = false;
+            continue;
+          }
+          region.assignments.emplace_back(
+            to_symbol_expr(current->assign_lhs()),
+            current->assign_rhs());
+        }
+        else if(
+          current->is_goto() || current->is_assume() ||
+          current->is_function_call() || current->is_start_thread() ||
+          current->is_throw() || current->is_catch() ||
+          (current->is_other() && !is_abstract_noop_other(*current)))
+        {
+          supported = false;
+        }
+      }
+      if(!complete)
+      {
+        reason = "affine_region_unclosed";
+        return false;
+      }
+      if(supported && !region.assignments.empty())
+      {
+        std::cout << "V217_AFFINE_REGION entry=" << region.entry
+                  << " begin=" << region.begin_location
+                  << " assignments=" << region.assignments.size();
+        for(const auto &assignment : region.assignments)
+          std::cout << " lhs=" << assignment.first.get_identifier();
+        std::cout << '\n';
+        regions.push_back(std::move(region));
+      }
+    }
+  }
+  return true;
+}
+
+void collect_symbol_identifiers(
+  const exprt &expr,
+  std::set<irep_idt> &identifiers)
+{
+  if(expr.id() == ID_symbol)
+    identifiers.insert(to_symbol_expr(expr).get_identifier());
+  for(const auto &operand : expr.operands())
+    collect_symbol_identifiers(operand, identifiers);
+}
+
+bool uses_identifier_from(
+  const exprt &expr,
+  const std::set<irep_idt> &identifiers)
+{
+  if(
+    expr.id() == ID_symbol &&
+    identifiers.find(to_symbol_expr(expr).get_identifier()) !=
+      identifiers.end())
+    return true;
+  for(const auto &operand : expr.operands())
+  {
+    if(uses_identifier_from(operand, identifiers))
+      return true;
+  }
+  return false;
+}
+
+bool affine_access_discipline(
+  const goto_modelt &model,
+  const std::vector<irep_idt> &thread_ids,
+  const std::vector<affine_regiont> &regions,
+  const std::unordered_set<exprt, irep_hash> &templates,
+  std::string &reason)
+{
+  if(regions.empty())
+  {
+    reason = "affine_no_supported_region";
+    return false;
+  }
+  const irep_idt proof_mutex = regions.front().mutex;
+  std::set<std::pair<irep_idt, unsigned>> supported_regions;
+  for(const auto &region : regions)
+  {
+    if(region.mutex != proof_mutex)
+    {
+      reason = "affine_multiple_mutexes";
+      return false;
+    }
+    supported_regions.emplace(region.entry, region.begin_location);
+  }
+
+  std::set<irep_idt> protected_identifiers;
+  for(const auto &predicate : templates)
+    collect_symbol_identifiers(predicate, protected_identifiers);
+
+  for(std::size_t thread_index = 0; thread_index < thread_ids.size();
+      ++thread_index)
+  {
+    const auto function =
+      model.goto_functions.function_map.find(thread_ids[thread_index]);
+    if(
+      function == model.goto_functions.function_map.end() ||
+      !function->second.body_available())
+      continue;
+    bool after_spawn = thread_index != 0;
+    irep_idt current_mutex;
+    unsigned current_begin = 0;
+    for(const auto &instruction : function->second.body.instructions)
+    {
+      if(
+        thread_index == 0 &&
+        instruction.source_location().get_bool("v49_thread_spawn"))
+        after_spawn = true;
+      if(
+        instruction.is_atomic_begin() &&
+        instruction.source_location().get("v217_mutex") != irep_idt())
+      {
+        current_mutex = instruction.source_location().get("v217_mutex");
+        current_begin = instruction.location_number;
+        continue;
+      }
+      if(
+        instruction.is_atomic_end() &&
+        instruction.source_location().get("v217_mutex") != irep_idt())
+      {
+        current_mutex = irep_idt();
+        current_begin = 0;
+        continue;
+      }
+
+      bool relevant_access = false;
+      if(
+        instruction.has_condition() &&
+        uses_identifier_from(
+          instruction.condition(), protected_identifiers))
+        relevant_access = true;
+      if(instruction.is_assign())
+      {
+        relevant_access =
+          relevant_access ||
+          uses_identifier_from(
+            instruction.assign_lhs(), protected_identifiers) ||
+          uses_identifier_from(
+            instruction.assign_rhs(), protected_identifiers);
+      }
+      if(!relevant_access || !after_spawn)
+        continue;
+      if(current_mutex != proof_mutex)
+      {
+        reason = "affine_unprotected_relevant_access";
+        return false;
+      }
+      if(
+        instruction.is_assign() &&
+        supported_regions.find(
+          {thread_ids[thread_index], current_begin}) ==
+          supported_regions.end())
+      {
+        reason = "affine_access_in_unsupported_region";
+        return false;
+      }
+    }
+  }
+  std::cout << "V217_AFFINE_ACCESS mutex=" << proof_mutex
+            << " symbols=" << protected_identifiers.size()
+            << " admitted=1\n";
+  return true;
+}
+
+bool affine_template_closure(
+  const goto_modelt &model,
+  const std::vector<irep_idt> &thread_ids,
+  const namespacet &ns,
+  std::vector<exprt> &extra_predicates,
+  std::string &reason)
+{
+  std::vector<affine_regiont> regions;
+  if(!collect_affine_regions(model, thread_ids, regions, reason))
+    return false;
+
+  std::unordered_set<exprt, irep_hash> templates;
+  for(const auto &thread_id : thread_ids)
+  {
+    const auto function =
+      model.goto_functions.function_map.find(thread_id);
+    if(
+      function == model.goto_functions.function_map.end() ||
+      !function->second.body_available())
+      continue;
+    for(const auto &instruction : function->second.body.instructions)
+    {
+      if(instruction.has_condition())
+        collect_signed_relational_templates(
+          instruction.condition(), ns, templates);
+    }
+  }
+
+  const std::size_t original_size = templates.size();
+  std::vector<exprt> frontier(templates.begin(), templates.end());
+  constexpr std::size_t max_templates = 64;
+  constexpr unsigned max_rounds = 16;
+  for(unsigned round = 0;
+      round < max_rounds && !frontier.empty(); ++round)
+  {
+    std::vector<exprt> next;
+    for(const auto &predicate : frontier)
+    {
+      for(const auto &region : regions)
+      {
+        exprt preimage = predicate;
+        for(auto assignment = region.assignments.rbegin();
+            assignment != region.assignments.rend(); ++assignment)
+        {
+          replace_symbolt replacement;
+          replacement.set(assignment->first, assignment->second);
+          replacement.replace(preimage);
+        }
+        preimage = normalize_relational_template(
+          simplify_expr(std::move(preimage), ns));
+        std::cout << "V217_AFFINE_PREIMAGE entry=" << region.entry
+                  << " begin=" << region.begin_location
+                  << " expr=" << from_expr(ns, irep_idt(), preimage) << '\n';
+        if(
+          preimage.is_true() || preimage.is_false() ||
+          !relational_template(preimage) ||
+          !uses_only_shared_symbols(preimage, ns))
+          continue;
+        if(templates.insert(preimage).second)
+        {
+          next.push_back(preimage);
+          if(templates.size() > max_templates)
+          {
+            reason = "affine_template_cap";
+            return false;
+          }
+        }
+      }
+    }
+    frontier = std::move(next);
+  }
+  if(!frontier.empty())
+  {
+    reason = "affine_template_nonfinite";
+    return false;
+  }
+  if(!affine_access_discipline(
+       model, thread_ids, regions, templates, reason))
+    return false;
+
+  extra_predicates.reserve(templates.size());
+  for(const auto &predicate : templates)
+    extra_predicates.push_back(predicate);
+  std::cout << "V217_AFFINE_CLOSURE regions=" << regions.size()
+            << " base_templates=" << original_size
+            << " closed_templates=" << extra_predicates.size() << '\n';
+  return true;
+}
+
+bool assertion_reachable_from(
+  const goto_programt &program,
+  goto_programt::const_targett start)
+{
+  std::deque<goto_programt::const_targett> pending;
+  pending.push_back(start);
+  std::set<const goto_programt::instructiont *> visited;
+  while(!pending.empty())
+  {
+    const auto current = pending.front();
+    pending.pop_front();
+    if(!visited.insert(&*current).second)
+      continue;
+    if(current->is_assert())
+      return true;
+    for(const auto successor : program.get_successors(current))
+      pending.push_back(successor);
+  }
+  return false;
+}
+
+bool error_control_safe_condition(
+  const goto_programt &program,
+  goto_programt::const_targett target,
+  exprt &safe_condition)
+{
+  if(!target->is_goto())
+    return false;
+  const auto successors = program.get_successors(target);
+  if(successors.size() != 2)
+    return false;
+  std::vector<goto_programt::const_targett> error_successors;
+  for(const auto successor : successors)
+  {
+    if(assertion_reachable_from(program, successor))
+      error_successors.push_back(successor);
+  }
+  if(error_successors.size() != 1)
+    return false;
+  const auto fallthrough = std::next(target);
+  safe_condition =
+    error_successors.front() == fallthrough
+      ? target->condition()
+      : boolean_negate(target->condition());
+  return true;
+}
+
+bool end_reachable_without(
+  const goto_programt &program,
+  goto_programt::const_targett skipped)
+{
+  if(program.instructions.empty())
+    return false;
+  std::deque<goto_programt::const_targett> pending;
+  pending.push_back(program.instructions.begin());
+  std::set<const goto_programt::instructiont *> visited;
+  while(!pending.empty())
+  {
+    const auto current = pending.front();
+    pending.pop_front();
+    if(current == skipped || !visited.insert(&*current).second)
+      continue;
+    if(current->is_end_function())
+      return true;
+    for(const auto successor : program.get_successors(current))
+      pending.push_back(successor);
+  }
+  return false;
+}
+
+struct phase_worker_summaryt
+{
+  irep_idt entry;
+  irep_idt mutex;
+  std::vector<std::pair<symbol_exprt, exprt>> assignments;
+};
+
+bool build_phase_worker_summary(
+  const goto_modelt &model,
+  const irep_idt &entry,
+  const std::set<irep_idt> &property_identifiers,
+  phase_worker_summaryt &summary,
+  std::string &reason)
+{
+  const auto function = model.goto_functions.function_map.find(entry);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "affine_phase_missing_worker";
+    return false;
+  }
+  summary.entry = entry;
+  irep_idt held_mutex;
+  for(auto instruction = function->second.body.instructions.begin();
+      instruction != function->second.body.instructions.end();
+      ++instruction)
+  {
+    if(instruction->is_function_call())
+    {
+      const exprt &function_expr =
+        skip_typecast(instruction->call_function());
+      if(function_expr.id() != ID_symbol)
+      {
+        reason = "affine_phase_indirect_call";
+        return false;
+      }
+      const irep_idt &identifier =
+        to_symbol_expr(function_expr).get_identifier();
+      if(
+        identifier == "pthread_mutex_lock" ||
+        identifier == "pthread_mutex_unlock")
+      {
+        irep_idt mutex;
+        if(
+          instruction->call_arguments().empty() ||
+          !get_addressed_symbol(
+            instruction->call_arguments()[0], mutex))
+        {
+          reason = "affine_phase_unresolved_mutex";
+          return false;
+        }
+        if(identifier == "pthread_mutex_lock")
+        {
+          if(held_mutex != irep_idt())
+          {
+            reason = "affine_phase_nested_mutex";
+            return false;
+          }
+          held_mutex = mutex;
+        }
+        else
+        {
+          if(held_mutex != mutex)
+          {
+            reason = "affine_phase_unbalanced_mutex";
+            return false;
+          }
+          held_mutex = irep_idt();
+        }
+        continue;
+      }
+      if(identifier == "pthread_cond_wait")
+      {
+        irep_idt mutex;
+        if(
+          held_mutex == irep_idt() ||
+          instruction->call_arguments().size() < 2 ||
+          !get_addressed_symbol(
+            instruction->call_arguments()[1], mutex) ||
+          mutex != held_mutex)
+        {
+          reason = "affine_phase_cond_mutex_mismatch";
+          return false;
+        }
+        continue;
+      }
+      if(
+        identifier == "pthread_cond_signal" ||
+        identifier == "pthread_cond_broadcast")
+        continue;
+      reason = "affine_phase_remaining_call";
+      return false;
+    }
+
+    if(
+      instruction->is_assign() &&
+      instruction->assign_lhs().id() == ID_dereference)
+    {
+      reason = "affine_phase_pointer_write";
+      return false;
+    }
+    if(
+      !instruction->is_assign() ||
+      instruction->assign_lhs().id() != ID_symbol)
+      continue;
+    const auto &lhs = to_symbol_expr(instruction->assign_lhs());
+    if(
+      property_identifiers.find(lhs.get_identifier()) ==
+      property_identifiers.end())
+      continue;
+    if(held_mutex == irep_idt())
+    {
+      reason = "affine_phase_unprotected_assignment";
+      return false;
+    }
+    if(
+      instruction_is_in_cycle(function->second.body, instruction) ||
+      end_reachable_without(function->second.body, instruction))
+    {
+      reason = "affine_phase_assignment_not_once";
+      return false;
+    }
+    if(
+      !affine_integer_expression(instruction->assign_rhs()) ||
+      has_subexpr(instruction->assign_rhs(), ID_side_effect) ||
+      has_subexpr(instruction->assign_rhs(), ID_dereference))
+    {
+      reason = "affine_phase_assignment_unsupported";
+      return false;
+    }
+    if(summary.mutex == irep_idt())
+      summary.mutex = held_mutex;
+    else if(summary.mutex != held_mutex)
+    {
+      reason = "affine_phase_multiple_mutexes";
+      return false;
+    }
+    summary.assignments.emplace_back(lhs, instruction->assign_rhs());
+  }
+  if(held_mutex != irep_idt())
+  {
+    reason = "affine_phase_unbalanced_mutex";
+    return false;
+  }
+  if(summary.assignments.size() != 1)
+  {
+    reason = "affine_phase_assignment_count";
+    return false;
+  }
+  return true;
+}
+
+bool collect_linear_initial_constants(
+  const goto_programt &program,
+  unsigned first_spawn_location,
+  const namespacet &ns,
+  std::map<irep_idt, exprt> &constants,
+  std::string &reason)
+{
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->location_number == first_spawn_location)
+      return true;
+    if(instruction->is_goto() || instruction->is_assume())
+    {
+      reason = "affine_phase_initial_control";
+      return false;
+    }
+    if(
+      !instruction->is_assign() ||
+      instruction->assign_lhs().id() != ID_symbol)
+      continue;
+    exprt rhs = instruction->assign_rhs();
+    replace_symbolt replacement;
+    for(const auto &entry : constants)
+    {
+      const symbolt *symbol = nullptr;
+      if(ns.lookup(entry.first, symbol))
+        continue;
+      replacement.set(
+        symbol_exprt(entry.first, symbol->type), entry.second);
+    }
+    replacement.replace(rhs);
+    rhs = simplify_expr(std::move(rhs), ns);
+    const irep_idt &lhs =
+      to_symbol_expr(instruction->assign_lhs()).get_identifier();
+    if(rhs.id() == ID_constant)
+      constants[lhs] = rhs;
+    else
+      constants.erase(lhs);
+  }
+  reason = "affine_phase_spawn_not_reached";
+  return false;
+}
+
+interference_predicate_resultt affine_phase_certificate(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler,
+  std::string &reason)
+{
+  std::map<irep_idt, bool> multiple_instances;
+  const auto entries =
+    find_thread_entries(goto_model, nullptr, &multiple_instances);
+  if(entries.empty() || entries.size() > 6)
+  {
+    reason = "affine_phase_worker_count";
+    return interference_predicate_resultt::UNKNOWN;
+  }
+  for(const auto &entry : entries)
+  {
+    if(multiple_instances[entry])
+    {
+      reason = "affine_phase_repeated_worker";
+      return interference_predicate_resultt::UNKNOWN;
+    }
+  }
+
+  goto_modelt main_model;
+  main_model.symbol_table = goto_model.symbol_table;
+  main_model.goto_functions.copy_from(goto_model.goto_functions);
+  neutralize_synchronization_calls(main_model);
+  irep_idt main_entry = "main";
+  for(const irep_idt &candidate :
+      {irep_idt("__CPROVER__start"), irep_idt("__CPROVER_start")})
+  {
+    const auto start = main_model.goto_functions.function_map.find(candidate);
+    if(
+      start != main_model.goto_functions.function_map.end() &&
+      start->second.body_available())
+    {
+      main_entry = candidate;
+      break;
+    }
+  }
+  goto_function_inline(
+    main_model, main_entry, message_handler, false, false);
+  main_model.goto_functions.update();
+  const auto main_function =
+    main_model.goto_functions.function_map.find(main_entry);
+  if(
+    main_function == main_model.goto_functions.function_map.end() ||
+    !main_function->second.body_available())
+  {
+    reason = "affine_phase_missing_main";
+    return interference_predicate_resultt::UNKNOWN;
+  }
+
+  exprt safe_condition;
+  unsigned safe_location = 0;
+  for(auto instruction = main_function->second.body.instructions.begin();
+      instruction != main_function->second.body.instructions.end();
+      ++instruction)
+  {
+    exprt candidate;
+    if(
+      error_control_safe_condition(
+        main_function->second.body, instruction, candidate))
+    {
+      if(safe_location != 0)
+      {
+        reason = "affine_phase_multiple_properties";
+        return interference_predicate_resultt::UNKNOWN;
+      }
+      safe_condition = std::move(candidate);
+      safe_location = instruction->location_number;
+    }
+  }
+  if(safe_location == 0)
+  {
+    reason = "affine_phase_property_not_found";
+    return interference_predicate_resultt::UNKNOWN;
+  }
+
+  const namespacet ns(main_model.symbol_table);
+  std::set<irep_idt> property_identifiers;
+  collect_symbol_identifiers(safe_condition, property_identifiers);
+  for(auto identifier = property_identifiers.begin();
+      identifier != property_identifiers.end();)
+  {
+    const symbolt *symbol = nullptr;
+    if(
+      ns.lookup(*identifier, symbol) || !symbol->is_static_lifetime ||
+      symbol->type.id() == ID_pointer)
+      identifier = property_identifiers.erase(identifier);
+    else
+      ++identifier;
+  }
+  if(property_identifiers.empty())
+  {
+    reason = "affine_phase_no_property_scalar";
+    return interference_predicate_resultt::UNKNOWN;
+  }
+
+  unsigned first_spawn = 0;
+  std::set<irep_idt> joined_entries;
+  bool after_spawn = false;
+  for(const auto &instruction : main_function->second.body.instructions)
+  {
+    if(instruction.source_location().get_bool("v49_thread_spawn"))
+    {
+      if(first_spawn == 0)
+        first_spawn = instruction.location_number;
+      after_spawn = true;
+    }
+    const irep_idt &joined =
+      instruction.source_location().get("v49_join_entry");
+    if(joined != irep_idt())
+      joined_entries.insert(joined);
+    if(
+      after_spawn && instruction.is_assign() &&
+      instruction.assign_lhs().id() == ID_symbol &&
+      property_identifiers.find(
+        to_symbol_expr(instruction.assign_lhs()).get_identifier()) !=
+        property_identifiers.end())
+    {
+      reason = "affine_phase_main_write_after_spawn";
+      return interference_predicate_resultt::UNKNOWN;
+    }
+    if(instruction.location_number == safe_location)
+      break;
+  }
+  if(first_spawn == 0 || joined_entries != entries)
+  {
+    reason = "affine_phase_incomplete_join";
+    return interference_predicate_resultt::UNKNOWN;
+  }
+
+  std::map<irep_idt, exprt> initial_constants;
+  if(!collect_linear_initial_constants(
+       main_function->second.body,
+       first_spawn,
+       ns,
+       initial_constants,
+       reason))
+    return interference_predicate_resultt::UNKNOWN;
+  for(const auto &identifier : property_identifiers)
+  {
+    if(initial_constants.find(identifier) == initial_constants.end())
+    {
+      reason = "affine_phase_initial_value_unknown";
+      return interference_predicate_resultt::UNKNOWN;
+    }
+  }
+
+  std::vector<phase_worker_summaryt> workers;
+  for(const auto &entry : entries)
+  {
+    phase_worker_summaryt worker;
+    if(!build_phase_worker_summary(
+         goto_model,
+         entry,
+         property_identifiers,
+         worker,
+         reason))
+      return interference_predicate_resultt::UNKNOWN;
+    if(!workers.empty() && worker.mutex != workers.front().mutex)
+    {
+      reason = "affine_phase_cross_mutex";
+      return interference_predicate_resultt::UNKNOWN;
+    }
+    workers.push_back(std::move(worker));
+  }
+
+  std::vector<std::size_t> order(workers.size());
+  for(std::size_t index = 0; index < order.size(); ++index)
+    order[index] = index;
+  std::size_t orders = 0;
+  do
+  {
+    std::map<irep_idt, exprt> environment = initial_constants;
+    for(const auto worker_index : order)
+    {
+      const auto &assignment = workers[worker_index].assignments.front();
+      exprt rhs = assignment.second;
+      replace_symbolt replacement;
+      for(const auto &entry : environment)
+      {
+        const symbolt *symbol = nullptr;
+        if(ns.lookup(entry.first, symbol))
+          continue;
+        replacement.set(
+          symbol_exprt(entry.first, symbol->type), entry.second);
+      }
+      replacement.replace(rhs);
+      environment[assignment.first.get_identifier()] =
+        simplify_expr(std::move(rhs), ns);
+    }
+    exprt claim = safe_condition;
+    replace_symbolt replacement;
+    for(const auto &entry : environment)
+    {
+      const symbolt *symbol = nullptr;
+      if(ns.lookup(entry.first, symbol))
+        continue;
+      replacement.set(
+        symbol_exprt(entry.first, symbol->type), entry.second);
+    }
+    replacement.replace(claim);
+    claim = simplify_expr(std::move(claim), ns);
+    if(!claim.is_true())
+    {
+      reason = "affine_phase_order_not_safe";
+      return interference_predicate_resultt::UNKNOWN;
+    }
+    ++orders;
+  } while(std::next_permutation(order.begin(), order.end()));
+
+  std::cout << "V217_AFFINE_PHASE result=SAFE workers=" << workers.size()
+            << " mutex=" << workers.front().mutex << " orders=" << orders
+            << " property={"
+            << from_expr(ns, irep_idt(), safe_condition) << "}\n";
+  return interference_predicate_resultt::SAFE;
+}
+
 struct fixedpoint_threadt
 {
   irep_idt entry;
@@ -759,11 +1701,14 @@ public:
     goto_modelt &model,
     std::vector<irep_idt> thread_ids,
     const std::vector<bool> &may_have_multiple_instances,
+    const std::vector<exprt> &extra_predicates,
     message_handlert &message_handler)
     : model(model),
       ns(model.symbol_table),
       kernel(ns, message_handler),
-      message_handler(message_handler)
+      message_handler(message_handler),
+      affine_diagnostics(!extra_predicates.empty()),
+      affine_templates(extra_predicates)
   {
     PRECONDITION(
       thread_ids.size() == may_have_multiple_instances.size());
@@ -776,6 +1721,8 @@ public:
     std::unordered_set<exprt, irep_hash> shared_predicates;
     for(std::size_t worker = 1; worker < completion_symbols.size(); ++worker)
       shared_predicates.insert(completion_symbols[worker]);
+    for(const auto &predicate : extra_predicates)
+      shared_predicates.insert(predicate);
     for(const auto &thread_id : thread_ids)
     {
       const auto function_it = model.goto_functions.function_map.find(thread_id);
@@ -987,6 +1934,24 @@ public:
             kernel.proves(cube, thread.predicates, location->condition());
           if(!proved.is_true())
           {
+            std::cout << "V217_ASSERTION_CUBE entry=" << thread.entry
+                      << " location=" << location_entry.first
+                      << " condition="
+                      << from_expr(ns, irep_idt(), location->condition());
+            for(std::size_t index = 0; index < cube.values.size(); ++index)
+            {
+              if(cube.values[index].is_true())
+                std::cout << " true={"
+                          << from_expr(
+                               ns, irep_idt(), thread.predicates[index])
+                          << '}';
+              else if(cube.values[index].is_false())
+                std::cout << " false={"
+                          << from_expr(
+                               ns, irep_idt(), thread.predicates[index])
+                          << '}';
+            }
+            std::cout << '\n';
             if(proved.is_unknown())
             {
               failed = true;
@@ -1032,6 +1997,9 @@ private:
   std::string failure_reason;
   std::size_t inserted_cubes = 0;
   std::size_t reached_locations = 0;
+  bool affine_diagnostics = false;
+  std::vector<exprt> affine_templates;
+  bool affine_invariant_active = false;
 
   interference_predicate_resultt report_unknown() const
   {
@@ -1086,12 +2054,100 @@ private:
     return false;
   }
 
+  bool affine_initial_templates_hold()
+  {
+    if(affine_templates.empty())
+      return true;
+    const auto &main_thread = threads.front();
+    std::map<irep_idt, exprt> constants;
+    for(auto instruction = main_thread.program->instructions.begin();
+        instruction != main_thread.program->instructions.end();
+        ++instruction)
+    {
+      if(instruction->location_number == main_thread.first_spawn_location)
+        break;
+      if(instruction->is_goto() || instruction->is_assume())
+      {
+        failure_reason = "affine_initial_control_unsupported";
+        return false;
+      }
+      if(
+        !instruction->is_assign() ||
+        instruction->assign_lhs().id() != ID_symbol)
+        continue;
+      exprt rhs = instruction->assign_rhs();
+      replace_symbolt replacement;
+      for(const auto &entry : constants)
+      {
+        const symbolt *symbol = nullptr;
+        if(ns.lookup(entry.first, symbol))
+          continue;
+        replacement.set(
+          symbol_exprt(entry.first, symbol->type), entry.second);
+      }
+      replacement.replace(rhs);
+      rhs = simplify_expr(std::move(rhs), ns);
+      const irep_idt &lhs =
+        to_symbol_expr(instruction->assign_lhs()).get_identifier();
+      if(rhs.id() == ID_constant)
+        constants[lhs] = rhs;
+      else
+        constants.erase(lhs);
+    }
+
+    replace_symbolt replacement;
+    for(const auto &entry : constants)
+    {
+      const symbolt *symbol = nullptr;
+      if(ns.lookup(entry.first, symbol))
+        continue;
+      replacement.set(
+        symbol_exprt(entry.first, symbol->type), entry.second);
+    }
+    for(const auto &invariant : affine_templates)
+    {
+      exprt initialized = invariant;
+      replacement.replace(initialized);
+      initialized = simplify_expr(std::move(initialized), ns);
+      if(!initialized.is_true())
+      {
+        std::cout << "V217_AFFINE_INITIALIZATION proved=0 invariant={"
+                  << from_expr(ns, irep_idt(), invariant)
+                  << "} reduced={"
+                  << from_expr(ns, irep_idt(), initialized) << "}\n";
+        failure_reason = "affine_initial_template_not_proved";
+        return false;
+      }
+    }
+    std::cout << "V217_AFFINE_INITIALIZATION proved=1 constants="
+              << constants.size() << " templates=" << affine_templates.size()
+              << '\n';
+    return true;
+  }
+
   bool add_cube(
     std::size_t thread_index,
     unsigned location_number,
     interference_predicate_cubet cube)
   {
     auto &thread = threads[thread_index];
+    if(affine_invariant_active)
+    {
+      for(const auto &invariant : affine_templates)
+      {
+        const auto predicate =
+          std::find(
+            thread.predicates.begin(), thread.predicates.end(), invariant);
+        if(predicate == thread.predicates.end())
+        {
+          failed = true;
+          failure_reason = "affine_invariant_predicate_missing";
+          return false;
+        }
+        cube.values[static_cast<std::size_t>(
+          predicate - thread.predicates.begin())] = tvt(true);
+      }
+    }
     auto &cubes = thread.states[location_number];
     const bool first_at_location = cubes.empty();
     if(!interference_predicate_cube_kernelt::insert_subsuming(cubes, cube))
@@ -1160,6 +2216,40 @@ private:
     effects.push_back(interference_effectt{
       writer_thread, location_number, path_number, writer_cube, operations});
     const auto effect = effects.back();
+    if(affine_diagnostics)
+    {
+      std::cout << "V217_AFFINE_EFFECT writer=" << writer_thread
+                << " location=" << location_number
+                << " operations=" << operations.size();
+      for(std::size_t index = 0; index < writer_cube.values.size(); ++index)
+      {
+        if(writer_cube.values[index].is_true())
+          std::cout << " writer_true={"
+                    << from_expr(
+                         ns,
+                         irep_idt(),
+                         threads[writer_thread].predicates[index])
+                    << '}';
+        else if(writer_cube.values[index].is_false())
+          std::cout << " writer_false={"
+                    << from_expr(
+                         ns,
+                         irep_idt(),
+                         threads[writer_thread].predicates[index])
+                    << '}';
+      }
+      for(const auto &operation : operations)
+      {
+        if(operation.kind == interference_predicate_operationt::kindt::ASSIGN)
+          std::cout << " assign={"
+                    << from_expr(ns, irep_idt(), operation.lhs) << ":="
+                    << from_expr(ns, irep_idt(), operation.rhs) << '}';
+        else
+          std::cout << " assume={"
+                    << from_expr(ns, irep_idt(), operation.rhs) << '}';
+      }
+      std::cout << '\n';
+    }
 
     for(std::size_t victim = 0; victim < threads.size() && !failed; ++victim)
     {
@@ -1223,6 +2313,17 @@ private:
 
   void start_workers(const interference_predicate_cubet &main_cube)
   {
+    if(!affine_templates.empty())
+    {
+      if(!affine_initial_templates_hold())
+      {
+        failed = true;
+        return;
+      }
+      affine_invariant_active = true;
+      std::cout << "V217_AFFINE_INVARIANT activated=1 templates="
+                << affine_templates.size() << '\n';
+    }
     const exprt initial_formula =
       kernel.cube_expression(main_cube, threads.front().predicates);
     for(std::size_t worker = 1; worker < threads.size(); ++worker)
@@ -1609,6 +2710,18 @@ interference_predicate_resultt interference_predicate_fixedpoint(
                  "reason=no_thread_entries\n";
     return interference_predicate_resultt::UNKNOWN;
   }
+  const bool affine_mode = std::getenv("DEAGLE_AFFINE_MODE") != nullptr;
+  std::string affine_failure_reason;
+  if(affine_mode && !repeated_single_worker_only)
+  {
+    const auto phase_result =
+      affine_phase_certificate(
+        goto_model, message_handler, affine_failure_reason);
+    if(phase_result == interference_predicate_resultt::SAFE)
+      return phase_result;
+    std::cout << "V217_AFFINE_PHASE result=UNKNOWN reason="
+              << affine_failure_reason << '\n';
+  }
 
   if(
     repeated_single_worker_only &&
@@ -1627,7 +2740,13 @@ interference_predicate_resultt interference_predicate_fixedpoint(
   goto_modelt analysis_model;
   analysis_model.symbol_table = goto_model.symbol_table;
   analysis_model.goto_functions.copy_from(goto_model.goto_functions);
-  neutralize_synchronization_calls(analysis_model);
+  if(!neutralize_synchronization_calls(
+       analysis_model, affine_mode, &affine_failure_reason))
+  {
+    std::cout << "INTERFERENCE_PREDICATE_FIXEDPOINT result=UNKNOWN reason="
+              << affine_failure_reason << '\n';
+    return interference_predicate_resultt::UNKNOWN;
+  }
 
   std::vector<irep_idt> thread_ids;
   irep_idt main_entry = "main";
@@ -1689,10 +2808,28 @@ interference_predicate_resultt interference_predicate_fixedpoint(
     return interference_predicate_resultt::UNKNOWN;
   }
 
+  std::vector<exprt> extra_predicates;
+  if(affine_mode)
+  {
+    const namespacet ns(analysis_model.symbol_table);
+    if(!affine_template_closure(
+         analysis_model,
+         thread_ids,
+         ns,
+         extra_predicates,
+         affine_failure_reason))
+    {
+      std::cout << "INTERFERENCE_PREDICATE_FIXEDPOINT result=UNKNOWN reason="
+                << affine_failure_reason << '\n';
+      return interference_predicate_resultt::UNKNOWN;
+    }
+  }
+
   fixedpoint_runnert runner(
     analysis_model,
     thread_ids,
     thread_multiple_instances,
+    extra_predicates,
     message_handler);
   return runner.run();
 }

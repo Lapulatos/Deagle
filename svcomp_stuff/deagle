@@ -360,6 +360,61 @@ if "unreach-call.prp" in property_path:
             re.S,
         )
     )
+    def actual_pthread_call_count(function_name):
+        return len(
+            re.findall(
+                r"^(?!\s*(?:extern|typedef)\b)[^\n]*\b"
+                + re.escape(function_name)
+                + r"\s*\(",
+                candidate_text,
+                re.M,
+            )
+        )
+
+    candidate_actual_creates = actual_pthread_call_count("pthread_create")
+    candidate_actual_joins = actual_pthread_call_count("pthread_join")
+    candidate_actual_locks = actual_pthread_call_count("pthread_mutex_lock")
+    candidate_actual_unlocks = actual_pthread_call_count(
+        "pthread_mutex_unlock"
+    )
+    candidate_affine_update = bool(
+        re.search(
+            r"^\s*[A-Za-z_]\w*\s*(?:"
+            r"\+\+|--|[+\-]?=\s*"
+            r"(?:[A-Za-z_]\w*|[-+]?\d+)"
+            r"(?:\s*[+\-]\s*(?:[A-Za-z_]\w*|[-+]?\d+))*"
+            r")\s*;",
+            candidate_text,
+            re.M,
+        )
+    )
+    candidate_repeated_create = bool(
+        re.search(
+            r"\b(?:for|while)\s*\([^)]*\)\s*\{?"
+            r"[^{}]{0,2000}\bpthread_create\s*\(",
+            candidate_text,
+            re.S,
+        )
+    )
+    candidate_affine_recurring = bool(
+        candidate_actual_creates >= 1
+        and candidate_repeated_create
+        and candidate_actual_locks >= 1
+        and candidate_actual_unlocks >= 1
+        and candidate_affine_update
+        and "reach_error" in candidate_text
+    )
+    candidate_affine_joined = bool(
+        candidate_actual_creates >= 2
+        and candidate_actual_joins == candidate_actual_creates
+        and candidate_actual_locks >= 1
+        and candidate_actual_unlocks >= 1
+        and candidate_affine_update
+        and "reach_error" in candidate_text
+    )
+    candidate_guarded_affine = bool(
+        candidate_affine_recurring or candidate_affine_joined
+    )
     if candidate_joined_effect_shape:
         try:
             import importlib.util
@@ -611,6 +666,7 @@ if multi_template_worker_prepass and "unreach-call.prp" in property_path:
         stderr=subprocess.DEVNULL,
         check=False,
     )
+    run_multi_template_fixedpoint = False
     if multi_template_result.returncode == 0:
         cached_loop_info = get_loop_info(
             program_path,
@@ -629,39 +685,58 @@ if multi_template_worker_prepass and "unreach-call.prp" in property_path:
             if unwind_budget > 64:
                 finite_small_budget = False
                 break
-        if not finite_small_budget:
-            multi_template_output = "deagle_tmp_multi_template_worker"
-            multi_template_args = (
-                [deagle_exe_path, program_path]
-                + shlex.split(flags)
-                + ["--interference-predicate-fixedpoint"]
+        run_multi_template_fixedpoint = not finite_small_budget
+    run_multi_template_fixedpoint = bool(
+        run_multi_template_fixedpoint or candidate_guarded_affine
+    )
+    if run_multi_template_fixedpoint:
+        multi_template_output = "deagle_tmp_multi_template_worker"
+        multi_template_args = (
+            [deagle_exe_path, program_path]
+            + shlex.split(flags)
+            + ["--interference-predicate-fixedpoint"]
+        )
+        multi_template_environment = os.environ.copy()
+        if candidate_guarded_affine:
+            multi_template_environment["DEAGLE_AFFINE_MODE"] = "1"
+            print(
+                "V218_AFFINE_DISPATCH recurring=%d joined=%d"
+                % (
+                    candidate_affine_recurring,
+                    candidate_affine_joined,
+                ),
+                flush=True,
             )
-            try:
-                with open(multi_template_output, "w") as output:
-                    multi_template_proof = subprocess.run(
-                        multi_template_args,
-                        stdout=output,
-                        stderr=subprocess.STDOUT,
-                        timeout=2,
-                        check=False,
+        try:
+            with open(multi_template_output, "w") as output:
+                multi_template_proof = subprocess.run(
+                    multi_template_args,
+                    env=multi_template_environment,
+                    stdout=output,
+                    stderr=subprocess.STDOUT,
+                    timeout=5 if candidate_guarded_affine else 2,
+                    check=False,
+                )
+        except subprocess.TimeoutExpired:
+            multi_template_proof = None
+        if (
+            multi_template_proof is not None
+            and multi_template_proof.returncode == 0
+        ):
+            with open(multi_template_output, "r") as output:
+                multi_template_lines = output.readlines()
+            if any(
+                line.startswith(
+                    (
+                        "INTERFERENCE_PREDICATE_FIXEDPOINT result=SAFE",
+                        "V217_AFFINE_PHASE result=SAFE",
                     )
-            except subprocess.TimeoutExpired:
-                multi_template_proof = None
-            if (
-                multi_template_proof is not None
-                and multi_template_proof.returncode == 0
+                )
+                for line in multi_template_lines
             ):
-                with open(multi_template_output, "r") as output:
-                    multi_template_lines = output.readlines()
-                if any(
-                    line.startswith(
-                        "INTERFERENCE_PREDICATE_FIXEDPOINT result=SAFE"
-                    )
-                    for line in multi_template_lines
-                ):
-                    print("".join(multi_template_lines), end="")
-                    print("VERIFICATION SUCCESSFUL")
-                    sys.exit(0)
+                print("".join(multi_template_lines), end="")
+                print("VERIFICATION SUCCESSFUL")
+                sys.exit(0)
 
 if recursive_worker_prepass and "unreach-call.prp" in property_path:
     lexical_filter = os.path.join(
