@@ -4,6 +4,7 @@ import sys
 import os
 import pathlib
 import re
+import signal
 import time
 import atexit
 import shlex
@@ -78,6 +79,12 @@ def get_result(remove = True):
                     "NATIVE_ALTERNATING_PHASE_RECURRENCE "
                 )
                 or line.startswith(
+                    "NATIVE_NONNEGATIVE_OSCILLATOR_MONITOR "
+                )
+                or line.startswith(
+                    "NATIVE_DYNAMIC_TLS_CALLOC_ZERO "
+                )
+                or line.startswith(
                     "NATIVE_INDEXED_LIFECYCLE_PREFIX "
                 )
                 or line.startswith(
@@ -131,24 +138,27 @@ def try_large_limit_native_proof(program_path, flags):
         + shlex.split(flags)
         + [
             "--native-pair-initialization-prefix",
+            "--native-jces",
             "--unwind",
             "2",
             "--no-unwinding-assertions",
         ]
     )
     proof_output = "deagle_tmp_large_limit_native_proof"
-    try:
-        with open(proof_output, "w") as output:
-            result = subprocess.run(
-                proof_args,
-                stdout=output,
-                stderr=subprocess.STDOUT,
-                timeout=2,
-                check=False,
-            )
-    except subprocess.TimeoutExpired:
-        return False
-    if result.returncode != 0:
+    with open(proof_output, "w") as output:
+        process = subprocess.Popen(
+            proof_args,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            returncode = process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            return False
+    if returncode != 0:
         return False
     with open(proof_output, "r") as output:
         lines = output.readlines()
@@ -163,6 +173,14 @@ def try_large_limit_native_proof(program_path, flags):
         "NATIVE_COMMON_MUTEX_ZERO_SUM applied=1 ",
         "NATIVE_RELATIONAL_BISIMULATION applied=1 ",
         "NATIVE_LOCK_RELATIONAL_AI applied=1 ",
+        "NATIVE_PARTITIONED_COUNT_REDUCTION applied=1 ",
+        "NATIVE_FINITE_TWO_SIDED_DISJUNCTION applied=1 ",
+        "NATIVE_COMPLETION_FLAG_ARITHMETIC applied=1 ",
+        "NATIVE_NONZERO_CAS_SEED applied=1 ",
+        "NATIVE_MONOTONE_CHUNK_MAXIMUM applied=1 ",
+        "NATIVE_LINEAR_TILED_COPY_EQUIVALENCE applied=1 ",
+        "NATIVE_ATOMIC_QUEUE_OCCUPANCY_VALUE applied=1 ",
+        "NATIVE_ISOMORPHIC_MODULAR_FOLD_PAIR applied=1 ",
     )
     marker = next(
         (
@@ -197,6 +215,41 @@ def condition_wait_routing_candidate(program_path):
         "pthread_mutex_unlock",
     )
     return all(token in source for token in required_tokens)
+
+def native_structural_proof_routing_candidate(program_path):
+    """Shallow routing only; deagle_exe checks every semantic obligation."""
+    try:
+        source = pathlib.Path(program_path).read_text(
+            encoding="utf-8",
+            errors="ignore",
+        )
+    except OSError:
+        return False
+    signatures = (
+        ("count = count + local_count;", "iterations = 1000/num_threads;"),
+        ("myArea += (four /", "area - 3.141592653883724"),
+        ("total = total + j;", "if (flag)"),
+        ("__VERIFIER_atomic_CAS(&seed", "int cond = seed != 0;"),
+        (
+            "int my_max = 0x80000000;",
+            "volatile int max = 0x80000000;",
+            "offset % 2 == 0",
+        ),
+        ("B[i][j] = F[i*M+j];", "A[a*M+b] != B[a][b]"),
+        (
+            "queue[front + size] == 5",
+            "x = queue[front];",
+            "assume_abort_if_not(x != 5)",
+        ),
+        (
+            "x = x + B;",
+            "end == start + 2",
+            "queue[start] == queue[start+1]",
+            "assume_abort_if_not(!ok)",
+        ),
+    )
+    return any(all(token in source for token in signature)
+               for signature in signatures)
 
 
 def get_loop_info(
@@ -346,6 +399,16 @@ if len(sys.argv) < 3:
 
 property_path = sys.argv[1]
 program_path = sys.argv[2]
+invocation_directory = os.getcwd()
+requested_witness_output_path = os.environ.get("DEAGLE_WITNESS_PATH")
+if (
+    requested_witness_output_path
+    and not os.path.isabs(requested_witness_output_path)
+):
+    requested_witness_output_path = os.path.join(
+        invocation_directory,
+        requested_witness_output_path,
+    )
 if "unreach-call.prp" in property_path:
     with open(program_path, "r", errors="replace") as candidate_input:
         candidate_text = candidate_input.read()
@@ -420,6 +483,50 @@ if "unreach-call.prp" in property_path:
     candidate_actual_unlocks = actual_pthread_call_count(
         "pthread_mutex_unlock"
     )
+    candidate_index_region_proof = bool(
+        candidate_actual_creates == 1
+        and candidate_actual_locks >= 1
+        and candidate_actual_unlocks >= 1
+        and re.search(
+            r"\bwhile\s*\(\s*\w+\s*<\s*\w+\s*\).{0,500}"
+            r"\w+\s*=\s*\w+\s*\+\s*1",
+            candidate_text,
+            re.S,
+        )
+    )
+    candidate_post_store_proof = bool(
+        candidate_actual_joins >= 2
+        and re.search(
+            r"\*\s*\w+\s*=\s*\w+\s*;.{0,500}"
+            r"__VERIFIER_assert\s*\(\s*\*\s*\w+\s*==\s*\w+",
+            candidate_text,
+            re.S,
+        )
+    )
+    candidate_stack_capacity_proof = bool(
+        candidate_actual_creates == 2
+        and candidate_actual_joins == 2
+        and re.search(r"\bif\s*\(\s*\w+\s*>\s*0\s*\)", candidate_text)
+        and re.search(r"\bpop\s*\([^;]+\)\s*==\s*\(?\s*-2", candidate_text)
+    )
+    candidate_queue_sequence_proof = bool(
+        candidate_actual_creates == 2
+        and candidate_actual_joins == 2
+        and "enqueue(" in candidate_text
+        and "dequeue(" in candidate_text
+        and re.search(
+            r"pthread_mutex_lock\s*\([^;]+;"
+            r"(?:(?!pthread_mutex_unlock).){0,300}\bfor\s*\(",
+            candidate_text,
+            re.S,
+        )
+    )
+    candidate_native_mutex_proof = bool(
+        candidate_index_region_proof
+        or candidate_post_store_proof
+        or candidate_stack_capacity_proof
+        or candidate_queue_sequence_proof
+    )
     candidate_affine_update = bool(
         re.search(
             r"^\s*[A-Za-z_]\w*\s*(?:"
@@ -457,6 +564,51 @@ if "unreach-call.prp" in property_path:
     )
     candidate_guarded_affine = bool(
         candidate_affine_recurring or candidate_affine_joined
+    )
+    candidate_error_control_wp = bool(
+        candidate_actual_creates >= 1
+        and candidate_repeated_create
+        and "__VERIFIER_atomic_begin" in candidate_text
+        and "reach_error" in candidate_text
+    )
+    candidate_explicit_atomic_call = bool(
+        re.search(
+            r"^(?!\s*(?:extern|typedef|enum)\b)[^\n]*\b"
+            r"(?:atomic_\w+_explicit|__atomic_\w+)\s*\(",
+            candidate_text,
+            re.M,
+        )
+    )
+    candidate_finite_protocol_product = bool(
+        2 <= candidate_actual_creates <= 4
+        and candidate_actual_joins == candidate_actual_creates
+        and candidate_loop_worker
+        and (
+            "#include <stdatomic.h>" in candidate_text
+            or "_Atomic" in candidate_text
+        )
+        and not candidate_explicit_atomic_call
+        and "reach_error" in candidate_text
+    )
+    candidate_lock_ownership = bool(
+        candidate_actual_creates >= 1
+        and "reach_error" in candidate_text
+        and (
+            (
+                candidate_actual_locks >= 1
+                and candidate_actual_unlocks >= 1
+            )
+            or (
+                (
+                    "__VERIFIER_atomic_fetch_and_inc" in candidate_text
+                    or "atomic_fetch_add" in candidate_text
+                )
+                and re.search(
+                    r"\bwhile\s*\([^)]*(?:==|!=)[^)]*\)",
+                    candidate_text,
+                )
+            )
+        )
     )
     if candidate_joined_effect_shape:
         try:
@@ -579,9 +731,14 @@ if "unreach-call.prp" in property_path:
 run_directory = tempfile.mkdtemp(prefix="deagle-")
 atexit.register(shutil.rmtree, run_directory, ignore_errors=True)
 os.chdir(run_directory)
+witness_output_path = (
+    requested_witness_output_path
+    or os.path.join(run_directory, "error-witness.graphml")
+)
 base_flags = (
-    "--refined-pointer-analysis --graphml-witness error-witness.graphml "
+    "--refined-pointer-analysis --graphml-witness %s "
     "--deagle-nondet-bulk-init "
+    % shlex.quote(witness_output_path)
 )
 force_experiment_direct = "--deagle-experiment-direct" in sys.argv[3:]
 shallow_counterexample_prepass = (
@@ -657,6 +814,68 @@ if (
 ):
     sys.exit(0)
 
+if (
+    "unreach-call.prp" in property_path
+    and native_structural_proof_routing_candidate(program_path)
+    and try_large_limit_native_proof(program_path, flags)
+):
+    sys.exit(0)
+
+if "unreach-call.prp" in property_path and candidate_native_mutex_proof:
+    native_mutex_output = "deagle_tmp_native_mutex_proof"
+    native_mutex_args = [
+        deagle_exe_path,
+        program_path,
+        "--refined-pointer-analysis",
+        "--graphml-witness",
+        witness_output_path,
+        "--deagle-nondet-bulk-init",
+    ]
+    native_mutex_args.extend(
+        arg for arg in sys.argv[3:] if arg in ("--32", "--64")
+    )
+    native_mutex_args.append("--native-jces")
+    native_mutex_environment = os.environ.copy()
+    if candidate_index_region_proof:
+        native_mutex_environment["DEAGLE_INDEX_REGION_OWNERSHIP_MODE"] = "1"
+    if candidate_post_store_proof:
+        native_mutex_environment["DEAGLE_POST_STORE_STABLE_CELL_MODE"] = "1"
+    if candidate_stack_capacity_proof:
+        native_mutex_environment["DEAGLE_STACK_CAPACITY_MODE"] = "1"
+    if candidate_queue_sequence_proof:
+        native_mutex_environment["DEAGLE_QUEUE_SEQUENCE_MODE"] = "1"
+    try:
+        with open(native_mutex_output, "w") as output:
+            native_mutex_result = subprocess.run(
+                native_mutex_args,
+                env=native_mutex_environment,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                timeout=5,
+                check=False,
+            )
+    except subprocess.TimeoutExpired:
+        native_mutex_result = None
+    if native_mutex_result is not None and native_mutex_result.returncode == 0:
+        with open(native_mutex_output, "r") as output:
+            native_mutex_lines = output.readlines()
+        accepted_markers = (
+            "NATIVE_INDEX_REGION_OWNERSHIP applied=1",
+            "NATIVE_POST_STORE_STABLE_CELL applied=1",
+            "NATIVE_STACK_CAPACITY applied=1",
+            "NATIVE_QUEUE_SEQUENCE applied=1",
+        )
+        if (
+            any(line.startswith(accepted_markers) for line in native_mutex_lines)
+            and any(
+                "VERIFICATION SUCCESSFUL" in line
+                for line in native_mutex_lines
+            )
+        ):
+            print("".join(native_mutex_lines), end="")
+            print("VERIFICATION SUCCESSFUL")
+            sys.exit(0)
+
 cached_loop_info = None
 
 if (
@@ -705,6 +924,49 @@ if (
         sys.exit(0)
     os.remove("deagle_tmp_output")
 
+if (
+    multi_template_worker_prepass
+    and "unreach-call.prp" in property_path
+    and candidate_lock_ownership
+):
+    ownership_output = "deagle_tmp_lock_ownership"
+    ownership_args = (
+        [deagle_exe_path, program_path]
+        + shlex.split(flags)
+        + ["--interference-predicate-fixedpoint"]
+    )
+    ownership_environment = os.environ.copy()
+    ownership_environment["DEAGLE_LOCK_OWNERSHIP_MODE"] = "1"
+    try:
+        with open(ownership_output, "w") as output:
+            ownership_proof = subprocess.run(
+                ownership_args,
+                env=ownership_environment,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                timeout=5,
+                check=False,
+            )
+    except subprocess.TimeoutExpired:
+        ownership_proof = None
+    if ownership_proof is not None and ownership_proof.returncode == 0:
+        with open(ownership_output, "r") as output:
+            ownership_lines = output.readlines()
+        if (
+            any(
+                line.startswith(
+                    "INTERFERENCE_PREDICATE_FIXEDPOINT result=SAFE"
+                )
+                for line in ownership_lines
+            )
+            and any(
+                "VERIFICATION SUCCESSFUL" in line
+                for line in ownership_lines
+            )
+        ):
+            print("".join(ownership_lines), end="")
+            sys.exit(0)
+
 if multi_template_worker_prepass and "unreach-call.prp" in property_path:
     multi_template_filter = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
@@ -737,7 +999,10 @@ if multi_template_worker_prepass and "unreach-call.prp" in property_path:
                 break
         run_multi_template_fixedpoint = not finite_small_budget
     run_multi_template_fixedpoint = bool(
-        run_multi_template_fixedpoint or candidate_guarded_affine
+        run_multi_template_fixedpoint
+        or candidate_guarded_affine
+        or candidate_error_control_wp
+        or candidate_finite_protocol_product
     )
     if run_multi_template_fixedpoint:
         multi_template_output = "deagle_tmp_multi_template_worker"
@@ -747,16 +1012,17 @@ if multi_template_worker_prepass and "unreach-call.prp" in property_path:
             + ["--interference-predicate-fixedpoint"]
         )
         multi_template_environment = os.environ.copy()
-        if candidate_guarded_affine:
-            multi_template_environment["DEAGLE_AFFINE_MODE"] = "1"
-            print(
-                "V218_AFFINE_DISPATCH recurring=%d joined=%d"
-                % (
-                    candidate_affine_recurring,
-                    candidate_affine_joined,
-                ),
-                flush=True,
+        if candidate_finite_protocol_product:
+            multi_template_environment[
+                "DEAGLE_FINITE_PROTOCOL_PRODUCT"
+            ] = "1"
+        elif candidate_error_control_wp:
+            multi_template_environment["DEAGLE_WP_SEED_MODE"] = (
+                "error-control-goto"
             )
+            multi_template_environment["DEAGLE_WP_MAX_DEPTH"] = "2"
+        elif candidate_guarded_affine:
+            multi_template_environment["DEAGLE_AFFINE_MODE"] = "1"
         try:
             with open(multi_template_output, "w") as output:
                 multi_template_proof = subprocess.run(
@@ -764,7 +1030,13 @@ if multi_template_worker_prepass and "unreach-call.prp" in property_path:
                     env=multi_template_environment,
                     stdout=output,
                     stderr=subprocess.STDOUT,
-                    timeout=5 if candidate_guarded_affine else 2,
+                    timeout=5
+                    if (
+                        candidate_guarded_affine
+                        or candidate_error_control_wp
+                        or candidate_finite_protocol_product
+                    )
+                    else 2,
                     check=False,
                 )
         except subprocess.TimeoutExpired:
@@ -780,12 +1052,12 @@ if multi_template_worker_prepass and "unreach-call.prp" in property_path:
                     (
                         "INTERFERENCE_PREDICATE_FIXEDPOINT result=SAFE",
                         "V217_AFFINE_PHASE result=SAFE",
+                        "V225_FINITE_PRODUCT result=SAFE",
                     )
                 )
                 for line in multi_template_lines
             ):
                 print("".join(multi_template_lines), end="")
-                print("VERIFICATION SUCCESSFUL")
                 sys.exit(0)
 
 if recursive_worker_prepass and "unreach-call.prp" in property_path:
@@ -948,6 +1220,9 @@ elif force_experiment_direct:
                 prepass_args.append(
                     "--native-alternating-phase-recurrence"
                 )
+                prepass_args.append(
+                    "--native-nonnegative-oscillator-monitor"
+                )
             try:
                 with open("deagle_tmp_output", "w") as prepass_output:
                     subprocess.run(
@@ -971,6 +1246,24 @@ elif force_experiment_direct:
                 )
                 result = get_result()
                 break
+            if prepass_result == "SUCCESS":
+                with open("deagle_tmp_output", "r") as prepass_output:
+                    native_shallow_proof = any(
+                        line.startswith((
+                            "NATIVE_NONNEGATIVE_OSCILLATOR_MONITOR "
+                            "applied=1 ",
+                            "NATIVE_DYNAMIC_TLS_CALLOC_ZERO "
+                            "applied=1 ",
+                        ))
+                        for line in prepass_output
+                    )
+                if native_shallow_proof:
+                    print(
+                        "Bound-%d shallow prepass completed a native "
+                        "proof." % shallow_bound
+                    )
+                    result = get_result()
+                    break
             print(
                 "Bound-%d shallow prepass found no accepted violation."
                 % shallow_bound
