@@ -232,24 +232,24 @@ bool write_graphml(const graphmlt &src, std::ostream &os, std::string filename, 
       key.new_element("default").data="<command-line>";
   }
 
-  // // <key attr.name="invariant" attr.type="string" for="node" id="invariant"/>
-  // {
-  //   xmlt &key=graphml.new_element("key");
-  //   key.set_attribute("attr.name", "invariant");
-  //   key.set_attribute("attr.type", "string");
-  //   key.set_attribute("for", "node");
-  //   key.set_attribute("id", "invariant");
-  // }
+  // <key attr.name="invariant" attr.type="string" for="node" id="invariant"/>
+  {
+    xmlt &key=graphml.new_element("key");
+    key.set_attribute("attr.name", "invariant");
+    key.set_attribute("attr.type", "string");
+    key.set_attribute("for", "node");
+    key.set_attribute("id", "invariant");
+  }
 
-  // // <key attr.name="invariant.scope" attr.type="string" for="node"
-  // //     id="invariant.scope"/>
-  // {
-  //   xmlt &key=graphml.new_element("key");
-  //   key.set_attribute("attr.name", "invariant.scope");
-  //   key.set_attribute("attr.type", "string");
-  //   key.set_attribute("for", "node");
-  //   key.set_attribute("id", "invariant.scope");
-  // }
+  // <key attr.name="invariant.scope" attr.type="string" for="node"
+  //     id="invariant.scope"/>
+  {
+    xmlt &key=graphml.new_element("key");
+    key.set_attribute("attr.name", "invariant.scope");
+    key.set_attribute("attr.type", "string");
+    key.set_attribute("for", "node");
+    key.set_attribute("id", "invariant.scope");
+  }
 
   // <key attr.name="isViolationNode" attr.type="boolean" for="node"
   //      id="violation">
@@ -489,6 +489,16 @@ bool write_graphml(const graphmlt &src, std::ostream &os, std::string filename, 
     key.set_attribute("id", "witness-type");
   }
 
+  // <key attr.name="witness-format-version" attr.type="string" for="graph"
+  //      id="witness-format-version"/>
+  {
+    xmlt &key=graphml.new_element("key");
+    key.set_attribute("attr.name", "witness-format-version");
+    key.set_attribute("attr.type", "string");
+    key.set_attribute("for", "graph");
+    key.set_attribute("id", "witness-format-version");
+  }
+
   xmlt &graph=graphml.new_element("graph");
   graph.set_attribute("edgedefault", "directed");
 
@@ -498,7 +508,17 @@ bool write_graphml(const graphmlt &src, std::ostream &os, std::string filename, 
   {
     xmlt &data=graph.new_element("data");
     data.set_attribute("key", "witness-type");
-    data.data="violation_witness";
+    const auto witness_type = src.key_values.find("witness-type");
+    data.data =
+      witness_type == src.key_values.end()
+        ? "violation_witness"
+        : witness_type->second;
+  }
+
+  {
+    xmlt &data=graph.new_element("data");
+    data.set_attribute("key", "witness-format-version");
+    data.data="1.0";
   }
 
   // <data key="sourcecodelang">C</data>
@@ -582,6 +602,8 @@ bool write_graphml(const graphmlt &src, std::ostream &os, std::string filename, 
 
   for(const auto &kv : src.key_values)
   {
+    if(kv.first == "witness-type")
+      continue;
     xmlt &data=graph.new_element("data");
     data.set_attribute("key", kv.first);
     data.data=kv.second;
@@ -618,16 +640,16 @@ bool write_graphml(const graphmlt &src, std::ostream &os, std::string filename, 
       entry.data="true";
     }
 
-    // if(n.has_invariant)
-    // {
-    //   xmlt &val=node.new_element("data");
-    //   val.set_attribute("key", "invariant");
-    //   val.data=n.invariant;
+    if(n.has_invariant)
+    {
+      xmlt &val=node.new_element("data");
+      val.set_attribute("key", "invariant");
+      val.data=n.invariant;
 
-    //   xmlt &val_s=node.new_element("data");
-    //   val_s.set_attribute("key", "invariant.scope");
-    //   val_s.data=n.invariant_scope;
-    // }
+      xmlt &val_s=node.new_element("data");
+      val_s.set_attribute("key", "invariant.scope");
+      val_s.data=n.invariant_scope;
+    }
 
     for(graphmlt::edgest::const_iterator
         e_it=n.out.begin();

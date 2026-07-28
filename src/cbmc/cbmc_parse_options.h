@@ -17,6 +17,8 @@ Author: Daniel Kroening, kroening@kroening.com
 #include <util/ui_message.h>
 #include <util/validation_interface.h>
 
+#include <functional>
+
 #include <goto-programs/goto_model.h>
 #include <goto-programs/goto_trace.h>
 
@@ -40,7 +42,7 @@ class optionst;
   "(interference-predicate-recursive-worker-fixedpoint)" \
   "(protocol-induced-capacity-cutoff)" \
   "(native-lock-ego-abstraction)" \
-  "(native-jces)(native-prefix-affine-envelope)(native-property-affine-audit)(native-property-affine-proof)(native-role-split-stream-audit)(native-publication-frontier-audit)(native-relational-bisimulation-audit)(native-group-action-cancellation-audit)(native-segmented-fold-audit)(native-nested-iteration-audit)(native-local-loop-accel-audit)(native-homogeneous-spawn-witness-audit)(native-homogeneous-spawn-witness)(native-alternating-phase-audit)(native-alternating-phase-recurrence)(native-indexed-lifecycle-audit)(native-indexed-lifecycle-prefix)(native-dormant-spawn-cutoff-audit)(native-dormant-spawn-cutoff)(native-main-worker-prefix)(native-pair-initialization-prefix)(native-dormant-spawn-pair-audit)(native-dormant-spawn-pair):(native-dormant-spawn-pair-portfolio)(native-counterexample-rescue-portfolio)" \
+  "(native-jces)(native-prefix-affine-envelope)(native-property-affine-audit)(native-property-affine-proof)(native-role-split-stream-audit)(native-publication-frontier-audit)(native-relational-bisimulation-audit)(native-group-action-cancellation-audit)(native-segmented-fold-audit)(native-nested-iteration-audit)(native-local-loop-accel-audit)(native-homogeneous-spawn-witness-audit)(native-homogeneous-spawn-witness)(native-alternating-phase-audit)(native-alternating-phase-recurrence)(native-nonnegative-oscillator-monitor)(native-indexed-lifecycle-audit)(native-indexed-lifecycle-prefix)(native-dormant-spawn-cutoff-audit)(native-dormant-spawn-cutoff)(native-main-worker-prefix)(native-pair-initialization-prefix)(native-dormant-spawn-pair-audit)(native-dormant-spawn-pair):(native-dormant-spawn-pair-portfolio)(native-counterexample-rescue-portfolio)" \
   OPT_BMC \
   "(preprocess)(slice-by-trace):" \
   OPT_FUNCTIONS \
@@ -104,7 +106,8 @@ public:
     goto_modelt &,
     const optionst &,
     const cmdlinet &,
-    ui_message_handlert &);
+    ui_message_handlert &,
+    const std::function<void(const goto_modelt &)> &before_processing = {});
 
 protected:
   goto_modelt goto_model;

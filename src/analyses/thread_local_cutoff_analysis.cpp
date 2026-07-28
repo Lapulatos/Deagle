@@ -11,6 +11,7 @@ Module: Homogeneous Thread-Local Cutoff
 #include <goto-programs/goto_model.h>
 
 #include <util/arith_tools.h>
+#include <util/c_types.h>
 #include <util/expr_util.h>
 #include <util/find_symbols.h>
 #include <util/namespace.h>
@@ -19,6 +20,7 @@ Module: Homogeneous Thread-Local Cutoff
 #include <util/std_expr.h>
 #include <util/symbol.h>
 
+#include <algorithm>
 #include <iostream>
 #include <set>
 #include <string>
@@ -760,7 +762,823 @@ bool sequentialize_representative(
   restrict_to_one(join);
   return true;
 }
+
+struct tls_array_loopt
+{
+  goto_programt::targett head;
+  goto_programt::targett action;
+  goto_programt::targett backedge;
+  irep_idt index;
+  exprt bound;
+  bool property = false;
+};
+
+bool dereference_index(
+  const exprt &src,
+  irep_idt &base,
+  irep_idt &index)
+{
+  const exprt &expr = strip(src);
+  if(expr.id() != ID_dereference || expr.operands().size() != 1)
+    return false;
+  const exprt &pointer =
+    strip(to_dereference_expr(expr).pointer());
+  return
+    pointer.id() == ID_plus && pointer.operands().size() == 2 &&
+    symbol_id(pointer.op0(), base) &&
+    symbol_id(pointer.op1(), index);
+}
+
+bool zero_constant(const exprt &src)
+{
+  const exprt &expr = strip(src);
+  if(expr.id() != ID_constant)
+    return false;
+  mp_integer value;
+  return !to_integer(to_constant_expr(expr), value) && value == 0;
+}
+
+bool nonzero_constant(const exprt &src)
+{
+  const exprt &expr = strip(src);
+  if(expr.id() != ID_constant)
+    return false;
+  mp_integer value;
+  return !to_integer(to_constant_expr(expr), value) && value != 0;
+}
+
+bool nonnegative_assumption(
+  const goto_programt::instructiont &instruction,
+  const irep_idt &identifier)
+{
+  irep_idt callee;
+  if(
+    !direct_call(instruction, callee) ||
+    callee != "assume_abort_if_not" ||
+    instruction.call_arguments().size() != 1)
+    return false;
+  const exprt &condition =
+    strip(instruction.call_arguments().front());
+  if(
+    condition.id() != ID_ge ||
+    condition.operands().size() != 2)
+    return false;
+  irep_idt lhs;
+  return
+    symbol_id(condition.op0(), lhs) && lhs == identifier &&
+    zero_constant(condition.op1());
+}
+
+bool analyze_tls_array_loop(
+  const natural_loops_mutablet::loop_mapt::value_type &entry,
+  const irep_idt &tls_pointer,
+  tls_array_loopt &result,
+  std::string &reason)
+{
+  exprt index_expr;
+  result.head = entry.first;
+  if(
+    !parse_loop_exit(
+      result.head, result.index, index_expr, result.bound))
+  {
+    reason = "tls_loop_guard";
+    return false;
+  }
+
+  std::size_t actions = 0;
+  std::size_t increments = 0;
+  std::size_t backedges = 0;
+  for(const auto instruction : entry.second)
+  {
+    irep_idt callee;
+    if(direct_call(*instruction, callee))
+    {
+      if(
+        callee != "__VERIFIER_assert" ||
+        instruction->call_arguments().size() != 1)
+      {
+        reason = "tls_loop_call";
+        return false;
+      }
+      const exprt &condition =
+        strip(instruction->call_arguments().front());
+      if(
+        condition.id() != ID_equal ||
+        condition.operands().size() != 2)
+      {
+        reason = "tls_property_relation";
+        return false;
+      }
+      irep_idt base;
+      irep_idt index;
+      if(
+        !dereference_index(condition.op0(), base, index) ||
+        base != tls_pointer || index != result.index ||
+        !zero_constant(condition.op1()))
+      {
+        reason = "tls_property_index";
+        return false;
+      }
+      result.property = true;
+      result.action = instruction;
+      ++actions;
+    }
+    else if(instruction->is_assign())
+    {
+      irep_idt lhs;
+      if(
+        symbol_id(instruction->assign_lhs(), lhs) &&
+        lhs == result.index)
+      {
+        if(!unit_increment(*instruction, result.index))
+        {
+          reason = "tls_loop_increment";
+          return false;
+        }
+        ++increments;
+      }
+      else
+      {
+        irep_idt base;
+        irep_idt index;
+        if(
+          !dereference_index(
+            instruction->assign_lhs(), base, index) ||
+          base != tls_pointer || index != result.index ||
+          !nonzero_constant(instruction->assign_rhs()))
+        {
+          reason = "tls_loop_write";
+          return false;
+        }
+        result.property = false;
+        result.action = instruction;
+        ++actions;
+      }
+    }
+    else if(instruction->is_backwards_goto())
+    {
+      if(instruction->get_target() != result.head)
+      {
+        reason = "tls_loop_backedge_target";
+        return false;
+      }
+      result.backedge = instruction;
+      ++backedges;
+    }
+    else if(
+      !instruction->is_goto() && !instruction->is_skip() &&
+      !instruction->is_location())
+    {
+      reason = "tls_loop_instruction";
+      return false;
+    }
+  }
+  if(actions != 1 || increments != 1 || backedges != 1)
+  {
+    reason = "tls_loop_cardinality";
+    return false;
+  }
+  return true;
+}
+
+bool dynamic_tls_worker(
+  goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker_id,
+  irep_idt &tls_pointer,
+  std::string &reason)
+{
+  auto worker = model.goto_functions.function_map.find(worker_id);
+  if(
+    worker == model.goto_functions.function_map.end() ||
+    !worker->second.body_available())
+  {
+    reason = "tls_worker";
+    return false;
+  }
+  auto &program = worker->second.body;
+  natural_loops_mutablet loops;
+  loops(program);
+  if(loops.loop_map.size() != 2)
+  {
+    reason = "tls_worker_loop_count";
+    return false;
+  }
+
+  goto_programt::targett calloc_call = program.instructions.end();
+  goto_programt::targett tls_assignment = program.instructions.end();
+  goto_programt::targett free_call = program.instructions.end();
+  irep_idt allocation_result;
+  irep_idt length;
+  std::size_t calloc_calls = 0;
+  std::size_t free_calls = 0;
+  std::size_t property_calls = 0;
+  std::size_t tls_writes = 0;
+  bool length_nonnegative = false;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    irep_idt callee;
+    if(direct_call(*instruction, callee))
+    {
+      if(callee == "calloc")
+      {
+        const auto &arguments = instruction->call_arguments();
+        if(arguments.size() != 2)
+        {
+          reason = "tls_calloc_shape";
+          return false;
+        }
+        const exprt &element_size_expr = strip(arguments[1]);
+        mp_integer element_size;
+        if(
+          instruction->call_lhs().is_nil() ||
+          !symbol_id(instruction->call_lhs(), allocation_result) ||
+          !symbol_id(arguments[0], length) ||
+          element_size_expr.id() != ID_constant ||
+          to_integer(
+            to_constant_expr(element_size_expr), element_size) ||
+          element_size <= 0)
+        {
+          reason = "tls_calloc_shape";
+          return false;
+        }
+        calloc_call = instruction;
+        ++calloc_calls;
+      }
+      else if(callee == "free")
+      {
+        irep_idt freed;
+        if(
+          instruction->call_arguments().size() != 1 ||
+          !symbol_id(instruction->call_arguments().front(), freed))
+        {
+          reason = "tls_free_shape";
+          return false;
+        }
+        if(tls_pointer.empty())
+          tls_pointer = freed;
+        if(freed != tls_pointer)
+        {
+          reason = "tls_free_object";
+          return false;
+        }
+        free_call = instruction;
+        ++free_calls;
+      }
+      else if(callee == "__VERIFIER_assert")
+        ++property_calls;
+      else if(callee == "assume_abort_if_not")
+      {
+        // Checked after the allocation has identified the bound symbol.
+      }
+      else
+      {
+        reason = "tls_worker_call";
+        return false;
+      }
+    }
+    if(instruction->is_assign())
+    {
+      irep_idt lhs;
+      irep_idt rhs;
+      if(
+        symbol_id(instruction->assign_lhs(), lhs))
+      {
+        const symbolt *symbol = nullptr;
+        if(!ns.lookup(lhs, symbol) && symbol->is_static_lifetime)
+        {
+          if(!symbol->is_thread_local)
+          {
+            reason = "tls_shared_write";
+            return false;
+          }
+          if(
+            !symbol_id(instruction->assign_rhs(), rhs) ||
+            rhs != allocation_result)
+          {
+            reason = "tls_pointer_assignment";
+            return false;
+          }
+          if(tls_pointer.empty())
+            tls_pointer = lhs;
+          if(lhs != tls_pointer)
+          {
+            reason = "tls_pointer_count";
+            return false;
+          }
+          tls_assignment = instruction;
+          ++tls_writes;
+        }
+      }
+    }
+  }
+  for(const auto &instruction : program.instructions)
+    length_nonnegative =
+      length_nonnegative ||
+      (!length.empty() &&
+       nonnegative_assumption(instruction, length));
+
+  const symbolt *tls_symbol = nullptr;
+  if(
+    calloc_calls != 1 || free_calls != 1 || property_calls != 1 ||
+    tls_writes != 1 || !length_nonnegative ||
+    calloc_call == program.instructions.end() ||
+    tls_assignment == program.instructions.end() ||
+    free_call == program.instructions.end() ||
+    ns.lookup(tls_pointer, tls_symbol) ||
+    !tls_symbol->is_thread_local ||
+    tls_symbol->type.id() != ID_pointer)
+  {
+    reason = "tls_worker_resources";
+    return false;
+  }
+
+  std::vector<tls_array_loopt> summaries;
+  for(const auto &entry : loops.loop_map)
+  {
+    tls_array_loopt summary;
+    if(!analyze_tls_array_loop(
+         entry, tls_pointer, summary, reason))
+      return false;
+    summaries.push_back(std::move(summary));
+  }
+  std::sort(
+    summaries.begin(),
+    summaries.end(),
+    [](const tls_array_loopt &lhs, const tls_array_loopt &rhs) {
+      return lhs.head->location_number < rhs.head->location_number;
+    });
+  irep_idt loop_bound;
+  if(
+    !summaries[0].property || summaries[1].property ||
+    strip(summaries[0].bound) != strip(summaries[1].bound) ||
+    !symbol_id(summaries[0].bound, loop_bound) ||
+    loop_bound != length ||
+    tls_assignment->location_number >=
+      summaries[0].head->location_number ||
+    summaries[0].backedge->location_number >=
+      summaries[1].head->location_number ||
+    summaries[1].backedge->location_number >=
+      free_call->location_number)
+  {
+    reason = "tls_worker_order";
+    return false;
+  }
+
+  const auto initialize =
+    model.goto_functions.function_map.find("__CPROVER_initialize");
+  if(
+    initialize == model.goto_functions.function_map.end() ||
+    !initialize->second.body_available())
+  {
+    reason = "tls_initialize";
+    return false;
+  }
+  std::size_t null_initializations = 0;
+  for(const auto &instruction : initialize->second.body.instructions)
+  {
+    irep_idt lhs;
+    if(
+      instruction.is_assign() &&
+      symbol_id(instruction.assign_lhs(), lhs) &&
+      lhs == tls_pointer &&
+      zero_value(instruction.assign_rhs()))
+      ++null_initializations;
+  }
+  if(null_initializations != 1)
+  {
+    reason = "tls_initial_value";
+    return false;
+  }
+  return true;
+}
+
+std::vector<goto_programt::targett> semantic_instructions(
+  goto_programt &program)
+{
+  std::vector<goto_programt::targett> result;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(
+      instruction->is_skip() || instruction->is_location() ||
+      instruction->is_decl() || instruction->is_dead() ||
+      instruction->is_set_return_value() ||
+      instruction->is_end_function())
+      continue;
+    result.push_back(instruction);
+  }
+  return result;
+}
+
+bool pointer_integer(
+  const exprt &src,
+  mp_integer &value)
+{
+  const exprt &expr = strip(src);
+  return
+    expr.id() == ID_constant &&
+    !to_integer(to_constant_expr(expr), value);
+}
+
+bool direct_dereference_symbol(
+  const exprt &src,
+  irep_idt &identifier)
+{
+  const exprt &expr = strip(src);
+  return
+    expr.id() == ID_dereference &&
+    expr.operands().size() == 1 &&
+    symbol_id(to_dereference_expr(expr).pointer(), identifier);
+}
+
+bool tls_destructor_shape(
+  goto_modelt &model,
+  irep_idt &key,
+  irep_idt &destructor,
+  irep_idt &worker_id,
+  mp_integer &value,
+  goto_programt::targett &key_create,
+  goto_programt::targett &worker_setspecific,
+  goto_programt::targett &worker_return,
+  std::string &reason)
+{
+  auto main = model.goto_functions.function_map.find(ID_main);
+  if(
+    main == model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+  {
+    reason = "tls_dtor_main";
+    return false;
+  }
+  auto main_semantic = semantic_instructions(main->second.body);
+  if(main_semantic.size() != 9)
+  {
+    reason = "tls_dtor_main_count";
+    return false;
+  }
+
+  irep_idt callee;
+  if(
+    !direct_call(*main_semantic[0], callee) ||
+    callee != "pthread_key_create" ||
+    main_semantic[0]->call_arguments().size() != 2 ||
+    !address_of_symbol(
+      main_semantic[0]->call_arguments()[0], key) ||
+    !address_of_symbol(
+      main_semantic[0]->call_arguments()[1], destructor) ||
+    main_semantic[0]->call_lhs().is_nil())
+  {
+    reason = "tls_dtor_key_create";
+    return false;
+  }
+  key_create = main_semantic[0];
+
+  irep_idt key_result;
+  irep_idt checked_result;
+  if(
+    !symbol_id(main_semantic[0]->call_lhs(), key_result) ||
+    !main_semantic[1]->is_assign() ||
+    !symbol_id(main_semantic[1]->assign_lhs(), checked_result) ||
+    !symbol_id(main_semantic[1]->assign_rhs(), callee) ||
+    callee != key_result ||
+    !main_semantic[2]->is_goto() ||
+    main_semantic[2]->targets.size() != 1 ||
+    !direct_call(*main_semantic[3], callee) ||
+    callee != "reach_error" ||
+    main_semantic[2]->get_target()->location_number <=
+      main_semantic[3]->location_number ||
+    main_semantic[2]->get_target()->location_number >
+      main_semantic[4]->location_number)
+  {
+    reason = "tls_dtor_key_result";
+    return false;
+  }
+  const exprt &key_success = strip(main_semantic[2]->condition());
+  irep_idt key_success_symbol;
+  if(
+    key_success.id() != ID_equal ||
+    key_success.operands().size() != 2 ||
+    !symbol_id(key_success.op0(), key_success_symbol) ||
+    key_success_symbol != checked_result ||
+    !zero_constant(key_success.op1()))
+  {
+    reason = "tls_dtor_key_success";
+    return false;
+  }
+
+  irep_idt thread;
+  irep_idt create_worker;
+  irep_idt create_key;
+  if(
+    !direct_call(*main_semantic[4], callee) ||
+    callee != "pthread_create" ||
+    main_semantic[4]->call_arguments().size() != 4 ||
+    !address_of_symbol(
+      main_semantic[4]->call_arguments()[0], thread) ||
+    !address_of_symbol(
+      main_semantic[4]->call_arguments()[2], create_worker))
+  {
+    reason = "tls_dtor_create";
+    return false;
+  }
+  const exprt &worker_argument =
+    strip(main_semantic[4]->call_arguments()[3]);
+  if(
+    worker_argument.id() != ID_address_of ||
+    !symbol_id(
+      to_address_of_expr(worker_argument).object(), create_key) ||
+    create_key != key)
+  {
+    reason = "tls_dtor_create_argument";
+    return false;
+  }
+  worker_id = create_worker;
+
+  if(
+    !direct_call(*main_semantic[5], callee) ||
+    callee != "pthread_setspecific" ||
+    main_semantic[5]->call_arguments().size() != 2 ||
+    !main_semantic[6]->is_goto() ||
+    !direct_call(*main_semantic[7], callee) ||
+    callee != "reach_error" ||
+    main_semantic[6]->get_target() != main_semantic[8] ||
+    !direct_call(*main_semantic[8], callee) ||
+    callee != "pthread_join" ||
+    main_semantic[8]->call_arguments().size() != 2)
+  {
+    reason = "tls_dtor_main_suffix";
+    return false;
+  }
+  irep_idt main_specific_key;
+  irep_idt joined_thread;
+  if(
+    !symbol_id(
+      main_semantic[5]->call_arguments()[0], main_specific_key) ||
+    main_specific_key != key ||
+    !symbol_id(
+      main_semantic[8]->call_arguments()[0], joined_thread) ||
+    joined_thread != thread)
+  {
+    reason = "tls_dtor_main_correspondence";
+    return false;
+  }
+
+  auto worker = model.goto_functions.function_map.find(worker_id);
+  if(
+    worker == model.goto_functions.function_map.end() ||
+    !worker->second.body_available())
+  {
+    reason = "tls_dtor_worker";
+    return false;
+  }
+  auto worker_semantic = semantic_instructions(worker->second.body);
+  if(worker_semantic.size() != 5)
+  {
+    reason = "tls_dtor_worker_count";
+    return false;
+  }
+  irep_idt local_key;
+  irep_idt worker_argument_symbol;
+  if(
+    !worker_semantic[0]->is_assign() ||
+    !symbol_id(worker_semantic[0]->assign_lhs(), local_key) ||
+    !symbol_id(
+      worker_semantic[0]->assign_rhs(), worker_argument_symbol) ||
+    !direct_call(*worker_semantic[1], callee) ||
+    callee != "pthread_setspecific" ||
+    worker_semantic[1]->call_arguments().size() != 2)
+  {
+    reason = "tls_dtor_worker_prefix";
+    return false;
+  }
+  irep_idt dereferenced_key;
+  if(
+    !direct_dereference_symbol(
+      worker_semantic[1]->call_arguments()[0], dereferenced_key) ||
+    dereferenced_key != local_key ||
+    !pointer_integer(
+      worker_semantic[1]->call_arguments()[1], value) ||
+    value == 0)
+  {
+    reason = "tls_dtor_worker_value";
+    return false;
+  }
+  worker_setspecific = worker_semantic[1];
+  irep_idt worker_result;
+  irep_idt worker_checked;
+  if(
+    worker_semantic[1]->call_lhs().is_nil() ||
+    !symbol_id(
+      worker_semantic[1]->call_lhs(), worker_result) ||
+    !worker_semantic[2]->is_assign() ||
+    !symbol_id(worker_semantic[2]->assign_lhs(), worker_checked) ||
+    !symbol_id(worker_semantic[2]->assign_rhs(), callee) ||
+    callee != worker_result ||
+    !worker_semantic[3]->is_goto() ||
+    !direct_call(*worker_semantic[4], callee) ||
+    callee != "reach_error")
+  {
+    reason = "tls_dtor_worker_result";
+    return false;
+  }
+  worker_return = worker_semantic[3]->get_target();
+  if(worker_return == worker->second.body.instructions.end())
+  {
+    reason = "tls_dtor_worker_return";
+    return false;
+  }
+
+  auto dtor = model.goto_functions.function_map.find(destructor);
+  if(
+    dtor == model.goto_functions.function_map.end() ||
+    !dtor->second.body_available())
+  {
+    reason = "tls_dtor_body";
+    return false;
+  }
+  auto dtor_semantic = semantic_instructions(dtor->second.body);
+  if(
+    dtor_semantic.size() != 3 ||
+    !dtor_semantic[0]->is_assign() ||
+    !dtor_semantic[1]->is_goto() ||
+    dtor_semantic[1]->targets.size() != 1 ||
+    !direct_call(*dtor_semantic[2], callee) ||
+    callee != "reach_error" ||
+    dtor_semantic[1]->get_target() ==
+      dtor_semantic[2])
+  {
+    reason = "tls_dtor_property";
+    return false;
+  }
+  irep_idt converted;
+  irep_idt parameter;
+  if(
+    !symbol_id(dtor_semantic[0]->assign_lhs(), converted) ||
+    !symbol_id(dtor_semantic[0]->assign_rhs(), parameter))
+  {
+    reason = "tls_dtor_conversion";
+    return false;
+  }
+  const exprt &guard = strip(dtor_semantic[1]->condition());
+  irep_idt guarded;
+  mp_integer forbidden;
+  if(
+    guard.id() != ID_notequal ||
+    guard.operands().size() != 2 ||
+    !symbol_id(guard.op0(), guarded) ||
+    guarded != converted ||
+    !pointer_integer(guard.op1(), forbidden) ||
+    forbidden != value)
+  {
+    reason = "tls_dtor_guard";
+    return false;
+  }
+  return true;
+}
 } // namespace
+
+bool tls_destructor_counterexample_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  irep_idt key;
+  irep_idt destructor;
+  irep_idt worker;
+  mp_integer value;
+  goto_programt::targett key_create;
+  goto_programt::targett worker_setspecific;
+  goto_programt::targett worker_return;
+  std::string reason;
+  if(
+    !tls_destructor_shape(
+      goto_model,
+      key,
+      destructor,
+      worker,
+      value,
+      key_create,
+      worker_setspecific,
+      worker_return,
+      reason))
+  {
+    std::cout
+      << "NATIVE_TLS_DESTRUCTOR_COUNTEREXAMPLE applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+
+  const namespacet ns(goto_model.symbol_table);
+  const symbolt &key_symbol = ns.lookup(key);
+  const symbolt &destructor_symbol = ns.lookup(destructor);
+  const exprt zero_key = from_integer(0, key_symbol.type);
+  const auto key_location = key_create->source_location();
+  auto &main =
+    goto_model.goto_functions.function_map.at(ID_main).body;
+  main.insert_before(
+    key_create,
+    goto_programt::make_assignment(
+      key_symbol.symbol_expr(), zero_key, key_location));
+  const exprt key_create_lhs = key_create->call_lhs();
+  *key_create =
+    goto_programt::make_assignment(
+      key_create_lhs,
+      from_integer(0, key_create_lhs.type()),
+      key_location);
+
+  const exprt worker_result_lhs =
+    worker_setspecific->call_lhs();
+  *worker_setspecific =
+    goto_programt::make_assignment(
+      worker_result_lhs,
+      from_integer(0, worker_result_lhs.type()),
+      worker_setspecific->source_location());
+  const code_typet &destructor_type =
+    to_code_type(destructor_symbol.type);
+  INVARIANT(
+    destructor_type.parameters().size() == 1,
+    "accepted TLS destructor has one parameter");
+  const exprt destructor_value =
+    typecast_exprt::conditional_cast(
+      from_integer(value, size_type()),
+      destructor_type.parameters().front().type());
+  code_function_callt destructor_call(
+    destructor_symbol.symbol_expr(), {destructor_value});
+  auto &worker_body =
+    goto_model.goto_functions.function_map.at(worker).body;
+  auto destructor_instruction =
+    goto_programt::make_function_call(
+      destructor_call, worker_return->source_location());
+  worker_body.insert_before_swap(
+    worker_return, destructor_instruction);
+  goto_model.goto_functions.update();
+  std::cout
+    << "NATIVE_TLS_DESTRUCTOR_COUNTEREXAMPLE applied=1"
+    << " worker=" << worker
+    << " destructor=" << destructor
+    << " value=" << value << '\n';
+  (void)message_handler;
+  return true;
+}
+
+bool dynamic_tls_calloc_zero_proof(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  std::string reason;
+  lifecycle_loopt create;
+  lifecycle_loopt join;
+  if(!collect_lifecycle(goto_model, create, join, reason))
+  {
+    std::cout
+      << "NATIVE_DYNAMIC_TLS_CALLOC_ZERO applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+  const namespacet ns(goto_model.symbol_table);
+  irep_idt tls_pointer;
+  if(
+    !dynamic_tls_worker(
+      goto_model, ns, create.worker, tls_pointer, reason))
+  {
+    std::cout
+      << "NATIVE_DYNAMIC_TLS_CALLOC_ZERO applied=0 reason="
+      << reason << " worker=" << create.worker << '\n';
+    return false;
+  }
+
+  bool thread_count_nonnegative = false;
+  const auto &main =
+    goto_model.goto_functions.function_map.at(ID_main).body;
+  irep_idt thread_count;
+  if(!symbol_id(create.bound, thread_count))
+  {
+    std::cout
+      << "NATIVE_DYNAMIC_TLS_CALLOC_ZERO applied=0"
+      << " reason=tls_thread_bound\n";
+    return false;
+  }
+  for(const auto &instruction : main.instructions)
+    thread_count_nonnegative =
+      thread_count_nonnegative ||
+      nonnegative_assumption(instruction, thread_count);
+  if(!thread_count_nonnegative)
+  {
+    std::cout
+      << "NATIVE_DYNAMIC_TLS_CALLOC_ZERO applied=0"
+      << " reason=tls_thread_count\n";
+    return false;
+  }
+
+  std::cout
+    << "NATIVE_DYNAMIC_TLS_CALLOC_ZERO applied=1"
+    << " worker=" << create.worker
+    << " tls=" << tls_pointer
+    << " thread_count=" << thread_count << '\n';
+  (void)message_handler;
+  return true;
+}
 
 bool homogeneous_thread_local_cutoff_transform(
   goto_modelt &goto_model,

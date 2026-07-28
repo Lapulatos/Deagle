@@ -13,6 +13,7 @@ Module: Interference-Closed Predicate Analysis
 #include <langapi/language_util.h>
 
 #include <util/expr_util.h>
+#include <util/arith_tools.h>
 #include <util/irep_hash.h>
 #include <util/message.h>
 #include <util/namespace.h>
@@ -339,6 +340,596 @@ bool is_shared_scalar(const exprt &expr, const namespacet &ns)
   if(ns.lookup(to_symbol_expr(expr).get_identifier(), symbol))
     return false;
   return symbol->is_static_lifetime && !symbol->is_type;
+}
+
+void collect_shared_scalar_identifiers(
+  const exprt &expr,
+  const namespacet &ns,
+  std::set<irep_idt> &result)
+{
+  const exprt &stripped = skip_typecast(expr);
+  if(stripped.id() == ID_symbol && is_shared_scalar(stripped, ns))
+    result.insert(to_symbol_expr(stripped).get_identifier());
+  for(const auto &operand : expr.operands())
+    collect_shared_scalar_identifiers(operand, ns, result);
+}
+
+std::set<irep_idt> instruction_shared_scalar_identifiers(
+  const goto_programt::instructiont &instruction,
+  const namespacet &ns)
+{
+  std::set<irep_idt> result;
+  instruction.apply(
+    [&ns, &result](const exprt &expr) {
+      collect_shared_scalar_identifiers(expr, ns, result);
+    });
+  return result;
+}
+
+bool validate_mutex_ownership(
+  const goto_modelt &model,
+  const std::vector<irep_idt> &thread_ids,
+  std::string &reason,
+  std::size_t &region_count,
+  std::size_t &protected_objects)
+{
+  const namespacet ns(model.symbol_table);
+  std::map<irep_idt, irep_idt> object_mutex;
+  std::set<const goto_programt::instructiont *> main_concurrent_locations;
+
+  if(!thread_ids.empty())
+  {
+    const auto main_function =
+      model.goto_functions.function_map.find(thread_ids.front());
+    if(
+      main_function != model.goto_functions.function_map.end() &&
+      main_function->second.body_available())
+    {
+      const auto &program = main_function->second.body;
+      for(auto spawn = program.instructions.begin();
+          spawn != program.instructions.end(); ++spawn)
+      {
+        if(!spawn->source_location().get_bool("v49_thread_spawn"))
+          continue;
+        const irep_idt &entry =
+          spawn->source_location().get("v49_thread_entry");
+        if(entry == irep_idt())
+          continue;
+        std::vector<goto_programt::const_targett> work;
+        const auto successors = program.get_successors(spawn);
+        work.insert(work.end(), successors.begin(), successors.end());
+        std::set<const goto_programt::instructiont *> visited;
+        while(!work.empty())
+        {
+          const auto location = work.back();
+          work.pop_back();
+          if(!visited.insert(&*location).second)
+            continue;
+          if(location->source_location().get("v49_join_entry") == entry)
+            continue;
+          main_concurrent_locations.insert(&*location);
+          const auto next = program.get_successors(location);
+          work.insert(work.end(), next.begin(), next.end());
+        }
+      }
+    }
+  }
+
+  struct accesst
+  {
+    irep_idt object;
+    irep_idt mutex;
+    bool concurrent;
+  };
+  std::vector<accesst> accesses;
+
+  for(std::size_t thread_index = 0; thread_index < thread_ids.size();
+      ++thread_index)
+  {
+    const auto function =
+      model.goto_functions.function_map.find(thread_ids[thread_index]);
+    if(
+      function == model.goto_functions.function_map.end() ||
+      !function->second.body_available())
+      continue;
+    const auto &program = function->second.body;
+    irep_idt held_mutex;
+    for(auto instruction = program.instructions.begin();
+        instruction != program.instructions.end(); ++instruction)
+    {
+      irep_idt ownership_scope =
+        instruction->source_location().get("deagle_lock_ownership_scope");
+      if(ownership_scope == irep_idt())
+        ownership_scope =
+          instruction->source_location().get("v217_mutex");
+      if(
+        instruction->is_atomic_begin() &&
+        ownership_scope != irep_idt())
+      {
+        if(held_mutex != irep_idt())
+        {
+          reason = "ownership_nested_mutex";
+          return false;
+        }
+        held_mutex = ownership_scope;
+        ++region_count;
+        continue;
+      }
+      if(
+        instruction->is_atomic_end() &&
+        ownership_scope != irep_idt())
+      {
+        if(
+          held_mutex == irep_idt() ||
+          held_mutex != ownership_scope)
+        {
+          reason = "ownership_unbalanced_mutex";
+          return false;
+        }
+        held_mutex = irep_idt();
+        continue;
+      }
+
+      const bool concurrent =
+        thread_index != 0 ||
+        main_concurrent_locations.find(&*instruction) !=
+          main_concurrent_locations.end();
+      for(const auto &object :
+          instruction_shared_scalar_identifiers(*instruction, ns))
+      {
+        accesses.push_back({object, held_mutex, concurrent});
+        if(held_mutex != irep_idt() && object != held_mutex)
+        {
+          const auto inserted = object_mutex.emplace(object, held_mutex);
+          if(!inserted.second && inserted.first->second != held_mutex)
+          {
+            reason = "ownership_multiple_mutexes";
+            protected_objects = object_mutex.size();
+            return false;
+          }
+        }
+      }
+    }
+    if(held_mutex != irep_idt())
+    {
+      reason = "ownership_unbalanced_mutex";
+      protected_objects = object_mutex.size();
+      return false;
+    }
+  }
+
+  for(const auto &access : accesses)
+  {
+    const auto protected_by = object_mutex.find(access.object);
+    if(
+      protected_by != object_mutex.end() && access.concurrent &&
+      access.mutex != protected_by->second)
+    {
+      reason = "ownership_external_protected_access";
+      protected_objects = object_mutex.size();
+      return false;
+    }
+  }
+  protected_objects = object_mutex.size();
+  return true;
+}
+
+bool expression_contains_identifier(
+  const exprt &expr,
+  const irep_idt &identifier)
+{
+  if(
+    expr.id() == ID_symbol &&
+    to_symbol_expr(expr).get_identifier() == identifier)
+    return true;
+  for(const auto &operand : expr.operands())
+  {
+    if(expression_contains_identifier(operand, identifier))
+      return true;
+  }
+  return false;
+}
+
+void collect_expression_identifiers(
+  const exprt &expr,
+  std::set<irep_idt> &identifiers)
+{
+  if(expr.id() == ID_symbol)
+    identifiers.insert(to_symbol_expr(expr).get_identifier());
+  for(const auto &operand : expr.operands())
+    collect_expression_identifiers(operand, identifiers);
+}
+
+bool expression_contains_unsigned_max(
+  const exprt &expr,
+  const typet &type)
+{
+  if(expr.id() == ID_constant)
+  {
+    const auto value = numeric_cast<mp_integer>(expr);
+    if(value.has_value() && type.id() == ID_unsignedbv)
+    {
+      const auto width = to_bitvector_type(type).get_width();
+      if(*value == -1 || *value == power(2, width) - 1)
+        return true;
+    }
+    const std::string bits =
+      id2string(to_constant_expr(expr).get_value());
+    if(
+      !bits.empty() &&
+      std::all_of(
+        bits.begin(), bits.end(), [](char bit) { return bit == '1'; }))
+      return true;
+  }
+  for(const auto &operand : expr.operands())
+  {
+    if(expression_contains_unsigned_max(operand, type))
+      return true;
+  }
+  return false;
+}
+
+bool exact_unit_increment(
+  const exprt &rhs,
+  const irep_idt &identifier)
+{
+  const exprt &stripped = skip_typecast(rhs);
+  if(stripped.id() != ID_plus || stripped.operands().size() != 2)
+    return false;
+  bool has_identifier = false;
+  bool has_one = false;
+  for(const auto &operand : stripped.operands())
+  {
+    const exprt &term = skip_typecast(operand);
+    if(
+      term.id() == ID_symbol &&
+      to_symbol_expr(term).get_identifier() == identifier)
+      has_identifier = true;
+    const auto value = numeric_cast<mp_integer>(term);
+    if(value.has_value() && *value == 1)
+      has_one = true;
+  }
+  return has_identifier && has_one;
+}
+
+bool exact_ticket_admission_equality(const exprt &condition)
+{
+  const exprt &stripped = skip_typecast(condition);
+  if(stripped.id() == ID_equal)
+    return true;
+  return stripped.id() == ID_not &&
+         stripped.operands().size() == 1 &&
+         skip_typecast(stripped.op0()).id() == ID_notequal;
+}
+
+struct ticket_allocator_summaryt
+{
+  irep_idt function;
+  irep_idt counter;
+  irep_idt pointer_parameter;
+};
+
+bool recognize_ticket_allocator(
+  const irep_idt &function_id,
+  const goto_functionst::goto_functiont &function,
+  ticket_allocator_summaryt &summary)
+{
+  if(!function.body_available())
+    return false;
+  bool inside_atomic = false;
+  bool saw_begin = false;
+  bool saw_end = false;
+  bool saw_no_wrap = false;
+  bool saw_pointer_copy = false;
+  bool saw_increment = false;
+  irep_idt counter;
+  irep_idt pointer_parameter;
+  typet counter_type;
+  std::vector<exprt> guard_conditions;
+
+  for(const auto &instruction : function.body.instructions)
+  {
+    if(instruction.is_atomic_begin())
+    {
+      if(inside_atomic || saw_begin)
+        return false;
+      inside_atomic = true;
+      saw_begin = true;
+      continue;
+    }
+    if(instruction.is_atomic_end())
+    {
+      if(!inside_atomic || saw_end)
+        return false;
+      inside_atomic = false;
+      saw_end = true;
+      continue;
+    }
+    if(!inside_atomic)
+      continue;
+    if(instruction.is_function_call())
+    {
+      if(instruction.call_arguments().size() != 1)
+        return false;
+      const exprt &condition = instruction.call_arguments().front();
+      guard_conditions.push_back(condition);
+      saw_no_wrap = true;
+      continue;
+    }
+    if(!instruction.is_assign())
+      continue;
+    if(instruction.assign_lhs().id() == ID_dereference)
+    {
+      const exprt &pointer =
+        skip_typecast(to_dereference_expr(instruction.assign_lhs()).pointer());
+      const exprt &rhs = skip_typecast(instruction.assign_rhs());
+      if(pointer.id() != ID_symbol || rhs.id() != ID_symbol)
+        return false;
+      pointer_parameter = to_symbol_expr(pointer).get_identifier();
+      counter = to_symbol_expr(rhs).get_identifier();
+      counter_type = rhs.type();
+      saw_pointer_copy = true;
+      continue;
+    }
+    if(instruction.assign_lhs().id() == ID_symbol)
+    {
+      const irep_idt &lhs =
+        to_symbol_expr(instruction.assign_lhs()).get_identifier();
+      if(counter == irep_idt() || lhs != counter ||
+         !exact_unit_increment(instruction.assign_rhs(), counter))
+        return false;
+      saw_increment = true;
+    }
+  }
+  if(
+    inside_atomic || !saw_begin || !saw_end || !saw_no_wrap ||
+    !saw_pointer_copy || !saw_increment)
+  {
+    if(saw_begin)
+      std::cout << "INTERFERENCE_TICKET_ALLOCATOR_AUDIT function="
+                << function_id << " begin=" << saw_begin
+                << " end=" << saw_end << " guard=" << saw_no_wrap
+                << " copy=" << saw_pointer_copy
+                << " increment=" << saw_increment << '\n';
+    return false;
+  }
+
+  for(const auto &condition : guard_conditions)
+  {
+    if(
+      expression_contains_identifier(condition, counter) &&
+      expression_contains_unsigned_max(condition, counter_type))
+    {
+      summary = {function_id, counter, pointer_parameter};
+      return true;
+    }
+  }
+  std::cout << "INTERFERENCE_TICKET_ALLOCATOR_AUDIT function="
+            << function_id << " structural=1 nowrap=0 counter="
+            << counter << " counter_type=" << counter_type.id();
+  for(const auto &condition : guard_conditions)
+    std::cout << " guard_expr=" << condition.pretty();
+  std::cout << '\n';
+  return false;
+}
+
+bool rewrite_ticket_worker(
+  goto_programt &program,
+  const ticket_allocator_summaryt &allocator,
+  const namespacet &ns,
+  std::string &reason,
+  std::size_t &region_count)
+{
+  for(auto call = program.instructions.begin();
+      call != program.instructions.end(); ++call)
+  {
+    if(!call->is_function_call())
+      continue;
+    const exprt &function = skip_typecast(call->call_function());
+    if(
+      function.id() != ID_symbol ||
+      to_symbol_expr(function).get_identifier() != allocator.function ||
+      call->call_arguments().size() != 1)
+      continue;
+    irep_idt local_ticket;
+    if(!get_addressed_symbol(call->call_arguments().front(), local_ticket))
+    {
+      reason = "ticket_allocator_argument";
+      return false;
+    }
+
+    auto spin_begin = std::next(call);
+    while(
+      spin_begin != program.instructions.end() &&
+      !spin_begin->is_atomic_begin())
+      ++spin_begin;
+    if(spin_begin == program.instructions.end())
+    {
+      reason = "ticket_spin_begin";
+      return false;
+    }
+    auto spin_end = std::next(spin_begin);
+    while(
+      spin_end != program.instructions.end() &&
+      !spin_end->is_atomic_end())
+      ++spin_end;
+    if(spin_end == program.instructions.end())
+    {
+      reason = "ticket_spin_end";
+      return false;
+    }
+
+    goto_programt::targett admission = program.instructions.end();
+    goto_programt::targett increment_slot = program.instructions.end();
+    irep_idt serving;
+    for(auto current = std::next(spin_begin); current != spin_end; ++current)
+    {
+      if(current->is_assign() || current->is_function_call())
+      {
+        reason = "ticket_spin_side_effect";
+        return false;
+      }
+      if(!current->is_goto())
+        continue;
+      std::set<irep_idt> identifiers;
+      collect_expression_identifiers(current->condition(), identifiers);
+      if(
+        identifiers.find(local_ticket) == identifiers.end() ||
+        identifiers.size() != 2 ||
+        !exact_ticket_admission_equality(current->condition()))
+      {
+        if(increment_slot != program.instructions.end())
+        {
+          reason = "ticket_spin_shape";
+          return false;
+        }
+        increment_slot = current;
+        continue;
+      }
+      for(const auto &identifier : identifiers)
+      {
+        if(identifier != local_ticket)
+          serving = identifier;
+      }
+      admission = current;
+    }
+    if(
+      admission == program.instructions.end() ||
+      increment_slot == program.instructions.end() ||
+      serving == irep_idt())
+    {
+      reason = "ticket_admission_equality";
+      return false;
+    }
+
+    auto release_begin = std::next(spin_end);
+    while(
+      release_begin != program.instructions.end() &&
+      !release_begin->is_atomic_begin())
+      ++release_begin;
+    if(release_begin == program.instructions.end())
+    {
+      reason = "ticket_release_begin";
+      return false;
+    }
+    auto release_end = std::next(release_begin);
+    while(
+      release_end != program.instructions.end() &&
+      !release_end->is_atomic_end())
+      ++release_end;
+    if(release_end == program.instructions.end())
+    {
+      reason = "ticket_release_end";
+      return false;
+    }
+    std::size_t release_assignments = 0;
+    for(auto current = std::next(release_begin);
+        current != release_end; ++current)
+    {
+      if(!current->is_assign())
+      {
+        if(!current->is_skip())
+        {
+          reason = "ticket_release_instruction";
+          return false;
+        }
+        continue;
+      }
+      if(
+        current->assign_lhs().id() != ID_symbol ||
+        to_symbol_expr(current->assign_lhs()).get_identifier() != serving ||
+        !exact_unit_increment(current->assign_rhs(), serving))
+      {
+        reason = "ticket_release_increment";
+        return false;
+      }
+      ++release_assignments;
+    }
+    if(release_assignments != 1)
+    {
+      reason = "ticket_release_count";
+      return false;
+    }
+
+    const symbolt *local_symbol = nullptr;
+    const symbolt *counter_symbol = nullptr;
+    if(
+      ns.lookup(local_ticket, local_symbol) ||
+      ns.lookup(allocator.counter, counter_symbol) ||
+      local_symbol->type.id() != ID_unsignedbv ||
+      counter_symbol->type.id() != ID_unsignedbv ||
+      local_symbol->type != counter_symbol->type)
+    {
+      reason = "ticket_counter_types";
+      return false;
+    }
+    const symbol_exprt local_expr(local_ticket, local_symbol->type);
+    const symbol_exprt counter_expr(
+      allocator.counter, counter_symbol->type);
+
+    const source_locationt admission_location = admission->source_location();
+    exprt admission_condition = admission->condition();
+    const auto width =
+      to_bitvector_type(counter_symbol->type).get_width();
+    const exprt no_wrap = notequal_exprt(
+      local_expr,
+      from_integer(power(2, width) - 1, counter_symbol->type));
+    *admission = goto_programt::make_assumption(
+      and_exprt(admission_condition, no_wrap), admission_location);
+    source_locationt begin_location = call->source_location();
+    begin_location.set("deagle_lock_ownership_scope", serving);
+    *call = goto_programt::make_atomic_begin(begin_location);
+    *spin_begin = goto_programt::make_assignment(
+      local_expr, counter_expr, spin_begin->source_location());
+    *increment_slot = goto_programt::make_assignment(
+      counter_expr,
+      plus_exprt(
+        counter_expr,
+        from_integer(1, counter_symbol->type)),
+      increment_slot->source_location());
+    spin_end->turn_into_skip();
+    release_begin->turn_into_skip();
+    source_locationt end_location = release_end->source_location();
+    end_location.set("deagle_lock_ownership_scope", serving);
+    *release_end = goto_programt::make_atomic_end(end_location);
+    ++region_count;
+    return true;
+  }
+  return false;
+}
+
+bool rewrite_ticket_lock_ownership(
+  goto_modelt &model,
+  std::string &reason,
+  std::size_t &region_count)
+{
+  const namespacet ns(model.symbol_table);
+  std::vector<ticket_allocator_summaryt> allocators;
+  for(const auto &function : model.goto_functions.function_map)
+  {
+    ticket_allocator_summaryt summary;
+    if(recognize_ticket_allocator(function.first, function.second, summary))
+      allocators.push_back(std::move(summary));
+  }
+  for(const auto &allocator : allocators)
+  {
+    for(auto &function : model.goto_functions.function_map)
+    {
+      if(rewrite_ticket_worker(
+           function.second.body, allocator, ns, reason, region_count))
+      {
+        model.goto_functions.update();
+        std::cout << "INTERFERENCE_TICKET_OWNERSHIP regions="
+                  << region_count << " allocator=" << allocator.function
+                  << " counter=" << allocator.counter << '\n';
+        return true;
+      }
+      if(!reason.empty())
+        return false;
+    }
+  }
+  reason = "ticket_protocol_not_found";
+  return false;
 }
 
 bool uses_only_shared_symbols(const exprt &expr, const namespacet &ns)
@@ -787,7 +1378,10 @@ thread_profilet profile_thread(
 }
 
 std::vector<exprt> predicate_basis(
-  const goto_functionst::goto_functiont &function)
+  const irep_idt &entry,
+  const goto_functionst::goto_functiont &function,
+  const namespacet &ns,
+  bool report_wp_audit)
 {
   std::unordered_set<exprt, irep_hash> predicates;
   for(const auto &instruction : function.body.instructions)
@@ -797,6 +1391,327 @@ std::vector<exprt> predicate_basis(
     if(instruction.is_assign())
       collect_boolean_atoms(instruction.assign_rhs(), predicates);
   }
+  const std::vector<exprt> basis(predicates.begin(), predicates.end());
+
+  if(report_wp_audit)
+  {
+    const std::size_t base_size = predicates.size();
+    std::vector<std::pair<symbol_exprt, exprt>> assignments;
+    for(const auto &instruction : function.body.instructions)
+    {
+      if(
+        !instruction.is_assign() ||
+        instruction.assign_lhs().id() != ID_symbol ||
+        has_subexpr(instruction.assign_rhs(), ID_side_effect) ||
+        has_subexpr(instruction.assign_rhs(), ID_dereference))
+        continue;
+      assignments.emplace_back(
+        to_symbol_expr(instruction.assign_lhs()), instruction.assign_rhs());
+    }
+
+    std::vector<exprt> frontier(predicates.begin(), predicates.end());
+    constexpr std::size_t max_wp_predicates = 256;
+    constexpr unsigned max_wp_depth = 3;
+    unsigned completed_depth = 0;
+    bool reached_cap = false;
+    for(unsigned depth = 1;
+        depth <= max_wp_depth && !frontier.empty() && !reached_cap; ++depth)
+    {
+      std::vector<exprt> next_frontier;
+      for(const auto &predicate : frontier)
+      {
+        for(const auto &assignment : assignments)
+        {
+          exprt preimage = predicate;
+          replace_symbolt replacement;
+          replacement.set(assignment.first, assignment.second);
+          if(replacement.replace(preimage))
+            continue;
+          preimage = simplify_expr(std::move(preimage), ns);
+          if(
+            preimage.is_true() || preimage.is_false() ||
+            preimage.type().id() != ID_bool ||
+            has_subexpr(preimage, ID_side_effect) ||
+            has_subexpr(preimage, ID_dereference))
+            continue;
+          if(predicates.insert(preimage).second)
+          {
+            next_frontier.push_back(std::move(preimage));
+            if(predicates.size() >= max_wp_predicates)
+            {
+              reached_cap = true;
+              break;
+            }
+          }
+        }
+        if(reached_cap)
+          break;
+      }
+      completed_depth = depth;
+      frontier = std::move(next_frontier);
+    }
+    std::cout << "INTERFERENCE_WP_AUDIT entry=" << entry
+              << " base=" << base_size << " candidate=" << predicates.size()
+              << " added=" << (predicates.size() - base_size)
+              << " assignments=" << assignments.size()
+              << " depth=" << completed_depth
+              << " reached_cap=" << (reached_cap ? 1 : 0) << '\n';
+  }
+  return basis;
+}
+
+enum class wp_seed_modet
+{
+  BASE,
+  ALL,
+  CONTROL,
+  ASSUME,
+  GOTO,
+  ERROR_CONTROL_GOTO,
+  RHS
+};
+
+const char *wp_seed_mode_name(wp_seed_modet mode)
+{
+  switch(mode)
+  {
+  case wp_seed_modet::BASE:
+    return "base";
+  case wp_seed_modet::ALL:
+    return "all";
+  case wp_seed_modet::CONTROL:
+    return "control";
+  case wp_seed_modet::ASSUME:
+    return "assume";
+  case wp_seed_modet::GOTO:
+    return "goto";
+  case wp_seed_modet::ERROR_CONTROL_GOTO:
+    return "error-control-goto";
+  case wp_seed_modet::RHS:
+    return "rhs";
+  }
+  UNREACHABLE;
+  return "invalid";
+}
+
+bool parse_wp_seed_mode(wp_seed_modet &mode)
+{
+  const char *raw = std::getenv("DEAGLE_WP_SEED_MODE");
+  if(raw == nullptr)
+  {
+    mode = wp_seed_modet::BASE;
+    return true;
+  }
+  if(std::string(raw) == "all")
+  {
+    mode = wp_seed_modet::ALL;
+    return true;
+  }
+  if(std::string(raw) == "control")
+    mode = wp_seed_modet::CONTROL;
+  else if(std::string(raw) == "assume")
+    mode = wp_seed_modet::ASSUME;
+  else if(std::string(raw) == "goto")
+    mode = wp_seed_modet::GOTO;
+  else if(std::string(raw) == "error-control-goto")
+    mode = wp_seed_modet::ERROR_CONTROL_GOTO;
+  else if(std::string(raw) == "rhs")
+    mode = wp_seed_modet::RHS;
+  else
+    return false;
+  return true;
+}
+
+bool parse_wp_max_depth(unsigned &depth)
+{
+  const char *raw = std::getenv("DEAGLE_WP_MAX_DEPTH");
+  if(raw == nullptr || std::string(raw) == "3")
+    depth = 3;
+  else if(std::string(raw) == "2")
+    depth = 2;
+  else if(std::string(raw) == "1")
+    depth = 1;
+  else
+    return false;
+  return true;
+}
+
+struct wp_seed_collectiont
+{
+  std::vector<exprt> seeds;
+  std::size_t assertions = 0;
+  std::size_t assume_instructions = 0;
+  std::size_t goto_instructions = 0;
+  std::size_t selected_control_gotos = 0;
+  std::size_t rhs_instructions = 0;
+};
+
+bool assertion_is_reachable(
+  const goto_programt &program,
+  goto_programt::const_targett start)
+{
+  std::deque<goto_programt::const_targett> pending;
+  pending.push_back(start);
+  std::set<const goto_programt::instructiont *> visited;
+  while(!pending.empty())
+  {
+    const auto current = pending.front();
+    pending.pop_front();
+    if(!visited.insert(&*current).second)
+      continue;
+    if(current->is_assert())
+      return true;
+    for(const auto successor : program.get_successors(current))
+      pending.push_back(successor);
+  }
+  return false;
+}
+
+bool goto_controls_assertion(
+  const goto_programt &program,
+  goto_programt::const_targett target)
+{
+  const auto successors = program.get_successors(target);
+  if(successors.size() < 2)
+    return false;
+  std::size_t reaching_successors = 0;
+  for(const auto successor : successors)
+  {
+    if(assertion_is_reachable(program, successor))
+      ++reaching_successors;
+  }
+  return reaching_successors != 0 &&
+         reaching_successors != successors.size();
+}
+
+wp_seed_collectiont collect_wp_seeds(
+  const goto_functionst::goto_functiont &function,
+  wp_seed_modet mode)
+{
+  std::unordered_set<exprt, irep_hash> seeds;
+  wp_seed_collectiont result;
+  for(auto instruction = function.body.instructions.begin();
+      instruction != function.body.instructions.end(); ++instruction)
+  {
+    if(instruction->is_assert())
+      ++result.assertions;
+    if(instruction->is_assume())
+    {
+      ++result.assume_instructions;
+      if(mode == wp_seed_modet::ALL || mode == wp_seed_modet::CONTROL ||
+         mode == wp_seed_modet::ASSUME)
+        collect_boolean_atoms(instruction->condition(), seeds);
+    }
+    if(instruction->is_goto())
+    {
+      ++result.goto_instructions;
+      const bool controls_assertion =
+        goto_controls_assertion(function.body, instruction);
+      if(mode == wp_seed_modet::ALL || mode == wp_seed_modet::CONTROL ||
+         mode == wp_seed_modet::GOTO ||
+         (mode == wp_seed_modet::ERROR_CONTROL_GOTO && controls_assertion))
+      {
+        collect_boolean_atoms(instruction->condition(), seeds);
+        if(controls_assertion)
+          ++result.selected_control_gotos;
+      }
+    }
+    if(instruction->is_assign())
+    {
+      ++result.rhs_instructions;
+      if(mode == wp_seed_modet::ALL || mode == wp_seed_modet::RHS)
+        collect_boolean_atoms(instruction->assign_rhs(), seeds);
+    }
+  }
+  result.seeds.assign(seeds.begin(), seeds.end());
+  return result;
+}
+
+std::vector<exprt> wp_predicate_closure(
+  const irep_idt &entry,
+  const goto_functionst::goto_functiont &function,
+  const namespacet &ns,
+  const std::vector<exprt> &basis,
+  const std::vector<exprt> &seeds,
+  wp_seed_modet mode,
+  unsigned max_wp_depth,
+  const wp_seed_collectiont &local_seed_collection)
+{
+  std::unordered_set<exprt, irep_hash> predicates(
+    basis.begin(), basis.end());
+  std::vector<std::pair<symbol_exprt, exprt>> assignments;
+  for(const auto &instruction : function.body.instructions)
+  {
+    if(
+      !instruction.is_assign() ||
+      instruction.assign_lhs().id() != ID_symbol ||
+      has_subexpr(instruction.assign_rhs(), ID_side_effect) ||
+      has_subexpr(instruction.assign_rhs(), ID_dereference))
+      continue;
+    assignments.emplace_back(
+      to_symbol_expr(instruction.assign_lhs()), instruction.assign_rhs());
+  }
+
+  std::vector<exprt> frontier(seeds.begin(), seeds.end());
+  constexpr std::size_t max_wp_predicates = 64;
+  unsigned completed_depth = 0;
+  bool reached_cap = false;
+  for(unsigned depth = 1;
+      depth <= max_wp_depth && !frontier.empty() && !reached_cap; ++depth)
+  {
+    std::vector<exprt> next_frontier;
+    for(const auto &predicate : frontier)
+    {
+      for(const auto &assignment : assignments)
+      {
+        exprt preimage = predicate;
+        replace_symbolt replacement;
+        replacement.set(assignment.first, assignment.second);
+        if(replacement.replace(preimage))
+          continue;
+        preimage = simplify_expr(std::move(preimage), ns);
+        if(
+          preimage.is_true() || preimage.is_false() ||
+          preimage.type().id() != ID_bool ||
+          has_subexpr(preimage, ID_side_effect) ||
+          has_subexpr(preimage, ID_dereference))
+          continue;
+        if(predicates.insert(preimage).second)
+        {
+          next_frontier.push_back(std::move(preimage));
+          if(predicates.size() >= max_wp_predicates)
+          {
+            reached_cap = true;
+            break;
+          }
+        }
+      }
+      if(reached_cap)
+        break;
+    }
+    completed_depth = depth;
+    frontier = std::move(next_frontier);
+  }
+  std::cout << "INTERFERENCE_WP_MODE entry=" << entry
+            << " mode=" << wp_seed_mode_name(mode)
+            << " base=" << basis.size() << " seeds=" << seeds.size()
+            << " candidate=" << predicates.size()
+            << " added=" << (predicates.size() - basis.size())
+            << " assignments=" << assignments.size()
+            << " assertions=" << local_seed_collection.assertions
+            << " local_assume_instructions="
+            << local_seed_collection.assume_instructions
+            << " local_goto_instructions="
+            << local_seed_collection.goto_instructions
+            << " local_selected_control_gotos="
+            << local_seed_collection.selected_control_gotos
+            << " local_rhs_instructions="
+            << local_seed_collection.rhs_instructions
+            << " max_depth=" << max_wp_depth
+            << " depth=" << completed_depth
+            << " reached_cap=" << (reached_cap ? 1 : 0) << '\n';
+  if(reached_cap)
+    return basis;
   return std::vector<exprt>(predicates.begin(), predicates.end());
 }
 
@@ -1694,6 +2609,567 @@ struct interference_effectt
   std::vector<interference_predicate_operationt> operations;
 };
 
+struct finite_product_threadt
+{
+  irep_idt entry;
+  const goto_programt *program = nullptr;
+  std::vector<goto_programt::const_targett> locations;
+  std::map<const goto_programt::instructiont *, std::size_t> indices;
+  std::map<std::size_t, std::size_t> spawn_workers;
+  std::map<std::size_t, std::size_t> join_workers;
+};
+
+struct finite_product_statet
+{
+  std::vector<std::size_t> pcs;
+  std::vector<bool> active;
+  std::vector<bool> completed;
+  std::vector<exprt> values;
+  int atomic_owner = -1;
+};
+
+class finite_product_runnert
+{
+public:
+  finite_product_runnert(
+    goto_modelt &model,
+    const std::vector<irep_idt> &thread_ids,
+    const std::vector<bool> &may_have_multiple_instances)
+    : model(model), ns(model.symbol_table)
+  {
+    if(thread_ids.size() < 2 || thread_ids.size() > max_workers)
+    {
+      fail("worker_count");
+      return;
+    }
+    if(thread_ids.size() != may_have_multiple_instances.size())
+    {
+      fail("worker_metadata");
+      return;
+    }
+    for(std::size_t index = 1; index < may_have_multiple_instances.size(); ++index)
+    {
+      if(may_have_multiple_instances[index])
+      {
+        fail("multiple_worker_instances");
+        return;
+      }
+    }
+
+    for(const auto &thread_id : thread_ids)
+    {
+      const auto function = model.goto_functions.function_map.find(thread_id);
+      if(
+        function == model.goto_functions.function_map.end() ||
+        !function->second.body_available())
+      {
+        fail("missing_thread_body");
+        return;
+      }
+      if(function->second.body.instructions.size() > max_locations_per_worker)
+      {
+        fail("location_cap");
+        return;
+      }
+      finite_product_threadt thread;
+      thread.entry = thread_id;
+      thread.program = &function->second.body;
+      for(auto location = thread.program->instructions.begin();
+          location != thread.program->instructions.end(); ++location)
+      {
+        thread.indices.emplace(&*location, thread.locations.size());
+        thread.locations.push_back(location);
+      }
+      threads.push_back(std::move(thread));
+    }
+
+    collect_shared_symbols();
+    if(failed)
+      return;
+    if(symbols.empty() || symbols.size() > max_symbols)
+    {
+      fail("symbol_count");
+      return;
+    }
+    audit_lifecycle(thread_ids);
+    if(failed)
+      return;
+    audit_instructions();
+  }
+
+  interference_predicate_resultt run()
+  {
+    if(failed)
+      return report_unknown();
+
+    finite_product_statet initial;
+    initial.pcs.assign(threads.size(), 0);
+    initial.active.assign(threads.size(), false);
+    initial.completed.assign(threads.size(), false);
+    initial.active.front() = true;
+    for(const auto &identifier : symbols)
+    {
+      const symbolt *symbol = nullptr;
+      if(ns.lookup(identifier, symbol))
+        return fail_run("missing_symbol");
+      exprt value = symbol->value;
+      if(value.is_nil() && symbol->is_static_lifetime)
+        value = from_integer(0, symbol->type);
+      if(value.is_not_nil())
+        value = simplify_expr(std::move(value), ns);
+      if(value.is_not_nil() && !is_exact_constant(value))
+        return fail_run("nonconstant_initializer");
+      initial.values.push_back(std::move(value));
+    }
+
+    std::deque<finite_product_statet> pending;
+    std::unordered_set<std::string> visited;
+    visited.insert(key(initial));
+    pending.push_back(std::move(initial));
+
+    while(!pending.empty())
+    {
+      finite_product_statet state = std::move(pending.front());
+      pending.pop_front();
+      for(std::size_t thread_index = 0; thread_index < threads.size();
+          ++thread_index)
+      {
+        if(
+          !state.active[thread_index] ||
+          (state.atomic_owner >= 0 &&
+           state.atomic_owner != static_cast<int>(thread_index)))
+          continue;
+        std::vector<finite_product_statet> successors;
+        if(!step(thread_index, state, successors))
+          return report_unknown();
+        for(auto &successor : successors)
+        {
+          ++transition_count;
+          if(transition_count > max_transitions)
+            return fail_run("transition_cap");
+          const std::string state_key = key(successor);
+          if(visited.insert(state_key).second)
+          {
+            if(visited.size() > max_states)
+              return fail_run("state_cap");
+            pending.push_back(std::move(successor));
+          }
+        }
+      }
+    }
+
+    std::cout << "V225_FINITE_PRODUCT result=SAFE workers="
+              << threads.size() - 1 << " symbols=" << symbols.size()
+              << " states=" << visited.size()
+              << " transitions=" << transition_count << '\n';
+    return interference_predicate_resultt::SAFE;
+  }
+
+private:
+  static constexpr std::size_t max_workers = 5;
+  static constexpr std::size_t max_symbols = 16;
+  static constexpr std::size_t max_locations_per_worker = 256;
+  static constexpr std::size_t max_states = 100000;
+  static constexpr std::size_t max_transitions = 1000000;
+
+  goto_modelt &model;
+  namespacet ns;
+  std::vector<finite_product_threadt> threads;
+  std::vector<irep_idt> symbols;
+  std::map<irep_idt, std::size_t> symbol_indices;
+  bool failed = false;
+  std::string failure_reason;
+  std::size_t transition_count = 0;
+
+  void fail(const std::string &reason)
+  {
+    failed = true;
+    failure_reason = reason;
+  }
+
+  interference_predicate_resultt fail_run(const std::string &reason)
+  {
+    fail(reason);
+    return report_unknown();
+  }
+
+  interference_predicate_resultt report_unknown() const
+  {
+    std::cout << "V225_FINITE_PRODUCT result=UNKNOWN reason="
+              << failure_reason << " states_or_transitions="
+              << transition_count << '\n';
+    return interference_predicate_resultt::UNKNOWN;
+  }
+
+  static bool is_exact_constant(const exprt &expr)
+  {
+    return expr.is_true() || expr.is_false() || expr.id() == ID_constant;
+  }
+
+  void collect_expr_symbols(const exprt &expr, std::set<irep_idt> &result)
+  {
+    if(expr.id() == ID_symbol)
+    {
+      const auto &identifier = to_symbol_expr(expr).get_identifier();
+      const symbolt *symbol = nullptr;
+      if(!ns.lookup(identifier, symbol) && !symbol->is_type &&
+         symbol->type.id() != ID_pointer &&
+         symbol->type.id() != ID_array)
+        result.insert(identifier);
+    }
+    for(const auto &operand : expr.operands())
+      collect_expr_symbols(operand, result);
+  }
+
+  void collect_shared_symbols()
+  {
+    std::set<irep_idt> found;
+    for(const auto &thread : threads)
+    {
+      for(const auto location : thread.locations)
+      {
+        if(location->is_assign())
+        {
+          collect_expr_symbols(location->assign_lhs(), found);
+          collect_expr_symbols(location->assign_rhs(), found);
+        }
+        else if(
+          location->is_assume() || location->is_assert() ||
+          location->is_goto())
+          collect_expr_symbols(location->condition(), found);
+      }
+    }
+    symbols.assign(found.begin(), found.end());
+    for(std::size_t index = 0; index < symbols.size(); ++index)
+      symbol_indices.emplace(symbols[index], index);
+  }
+
+  void audit_lifecycle(const std::vector<irep_idt> &thread_ids)
+  {
+    for(std::size_t thread_index = 0; thread_index < threads.size();
+        ++thread_index)
+    {
+      auto &thread = threads[thread_index];
+      for(std::size_t pc = 0; pc < thread.locations.size(); ++pc)
+      {
+        const auto location = thread.locations[pc];
+        const irep_idt &spawn_entry =
+          location->source_location().get("v49_thread_entry");
+        if(spawn_entry != irep_idt())
+        {
+          if(thread_index != 0)
+            return fail("nested_thread_creation");
+          const auto worker =
+            std::find(thread_ids.begin() + 1, thread_ids.end(), spawn_entry);
+          if(worker == thread_ids.end())
+            return fail("spawn_target_not_found");
+          thread.spawn_workers.emplace(
+            pc, static_cast<std::size_t>(worker - thread_ids.begin()));
+        }
+        const irep_idt &join_entry =
+          location->source_location().get("v49_join_entry");
+        if(join_entry != irep_idt())
+        {
+          if(thread_index != 0)
+            return fail("worker_join");
+          const auto worker =
+            std::find(thread_ids.begin() + 1, thread_ids.end(), join_entry);
+          if(worker == thread_ids.end())
+            return fail("join_target_not_found");
+          thread.join_workers.emplace(
+            pc, static_cast<std::size_t>(worker - thread_ids.begin()));
+        }
+        if(location->source_location().get_bool("v49_unresolved_join"))
+          return fail("unresolved_join");
+      }
+    }
+    for(std::size_t worker = 1; worker < threads.size(); ++worker)
+    {
+      std::size_t spawns = 0;
+      for(const auto &spawn : threads.front().spawn_workers)
+        spawns += spawn.second == worker ? 1 : 0;
+      if(spawns != 1)
+        return fail("worker_spawn_count");
+    }
+  }
+
+  bool expression_supported(const exprt &expr) const
+  {
+    if(expr.id() == ID_symbol)
+    {
+      const auto &identifier = to_symbol_expr(expr).get_identifier();
+      return symbol_indices.find(identifier) != symbol_indices.end();
+    }
+    if(
+      expr.id() == ID_dereference || expr.id() == ID_index ||
+      expr.id() == ID_address_of || expr.id() == ID_side_effect)
+      return false;
+    for(const auto &operand : expr.operands())
+    {
+      if(!expression_supported(operand))
+        return false;
+    }
+    return true;
+  }
+
+  void audit_instructions()
+  {
+    for(const auto &thread : threads)
+    {
+      unsigned atomic_depth = 0;
+      for(const auto location : thread.locations)
+      {
+        if(location->is_atomic_begin())
+        {
+          if(atomic_depth != 0)
+            return fail("nested_atomic");
+          ++atomic_depth;
+        }
+        else if(location->is_atomic_end())
+        {
+          if(atomic_depth != 1)
+            return fail("unbalanced_atomic_end");
+          --atomic_depth;
+        }
+        else if(location->is_assign())
+        {
+          const exprt &lhs = location->assign_lhs();
+          if(lhs.id() == ID_symbol)
+          {
+            const auto tracked =
+              symbol_indices.find(to_symbol_expr(lhs).get_identifier());
+            if(
+              tracked != symbol_indices.end() &&
+              !expression_supported(location->assign_rhs()))
+              return fail("unsupported_shared_rhs");
+          }
+          else
+            return fail("unsupported_shared_lhs");
+        }
+        else if(
+          (location->is_assume() || location->is_assert() ||
+           location->is_goto()) &&
+          !expression_supported(location->condition()))
+        {
+          std::cout << "V225_FINITE_PRODUCT_REJECT location="
+                    << location->location_number << " condition={"
+                    << from_expr(ns, thread.entry, location->condition())
+                    << "}\n";
+          return fail("unsupported_condition");
+        }
+        else if(
+          location->is_function_call() || location->is_start_thread() ||
+          location->is_throw() || location->is_catch() ||
+          (location->is_other() && !is_abstract_noop_other(*location)))
+          return fail("unsupported_instruction");
+      }
+      if(atomic_depth != 0)
+        return fail("unbalanced_atomic_begin");
+    }
+  }
+
+  bool evaluate(
+    const exprt &input,
+    const finite_product_statet &state,
+    exprt &result)
+  {
+    replace_symbolt replacement;
+    for(std::size_t index = 0; index < symbols.size(); ++index)
+    {
+      if(state.values[index].is_not_nil())
+      {
+        const symbolt *symbol = nullptr;
+        if(ns.lookup(symbols[index], symbol))
+        {
+          fail("missing_evaluation_symbol");
+          return false;
+        }
+        replacement.insert(
+          symbol_exprt(symbols[index], symbol->type),
+          state.values[index]);
+      }
+    }
+    result = input;
+    replacement.replace(result);
+    result = simplify_expr(std::move(result), ns);
+    if(!is_exact_constant(result))
+    {
+      fail("nonconstant_evaluation");
+      return false;
+    }
+    return true;
+  }
+
+  std::size_t index_of(
+    const finite_product_threadt &thread,
+    goto_programt::const_targett location)
+  {
+    const auto found = thread.indices.find(&*location);
+    if(found == thread.indices.end())
+    {
+      fail("successor_not_found");
+      return thread.locations.size();
+    }
+    return found->second;
+  }
+
+  bool advance(
+    std::size_t thread_index,
+    const finite_product_statet &state,
+    std::vector<finite_product_statet> &successors,
+    goto_programt::const_targett successor)
+  {
+    finite_product_statet next = state;
+    next.pcs[thread_index] = index_of(threads[thread_index], successor);
+    if(failed)
+      return false;
+    successors.push_back(std::move(next));
+    return true;
+  }
+
+  bool step(
+    std::size_t thread_index,
+    const finite_product_statet &state,
+    std::vector<finite_product_statet> &successors)
+  {
+    const auto &thread = threads[thread_index];
+    const std::size_t pc = state.pcs[thread_index];
+    if(pc >= thread.locations.size())
+      return true;
+    const auto location = thread.locations[pc];
+
+    const auto join = thread.join_workers.find(pc);
+    if(join != thread.join_workers.end() && !state.completed[join->second])
+      return true;
+
+    const auto spawn = thread.spawn_workers.find(pc);
+    if(spawn != thread.spawn_workers.end())
+    {
+      if(state.active[spawn->second] || state.completed[spawn->second])
+        return fail_step("worker_reactivation");
+    }
+
+    if(location->is_end_function())
+    {
+      finite_product_statet next = state;
+      next.active[thread_index] = false;
+      next.completed[thread_index] = true;
+      next.pcs[thread_index] = thread.locations.size();
+      if(next.atomic_owner == static_cast<int>(thread_index))
+        return fail_step("atomic_end_function");
+      successors.push_back(std::move(next));
+      return true;
+    }
+
+    auto next_location = std::next(location);
+    if(next_location == thread.program->instructions.end())
+      return fail_step("missing_fallthrough");
+
+    finite_product_statet base = state;
+    if(spawn != thread.spawn_workers.end())
+      base.active[spawn->second] = true;
+
+    if(location->is_atomic_begin())
+    {
+      if(base.atomic_owner != -1)
+        return fail_step("nested_atomic_runtime");
+      base.atomic_owner = static_cast<int>(thread_index);
+    }
+    else if(location->is_atomic_end())
+    {
+      if(base.atomic_owner != static_cast<int>(thread_index))
+        return fail_step("atomic_owner");
+      base.atomic_owner = -1;
+    }
+    else if(location->is_assign())
+    {
+      const exprt &lhs = location->assign_lhs();
+      if(lhs.id() == ID_symbol)
+      {
+        const auto tracked =
+          symbol_indices.find(to_symbol_expr(lhs).get_identifier());
+        if(tracked != symbol_indices.end())
+        {
+          exprt rhs;
+          if(!evaluate(location->assign_rhs(), base, rhs))
+            return false;
+          if(rhs.type() != lhs.type())
+            rhs = typecast_exprt::conditional_cast(
+              rhs, lhs.type());
+          rhs = simplify_expr(std::move(rhs), ns);
+          if(!is_exact_constant(rhs))
+            return fail_step("assignment_cast");
+          base.values[tracked->second] = std::move(rhs);
+        }
+      }
+    }
+    else if(location->is_assert())
+    {
+      exprt condition;
+      if(!evaluate(location->condition(), base, condition))
+        return false;
+      if(condition.is_false())
+        return fail_step("reachable_assertion");
+      if(!condition.is_true())
+        return fail_step("nonboolean_assertion");
+    }
+    else if(location->is_assume())
+    {
+      exprt condition;
+      if(!evaluate(location->condition(), base, condition))
+        return false;
+      if(condition.is_false())
+        return true;
+      if(!condition.is_true())
+        return fail_step("nonboolean_assumption");
+    }
+    else if(location->is_goto())
+    {
+      exprt condition;
+      if(!evaluate(location->condition(), base, condition))
+        return false;
+      goto_programt::const_targett successor;
+      if(condition.is_true())
+        successor = location->get_target();
+      else if(condition.is_false())
+        successor = next_location;
+      else
+        return fail_step("nonboolean_guard");
+      finite_product_statet next = std::move(base);
+      next.pcs[thread_index] = index_of(thread, successor);
+      if(failed)
+        return false;
+      successors.push_back(std::move(next));
+      return true;
+    }
+
+    base.pcs[thread_index] = index_of(thread, next_location);
+    if(failed)
+      return false;
+    successors.push_back(std::move(base));
+    return true;
+  }
+
+  bool fail_step(const std::string &reason)
+  {
+    fail(reason);
+    return false;
+  }
+
+  std::string key(const finite_product_statet &state) const
+  {
+    std::ostringstream out;
+    out << state.atomic_owner << ':';
+    for(std::size_t index = 0; index < state.pcs.size(); ++index)
+      out << state.pcs[index] << ',' << state.active[index] << ','
+          << state.completed[index] << ';';
+    out << '|';
+    for(const auto &value : state.values)
+      out << (value.is_nil() ? "<uninitialized>" : value.pretty()) << ';';
+    return out.str();
+  }
+};
+
 class fixedpoint_runnert
 {
 public:
@@ -1712,6 +3188,20 @@ public:
   {
     PRECONDITION(
       thread_ids.size() == may_have_multiple_instances.size());
+    wp_seed_modet seed_mode;
+    if(!parse_wp_seed_mode(seed_mode))
+    {
+      failed = true;
+      failure_reason = "invalid_wp_seed_mode";
+      return;
+    }
+    unsigned wp_max_depth;
+    if(!parse_wp_max_depth(wp_max_depth))
+    {
+      failed = true;
+      failure_reason = "invalid_wp_max_depth";
+      return;
+    }
     for(std::size_t worker = 0; worker < thread_ids.size(); ++worker)
     {
       std::ostringstream identifier;
@@ -1719,6 +3209,7 @@ public:
       completion_symbols.emplace_back(identifier.str(), bool_typet());
     }
     std::unordered_set<exprt, irep_hash> shared_predicates;
+    std::unordered_set<exprt, irep_hash> shared_seeds;
     for(std::size_t worker = 1; worker < completion_symbols.size(); ++worker)
       shared_predicates.insert(completion_symbols[worker]);
     for(const auto &predicate : extra_predicates)
@@ -1730,10 +3221,17 @@ public:
         function_it == model.goto_functions.function_map.end() ||
         !function_it->second.body_available())
         continue;
-      for(const auto &predicate : predicate_basis(function_it->second))
+      for(const auto &predicate :
+          predicate_basis(thread_id, function_it->second, ns, false))
       {
         if(uses_only_shared_symbols(predicate, ns))
           shared_predicates.insert(predicate);
+      }
+      for(const auto &predicate :
+          collect_wp_seeds(function_it->second, seed_mode).seeds)
+      {
+        if(uses_only_shared_symbols(predicate, ns))
+          shared_seeds.insert(predicate);
       }
     }
 
@@ -1756,7 +3254,8 @@ public:
       thread.may_have_multiple_instances =
         may_have_multiple_instances[thread_index];
       thread.program = &function_it->second.body;
-      thread.predicates = predicate_basis(function_it->second);
+      thread.predicates =
+        predicate_basis(thread_id, function_it->second, ns, false);
       for(const auto &predicate : thread.predicates)
       {
         if(has_subexpr(predicate, ID_dereference))
@@ -1773,6 +3272,31 @@ public:
         if(own_predicates.insert(predicate).second)
           thread.predicates.push_back(predicate);
       }
+      const wp_seed_collectiont local_seed_collection =
+        collect_wp_seeds(function_it->second, seed_mode);
+      std::vector<exprt> origin_seeds;
+      if(seed_mode == wp_seed_modet::ALL)
+        origin_seeds = thread.predicates;
+      else
+      {
+        origin_seeds = local_seed_collection.seeds;
+        std::unordered_set<exprt, irep_hash> own_seeds(
+          origin_seeds.begin(), origin_seeds.end());
+        for(const auto &predicate : shared_seeds)
+        {
+          if(own_seeds.insert(predicate).second)
+            origin_seeds.push_back(predicate);
+        }
+      }
+      thread.predicates = wp_predicate_closure(
+        thread_id,
+        function_it->second,
+        ns,
+        thread.predicates,
+        origin_seeds,
+        seed_mode,
+        wp_max_depth,
+        local_seed_collection);
       if(thread.predicates.size() > max_predicates)
       {
         failed = true;
@@ -2412,8 +3936,30 @@ private:
 
       if(path.location->is_assign())
       {
-        if(path.location->assign_lhs().id() != ID_symbol)
+        exprt lhs =
+          simplify_expr(path.location->assign_lhs(), ns);
+        if(lhs.id() == ID_dereference)
         {
+          exprt pointer =
+            simplify_expr(to_dereference_expr(lhs).pointer(), ns);
+          if(pointer.id() == ID_address_of)
+          {
+            const exprt &object =
+              skip_typecast(to_address_of_expr(pointer).object());
+            if(object.id() == ID_symbol)
+              lhs = object;
+          }
+        }
+        if(lhs.id() != ID_symbol)
+        {
+          std::cout << "INTERFERENCE_ATOMIC_LHS_AUDIT id=" << lhs.id()
+                    << " expr=" << from_expr(ns, irep_idt(), lhs);
+          if(lhs.id() == ID_dereference)
+            std::cout << " pointer_id="
+                      << to_dereference_expr(lhs).pointer().id()
+                      << " pointer="
+                      << to_dereference_expr(lhs).pointer().pretty();
+          std::cout << '\n';
           failed = true;
           failure_reason = "unsupported_atomic_assignment_lhs";
           return;
@@ -2428,11 +3974,11 @@ private:
           failure_reason = "unsupported_atomic_rhs_dereference";
           return;
         }
-        path.writes_shared = path.writes_shared ||
-                             is_shared_scalar(path.location->assign_lhs(), ns);
+        path.writes_shared =
+          path.writes_shared || is_shared_scalar(lhs, ns);
         path.operations.push_back(
           interference_predicate_operationt::assignment(
-            path.location->assign_lhs(), rhs));
+            lhs, rhs));
       }
       else if(path.location->is_assume())
         path.operations.push_back(
@@ -2711,6 +4257,8 @@ interference_predicate_resultt interference_predicate_fixedpoint(
     return interference_predicate_resultt::UNKNOWN;
   }
   const bool affine_mode = std::getenv("DEAGLE_AFFINE_MODE") != nullptr;
+  const bool ownership_mode =
+    std::getenv("DEAGLE_LOCK_OWNERSHIP_MODE") != nullptr;
   std::string affine_failure_reason;
   if(affine_mode && !repeated_single_worker_only)
   {
@@ -2740,8 +4288,19 @@ interference_predicate_resultt interference_predicate_fixedpoint(
   goto_modelt analysis_model;
   analysis_model.symbol_table = goto_model.symbol_table;
   analysis_model.goto_functions.copy_from(goto_model.goto_functions);
+  if(ownership_mode)
+  {
+    std::string ticket_reason;
+    std::size_t ticket_regions = 0;
+    if(!rewrite_ticket_lock_ownership(
+         analysis_model, ticket_reason, ticket_regions))
+      std::cout << "INTERFERENCE_TICKET_OWNERSHIP regions=0 reason="
+                << ticket_reason << '\n';
+  }
   if(!neutralize_synchronization_calls(
-       analysis_model, affine_mode, &affine_failure_reason))
+       analysis_model,
+       affine_mode || ownership_mode,
+       &affine_failure_reason))
   {
     std::cout << "INTERFERENCE_PREDICATE_FIXEDPOINT result=UNKNOWN reason="
               << affine_failure_reason << '\n';
@@ -2770,6 +4329,38 @@ interference_predicate_resultt interference_predicate_fixedpoint(
   for(const auto &thread_id : thread_ids)
     goto_function_inline(analysis_model, thread_id, message_handler, false, false);
   analysis_model.goto_functions.update();
+
+  std::string ownership_reason;
+  std::size_t ownership_regions = 0;
+  std::size_t ownership_objects = 0;
+  if(!validate_mutex_ownership(
+       analysis_model,
+       thread_ids,
+       ownership_reason,
+       ownership_regions,
+       ownership_objects))
+  {
+    std::cout << "INTERFERENCE_PREDICATE_FIXEDPOINT result=UNKNOWN reason="
+              << ownership_reason << " ownership_regions="
+              << ownership_regions << " protected_objects="
+              << ownership_objects << '\n';
+    return interference_predicate_resultt::UNKNOWN;
+  }
+  if(ownership_regions != 0)
+    std::cout << "INTERFERENCE_OWNERSHIP regions=" << ownership_regions
+              << " protected_objects=" << ownership_objects << '\n';
+
+  if(
+    std::getenv("DEAGLE_FINITE_PROTOCOL_PRODUCT") != nullptr &&
+    !repeated_single_worker_only)
+  {
+    finite_product_runnert finite_product(
+      analysis_model, thread_ids, thread_multiple_instances);
+    const auto result = finite_product.run();
+    if(result == interference_predicate_resultt::SAFE)
+      return result;
+    std::cout << "V225_FINITE_PRODUCT_FALLBACK fixedpoint=1\n";
+  }
 
   if(repeated_single_worker_only)
   {

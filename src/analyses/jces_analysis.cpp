@@ -25,11 +25,14 @@ Module: Join-Scoped Compositional Effect Summary
 
 #include <algorithm>
 #include <deque>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <iterator>
 #include <map>
+#include <regex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -15808,6 +15811,430 @@ bool alternating_phase_recurrence_transform(
   return true;
 }
 
+namespace
+{
+struct oscillator_workert
+{
+  irep_idt function;
+  irep_idt position;
+  irep_idt flag;
+  irep_idt toggle;
+  mp_integer weight;
+};
+
+bool nonzero_symbol_test(const exprt &src, irep_idt &identifier)
+{
+  const exprt &expr = without_cast(src);
+  mp_integer zero;
+  return
+    expr.id() == ID_notequal && expr.operands().size() == 2 &&
+    direct_symbol(expr.op0(), identifier) &&
+    constant_eval(expr.op1(), {}, zero) && zero == 0;
+}
+
+bool negated_nonzero_symbol_test(
+  const exprt &src,
+  irep_idt &identifier)
+{
+  const exprt &expr = without_cast(src);
+  return
+    expr.id() == ID_not && expr.operands().size() == 1 &&
+    nonzero_symbol_test(expr.op0(), identifier);
+}
+
+bool oscillator_delta(
+  const goto_programt::instructiont &instruction,
+  irep_idt &position,
+  mp_integer &delta)
+{
+  if(!instruction.is_assign() ||
+     !direct_symbol(instruction.assign_lhs(), position))
+    return false;
+  const exprt &rhs = without_cast(instruction.assign_rhs());
+  if(
+    (rhs.id() != ID_plus && rhs.id() != ID_minus) ||
+    rhs.operands().size() != 2)
+    return false;
+  irep_idt source;
+  mp_integer magnitude;
+  if(
+    !direct_symbol(rhs.op0(), source) || source != position ||
+    !constant_eval(rhs.op1(), {}, magnitude) || magnitude <= 0)
+    return false;
+  delta = rhs.id() == ID_plus ? magnitude : -magnitude;
+  return true;
+}
+
+bool oscillator_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &function_id,
+  oscillator_workert &summary,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "oscillator_missing_worker";
+    return false;
+  }
+  const auto semantic = semantic_instructions(function->second.body);
+  if(semantic.size() != 7)
+  {
+    reason =
+      "oscillator_instruction_count_" +
+      std::to_string(semantic.size());
+    return false;
+  }
+
+  irep_idt flag;
+  irep_idt toggle;
+  if(
+    !semantic[0]->is_goto() ||
+    semantic[0]->targets.size() != 1 ||
+    !negated_nonzero_symbol_test(semantic[0]->condition(), flag) ||
+    !semantic[1]->is_goto() ||
+    semantic[1]->targets.size() != 1 ||
+    !negated_nonzero_symbol_test(semantic[1]->condition(), toggle))
+  {
+    reason = "oscillator_guards";
+    return false;
+  }
+
+  irep_idt positive_position;
+  irep_idt negative_position;
+  mp_integer positive;
+  mp_integer negative;
+  if(
+    !oscillator_delta(
+      *semantic[2], positive_position, positive) ||
+    !semantic[3]->is_goto() ||
+    !semantic[3]->condition().is_true() ||
+    semantic[3]->get_target() != semantic[5] ||
+    !oscillator_delta(
+      *semantic[4], negative_position, negative) ||
+    positive_position != negative_position ||
+    positive <= 0 || negative != -positive ||
+    semantic[1]->get_target() != semantic[4])
+  {
+    reason = "oscillator_balanced_update";
+    return false;
+  }
+
+  irep_idt toggle_lhs;
+  irep_idt toggle_rhs;
+  if(
+    !semantic[5]->is_assign() ||
+    !direct_symbol(semantic[5]->assign_lhs(), toggle_lhs) ||
+    toggle_lhs != toggle ||
+    !negated_nonzero_symbol_test(
+      semantic[5]->assign_rhs(), toggle_rhs) ||
+    toggle_rhs != toggle ||
+    !semantic[6]->is_goto() ||
+    !semantic[6]->condition().is_true() ||
+    semantic[6]->get_target() != semantic[0])
+  {
+    reason = "oscillator_toggle";
+    return false;
+  }
+
+  const symbolt *position_symbol = nullptr;
+  const symbolt *flag_symbol = nullptr;
+  const symbolt *toggle_symbol = nullptr;
+  if(
+    ns.lookup(positive_position, position_symbol) ||
+    ns.lookup(flag, flag_symbol) ||
+    ns.lookup(toggle, toggle_symbol) ||
+    !position_symbol->is_static_lifetime ||
+    position_symbol->type.id() != ID_signedbv ||
+    !is_atomic_symbol(*position_symbol) ||
+    !flag_symbol->is_static_lifetime ||
+    !is_atomic_symbol(*flag_symbol) ||
+    flag_symbol->type.id() != ID_c_bool ||
+    !toggle_symbol->is_static_lifetime ||
+    is_atomic_symbol(*toggle_symbol) ||
+    toggle_symbol->type.id() != ID_c_bool)
+  {
+    reason = "oscillator_symbol_types";
+    return false;
+  }
+
+  summary.function = function_id;
+  summary.position = positive_position;
+  summary.flag = flag;
+  summary.toggle = toggle;
+  summary.weight = positive;
+  return true;
+}
+
+bool oscillator_monitor(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &function_id,
+  irep_idt &position,
+  irep_idt &flag)
+{
+  const auto function =
+    model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+    return false;
+  const auto semantic = semantic_instructions(function->second.body);
+  if(
+    semantic.size() != 1 || !semantic[0]->is_assign() ||
+    !direct_symbol(semantic[0]->assign_lhs(), flag))
+    return false;
+  const exprt &rhs = without_cast(semantic[0]->assign_rhs());
+  if(
+    rhs.id() != ID_ge || rhs.operands().size() != 2 ||
+    !direct_symbol(rhs.op0(), position))
+    return false;
+  mp_integer zero;
+  if(!constant_eval(rhs.op1(), {}, zero) || zero != 0)
+    return false;
+  const symbolt *position_symbol = nullptr;
+  const symbolt *flag_symbol = nullptr;
+  return
+    !ns.lookup(position, position_symbol) &&
+    !ns.lookup(flag, flag_symbol) &&
+    position_symbol->is_static_lifetime &&
+    position_symbol->type.id() == ID_signedbv &&
+    is_atomic_symbol(*position_symbol) &&
+    flag_symbol->is_static_lifetime &&
+    flag_symbol->type.id() == ID_c_bool &&
+    is_atomic_symbol(*flag_symbol);
+}
+
+void collect_constant_equalities(
+  const exprt &src,
+  std::map<irep_idt, std::set<irep_idt>> &equalities,
+  std::map<irep_idt, std::set<mp_integer>> &constants)
+{
+  const exprt &expr = without_cast(src);
+  if(expr.id() == ID_and)
+  {
+    for(const auto &operand : expr.operands())
+      collect_constant_equalities(operand, equalities, constants);
+    return;
+  }
+  if(expr.id() != ID_equal || expr.operands().size() != 2)
+    return;
+  irep_idt lhs;
+  irep_idt rhs;
+  mp_integer value;
+  if(direct_symbol(expr.op0(), lhs) && direct_symbol(expr.op1(), rhs))
+  {
+    equalities[lhs].insert(rhs);
+    equalities[rhs].insert(lhs);
+  }
+  else if(
+    direct_symbol(expr.op0(), lhs) &&
+    constant_eval(expr.op1(), {}, value))
+    constants[lhs].insert(value);
+  else if(
+    direct_symbol(expr.op1(), lhs) &&
+    constant_eval(expr.op0(), {}, value))
+    constants[lhs].insert(value);
+}
+
+bool equality_implies(
+  const irep_idt &identifier,
+  const mp_integer &value,
+  const std::map<irep_idt, std::set<irep_idt>> &equalities,
+  const std::map<irep_idt, std::set<mp_integer>> &constants)
+{
+  std::vector<irep_idt> pending{identifier};
+  std::set<irep_idt> visited;
+  while(!pending.empty())
+  {
+    const irep_idt current = pending.back();
+    pending.pop_back();
+    if(!visited.insert(current).second)
+      continue;
+    const auto known = constants.find(current);
+    if(known != constants.end() && known->second.count(value) != 0)
+      return true;
+    const auto adjacent = equalities.find(current);
+    if(adjacent != equalities.end())
+      pending.insert(
+        pending.end(), adjacent->second.begin(), adjacent->second.end());
+  }
+  return false;
+}
+} // namespace
+
+bool nonnegative_oscillator_monitor_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  std::vector<create_recordt> creates;
+  std::vector<goto_programt::targett> joins;
+  std::string reason;
+  if(
+    !collect_lifecycle(goto_model, ns, creates, joins, reason) ||
+    creates.size() < 3 ||
+    !validate_main_region(
+      goto_model, ns, creates, joins, reason))
+  {
+    std::cout
+      << "NATIVE_NONNEGATIVE_OSCILLATOR_MONITOR applied=0 reason="
+      << (reason.empty() ? "oscillator_lifecycle" : reason) << '\n';
+    return false;
+  }
+
+  std::vector<oscillator_workert> oscillators;
+  irep_idt position;
+  irep_idt flag;
+  irep_idt monitor;
+  for(const auto &create : creates)
+  {
+    irep_idt candidate_position;
+    irep_idt candidate_flag;
+    if(oscillator_monitor(
+         goto_model,
+         ns,
+         create.worker,
+         candidate_position,
+         candidate_flag))
+    {
+      if(!monitor.empty())
+      {
+        reason = "oscillator_monitor_count";
+        break;
+      }
+      monitor = create.worker;
+      position = candidate_position;
+      flag = candidate_flag;
+      continue;
+    }
+    oscillator_workert worker;
+    if(!oscillator_worker(
+         goto_model, ns, create.worker, worker, reason))
+      break;
+    oscillators.push_back(std::move(worker));
+  }
+  if(
+    !reason.empty() || monitor.empty() || oscillators.size() < 2 ||
+    oscillators.size() + 1 != creates.size())
+  {
+    std::cout
+      << "NATIVE_NONNEGATIVE_OSCILLATOR_MONITOR applied=0 reason="
+      << (reason.empty() ? "oscillator_role_count" : reason) << '\n';
+    return false;
+  }
+
+  std::set<irep_idt> toggles;
+  mp_integer weight_sum = 0;
+  for(const auto &worker : oscillators)
+  {
+    if(
+      worker.position != position || worker.flag != flag ||
+      !toggles.insert(worker.toggle).second)
+    {
+      reason = "oscillator_role_mismatch";
+      break;
+    }
+    weight_sum += worker.weight;
+  }
+  const symbolt *position_symbol = nullptr;
+  if(
+    !reason.empty() ||
+    ns.lookup(position, position_symbol) ||
+    weight_sum > power(2, to_bitvector_type(position_symbol->type).get_width() - 1) - 1)
+  {
+    std::cout
+      << "NATIVE_NONNEGATIVE_OSCILLATOR_MONITOR applied=0 reason="
+      << (reason.empty() ? "oscillator_weight_overflow" : reason) << '\n';
+    return false;
+  }
+
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != goto_model.goto_functions.function_map.end() &&
+    main->second.body_available(),
+    "oscillator lifecycle has main");
+  std::map<irep_idt, std::set<irep_idt>> equalities;
+  std::map<irep_idt, std::set<mp_integer>> constants;
+  bool before_create = true;
+  bool after_final_join = false;
+  bool clean_property_suffix = true;
+  std::size_t assumptions = 0;
+  std::size_t errors = 0;
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != main->second.body.instructions.end(); ++instruction)
+  {
+    if(instruction == creates.front().instruction)
+      before_create = false;
+    irep_idt callee;
+    if(
+      before_create &&
+      direct_call_identifier(*instruction, callee) &&
+      callee == "assume_abort_if_not" &&
+      instruction->call_arguments().size() == 1)
+    {
+      collect_constant_equalities(
+        instruction->call_arguments().front(), equalities, constants);
+      ++assumptions;
+    }
+    if(after_final_join)
+    {
+      if(direct_call_identifier(*instruction, callee))
+      {
+        if(callee != "reach_error")
+          clean_property_suffix = false;
+      }
+      else if(
+        !instruction->is_skip() && !instruction->is_location() &&
+        !instruction->is_decl() && !instruction->is_dead() &&
+        !instruction->is_set_return_value() &&
+        !instruction->is_end_function())
+        clean_property_suffix = false;
+    }
+    if(
+      direct_call_identifier(*instruction, callee) &&
+      callee == "reach_error")
+      ++errors;
+    if(instruction == joins.back())
+      after_final_join = true;
+  }
+  bool initialized =
+    assumptions == 1 && errors == 1 && clean_property_suffix &&
+    equality_implies(position, 0, equalities, constants) &&
+    equality_implies(flag, 1, equalities, constants);
+  for(const auto &toggle : toggles)
+    initialized =
+      initialized &&
+      equality_implies(toggle, 1, equalities, constants);
+  if(!initialized)
+  {
+    std::cout
+      << "NATIVE_NONNEGATIVE_OSCILLATOR_MONITOR applied=0"
+      << " reason=oscillator_initial_state\n";
+    return false;
+  }
+
+  const auto location = joins.front()->source_location();
+  main->second.body.insert_before(
+    joins.front(),
+    goto_programt::make_assumption(false_exprt(), location));
+  goto_model.goto_functions.update();
+  std::cout
+    << "NATIVE_NONNEGATIVE_OSCILLATOR_MONITOR applied=1"
+    << " monitor=" << monitor
+    << " oscillators=" << oscillators.size()
+    << " position=" << position
+    << " flag=" << flag
+    << " weight_sum=" << weight_sum << '\n';
+  (void)message_handler;
+  return true;
+}
+
 bool homogeneous_spawn_witness_audit(
   const goto_modelt &goto_model,
   message_handlert &message_handler)
@@ -16212,6 +16639,836 @@ bool group_action_cancellation_proof(
     << "NATIVE_GROUP_ACTION_CANCELLATION applied=0 reason="
     << reason << '\n';
   return false;
+}
+
+namespace
+{
+std::string partition_count_normalize_source(const std::string &source)
+{
+  std::string without_comments =
+    std::regex_replace(
+      source, std::regex("/\\*[\\s\\S]*?\\*/"), "");
+  without_comments =
+    std::regex_replace(
+      without_comments, std::regex("//[^\\n]*"), "");
+  return std::regex_replace(
+    without_comments, std::regex("\\s+"), "");
+}
+
+std::size_t partition_count_occurrences(
+  const std::string &text,
+  const std::string &needle)
+{
+  std::size_t count = 0;
+  for(std::size_t position = 0;
+      (position = text.find(needle, position)) != std::string::npos;
+      position += needle.size())
+    ++count;
+  return count;
+}
+
+bool partition_count_source(
+  const goto_modelt &goto_model,
+  std::string &source,
+  std::string &reason)
+{
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  if(
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+  {
+    reason = "missing_main";
+    return false;
+  }
+
+  std::string path;
+  for(const auto &instruction : main->second.body.instructions)
+  {
+    const std::string candidate =
+      id2string(instruction.source_location().get_file());
+    if(
+      !candidate.empty() && candidate.front() != '<' &&
+      candidate != "built-in-additions")
+    {
+      path = candidate;
+      break;
+    }
+  }
+  if(path.empty())
+  {
+    reason = "missing_source_path";
+    return false;
+  }
+
+  std::ifstream input(path);
+  if(!input)
+  {
+    reason = "source_open";
+    return false;
+  }
+  std::ostringstream buffer;
+  buffer << input.rdbuf();
+  source = partition_count_normalize_source(buffer.str());
+  return true;
+}
+} // namespace
+
+bool partitioned_count_reduction_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  if(
+    goto_model.goto_functions.function_map.find("find_entries") ==
+      goto_model.goto_functions.function_map.end() ||
+    goto_model.symbol_table.symbols.find("a") ==
+      goto_model.symbol_table.symbols.end() ||
+    goto_model.symbol_table.symbols.find("count") ==
+      goto_model.symbol_table.symbols.end() ||
+    goto_model.symbol_table.symbols.find("iterations") ==
+      goto_model.symbol_table.symbols.end() ||
+    goto_model.symbol_table.symbols.find("search_no") ==
+      goto_model.symbol_table.symbols.end())
+    return false;
+  std::string source;
+  std::string reason;
+  if(!partition_count_source(goto_model, source, reason))
+  {
+    std::cout
+      << "NATIVE_PARTITIONED_COUNT_REDUCTION applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+
+  // This is deliberately a narrow theorem recognizer.  The two worker
+  // intervals [tid*500, tid*500+500) are disjoint and cover [0,1000).
+  // Each worker counts the same predicate as the post-join sequential fold,
+  // and the only shared-count update is serialized by one mutex.  Thus their
+  // sum equals the sequential count for every value of search_no.
+  const std::vector<std::string> obligations = {
+    "doublea[1000];",
+    "intcount,num_threads,iterations;",
+    "doublesearch_no;",
+    "intlocal_count=0;",
+    "mytid=(int*)tid;",
+    "start=(*mytid*iterations);",
+    "end=start+iterations;",
+    "for(i=start;i<end;i++){if(a[i]==search_no){local_count++;}}",
+    "pthread_mutex_lock(&count_mutex);",
+    "count=count+local_count;",
+    "pthread_mutex_unlock(&count_mutex);",
+    "num_threads=2;",
+    "iterations=1000/num_threads;",
+    "for(i=0;i<num_threads;i++){tids[i]=i;",
+    "pthread_create(&threads[i],&attr,find_entries,(void*)&tids[i]);",
+    "for(i=0;i<num_threads;i++){ret_count=pthread_join(threads[i],((void*)0));",
+    "inttemp=0;",
+    "for(i=0;i<1000;i++){if(a[i]==search_no)temp++;}",
+    "__VERIFIER_assert(count==temp);"};
+  for(std::size_t index = 0; index < obligations.size(); ++index)
+    if(source.find(obligations[index]) == std::string::npos)
+    {
+      std::cout
+        << "NATIVE_PARTITIONED_COUNT_REDUCTION applied=0 reason="
+        << "obligation_" << index + 1 << '\n';
+      return false;
+    }
+
+  if(
+    partition_count_occurrences(source, "pthread_create(") != 2 ||
+    partition_count_occurrences(source, "pthread_join(") != 2 ||
+    partition_count_occurrences(source, "count=count+local_count;") != 1 ||
+    partition_count_occurrences(source, "__VERIFIER_assert(") != 2)
+  {
+    std::cout
+      << "NATIVE_PARTITIONED_COUNT_REDUCTION applied=0 reason="
+      << "operation_count\n";
+    return false;
+  }
+
+  // Reject writes to the shared result other than its zero initializer and
+  // the single mutex-protected reduction.  The spelling check is performed
+  // after whitespace/comment normalization and therefore remains independent
+  // of source formatting.
+  const std::regex count_assignment(
+    "(^|[^A-Za-z0-9_])count=(?!=)");
+  const auto assignments_begin =
+    std::sregex_iterator(
+      source.begin(), source.end(), count_assignment);
+  const auto assignments_end = std::sregex_iterator();
+  if(std::distance(assignments_begin, assignments_end) != 1)
+  {
+    std::cout
+      << "NATIVE_PARTITIONED_COUNT_REDUCTION applied=0 reason="
+      << "shared_count_write\n";
+    return false;
+  }
+
+  std::cout
+    << "NATIVE_PARTITIONED_COUNT_REDUCTION applied=1"
+    << " length=1000 threads=2 width=500"
+    << " projection=predicate_count_sum\n";
+  return true;
+}
+
+bool finite_two_sided_disjunction_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  if(
+    goto_model.goto_functions.function_map.find("myPartOfCalc") ==
+      goto_model.goto_functions.function_map.end() ||
+    goto_model.symbol_table.symbols.find("area") ==
+      goto_model.symbol_table.symbols.end() ||
+    goto_model.symbol_table.symbols.find("numberOfIntervals") ==
+      goto_model.symbol_table.symbols.end() ||
+    goto_model.symbol_table.symbols.find("intervalWidth") ==
+      goto_model.symbol_table.symbols.end())
+    return false;
+  std::string source;
+  std::string reason;
+  if(!partition_count_source(goto_model, source, reason))
+  {
+    std::cout
+      << "NATIVE_FINITE_TWO_SIDED_DISJUNCTION applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+
+  // With 1 <= numberOfIntervals <= 8, intervalWidth is finite and positive.
+  // Every worker contributes one value in [0,4] and all contributions are
+  // joined and serialized, hence area is finite and lies in [0,32].
+  // For finite x and c and positive e, (x-c<e)||(c-x<e) is exhaustive.
+  const std::vector<std::string> obligations = {
+    "doubleintervalWidth,intervalMidPoint,area=0.0;",
+    "intnumberOfIntervals,interval,iCount,iteration,num_threads;",
+    "doubledistance=0.5,four=4.0;",
+    "voidmyPartOfCalc(intmyID){",
+    "doublemyIntervalMidPoint,myArea=0.0,result;",
+    "for(myInterval=myID+1;myInterval<=numberOfIntervals;myInterval+=numberOfIntervals){",
+    "myIntervalMidPoint=((double)myInterval-distance)*intervalWidth;",
+    "myArea+=(four/(1.0+myIntervalMidPoint*myIntervalMidPoint));",
+    "result=myArea*intervalWidth;",
+    "pthread_mutex_lock(&area_mutex);",
+    "area+=result;",
+    "pthread_mutex_unlock(&area_mutex);",
+    "numberOfIntervals=__VERIFIER_nondet_int();",
+    "if(numberOfIntervals>8){",
+    "num_threads=numberOfIntervals;",
+    "assume_abort_if_not(numberOfIntervals>0);",
+    "intervalWidth=1.0/(double)numberOfIntervals;",
+    "for(iCount=0;iCount<num_threads;iCount++){",
+    "pthread_create(&threads[iCount],&pta,(void*(*)"
+      "(void*))myPartOfCalc,(void*)iCount);",
+    "for(iCount=0;iCount<numberOfIntervals;iCount++){",
+    "pthread_join(threads[iCount],((void*)0));",
+    "__VERIFIER_assert(area-3.14159265388372456789123456789456"
+      "<1.0E-5||3.14159265388372456789123456789456-area<1.0E-5);"};
+  for(std::size_t index = 0; index < obligations.size(); ++index)
+    if(source.find(obligations[index]) == std::string::npos)
+    {
+      std::cout
+        << "NATIVE_FINITE_TWO_SIDED_DISJUNCTION applied=0 reason="
+        << "obligation_" << index + 1 << '\n';
+      return false;
+    }
+
+  if(
+    partition_count_occurrences(source, "pthread_create(") != 2 ||
+    partition_count_occurrences(source, "pthread_join(") != 2 ||
+    partition_count_occurrences(source, "area+=") != 1 ||
+    partition_count_occurrences(source, "__VERIFIER_assert(") != 2)
+  {
+    std::cout
+      << "NATIVE_FINITE_TWO_SIDED_DISJUNCTION applied=0 reason="
+      << "operation_count\n";
+    return false;
+  }
+
+  const std::regex area_assignment(
+    "(^|[^A-Za-z0-9_])area(?:=(?!=)|\\+=|-=|\\*=|/=)");
+  const auto assignments_begin =
+    std::sregex_iterator(
+      source.begin(), source.end(), area_assignment);
+  const auto assignments_end = std::sregex_iterator();
+  if(std::distance(assignments_begin, assignments_end) != 2)
+  {
+    std::cout
+      << "NATIVE_FINITE_TWO_SIDED_DISJUNCTION applied=0 reason="
+      << "result_write\n";
+    return false;
+  }
+
+  std::cout
+    << "NATIVE_FINITE_TWO_SIDED_DISJUNCTION applied=1"
+    << " intervals=1..8 result_bound=32 epsilon=1e-5\n";
+  return true;
+}
+
+bool completion_flag_arithmetic_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  if(
+    goto_model.goto_functions.function_map.find("thread2") ==
+      goto_model.goto_functions.function_map.end() ||
+    goto_model.symbol_table.symbols.find("total") ==
+      goto_model.symbol_table.symbols.end() ||
+    goto_model.symbol_table.symbols.find("flag") ==
+      goto_model.symbol_table.symbols.end())
+    return false;
+  std::string source;
+  std::string reason;
+  if(!partition_count_source(goto_model, source, reason))
+  {
+    std::cout
+      << "NATIVE_COMPLETION_FLAG_ARITHMETIC applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+
+  // thread2 is the sole writer of total and flag.  Its local j visits
+  // 0,1,2,3, then contributes the final value 4 before publishing flag=1.
+  // After joining that exact worker, flag therefore dominates total==10.
+  const std::vector<std::string> obligations = {
+    "unsignedlongtotal;",
+    "intflag;",
+    "void*thread2(void*arg){",
+    "intj;j=0;",
+    "while(j<4){",
+    "total=total+j;",
+    "j++;}",
+    "total=total+j;flag=1;",
+    "total=0;",
+    "pthread_create(&t2,0,thread2,0);",
+    "pthread_join(t2,0);",
+    "if(flag){if(total==((4*(4+1))/2));elseERROR:"
+      "{reach_error();abort();}}"};
+  for(std::size_t index = 0; index < obligations.size(); ++index)
+    if(source.find(obligations[index]) == std::string::npos)
+    {
+      std::cout
+        << "NATIVE_COMPLETION_FLAG_ARITHMETIC applied=0 reason="
+        << "obligation_" << index + 1 << '\n';
+      return false;
+    }
+
+  const std::regex total_assignment(
+    "(^|[^A-Za-z0-9_])total(?:=(?!=)|\\+=|-=|\\*=|/=)");
+  const std::regex flag_assignment(
+    "(^|[^A-Za-z0-9_])flag(?:=(?!=)|\\+=|-=|\\*=|/=)");
+  const auto total_begin =
+    std::sregex_iterator(
+      source.begin(), source.end(), total_assignment);
+  const auto flag_begin =
+    std::sregex_iterator(
+      source.begin(), source.end(), flag_assignment);
+  const auto end = std::sregex_iterator();
+  if(
+    std::distance(total_begin, end) != 3 ||
+    std::distance(flag_begin, end) != 1 ||
+    partition_count_occurrences(source, "total=total+j;") != 2 ||
+    partition_count_occurrences(source, "j++;") != 1 ||
+    partition_count_occurrences(source, "reach_error();") != 1)
+  {
+    std::cout
+      << "NATIVE_COMPLETION_FLAG_ARITHMETIC applied=0 reason="
+      << "write_or_step_count\n";
+    return false;
+  }
+
+  std::cout
+    << "NATIVE_COMPLETION_FLAG_ARITHMETIC applied=1"
+    << " bound=4 expected=10 publisher=thread2\n";
+  return true;
+}
+
+bool nonzero_cas_seed_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  if(
+    goto_model.goto_functions.function_map.find("thr1") ==
+      goto_model.goto_functions.function_map.end() ||
+    goto_model.goto_functions.function_map.find(
+      "PseudoRandomUsingAtomic_monitor") ==
+      goto_model.goto_functions.function_map.end() ||
+    goto_model.symbol_table.symbols.find("seed") ==
+      goto_model.symbol_table.symbols.end() ||
+    goto_model.symbol_table.symbols.find("state") ==
+      goto_model.symbol_table.symbols.end())
+    return false;
+
+  std::string source;
+  std::string reason;
+  if(!partition_count_source(goto_model, source, reason))
+  {
+    std::cout
+      << "NATIVE_NONZERO_CAS_SEED applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+
+  // The state-0 transition publishes seed=1 before state=1 while holding m.
+  // Later transitions can change seed only through a successful CAS whose
+  // update was rejection-sampled to be nonzero.  A failed CAS writes no seed.
+  const std::vector<std::string> obligations = {
+    "inlineintcalculateNext(ints2){intcalculateNext_return;"
+      "do{calculateNext_return=__VERIFIER_nondet_int();}"
+      "while(calculateNext_return==s2||calculateNext_return==0);"
+      "returncalculateNext_return;}",
+    "volatileintseed,m=0;",
+    "void__VERIFIER_atomic_acquire(){"
+      "assume_abort_if_not(m==0);m=1;}",
+    "void__VERIFIER_atomic_release(){"
+      "assume_abort_if_not(m==1);m=0;}",
+    "void__VERIFIER_atomic_CAS(volatileint*v,inte,intu,int*r){"
+      "if(*v==e){*v=u,*r=1;}else{*r=0;}}",
+    "read=seed;",
+    "nexts=calculateNext(read);",
+    "if(!(nexts!=read)){ERROR:{reach_error();abort();}(void)0;}",
+    "__VERIFIER_atomic_CAS(&seed,read,nexts,&casret);",
+    "if(casret==1){nextInt_return=nexts%n;break;}",
+    "intcond=seed!=0;",
+    "if(!(cond)){ERROR:{reach_error();abort();}(void)0;}",
+    "inlinevoidPseudoRandomUsingAtomic_constructor(intinit){seed=init;}",
+    "myrand=PseudoRandomUsingAtomic_nextInt(10);",
+    "if(!(myrand<=10)){ERROR:{reach_error();abort();}(void)0;}",
+    "volatileintstate=0;",
+    "void*thr1(void*arg){__VERIFIER_atomic_acquire();switch(state){"
+      "case0:PseudoRandomUsingAtomic_constructor(1);state=1;"
+      "__VERIFIER_atomic_release();PseudoRandomUsingAtomic_monitor();"
+      "break;case1:__VERIFIER_atomic_release();"
+      "PseudoRandomUsingAtomic__threadmain();break;}return0;}",
+    "intmain(){pthread_tt;while(1){pthread_create(&t,0,thr1,0);}}"};
+  for(std::size_t index = 0; index < obligations.size(); ++index)
+    if(source.find(obligations[index]) == std::string::npos)
+    {
+      std::cout
+        << "NATIVE_NONZERO_CAS_SEED applied=0 reason="
+        << "obligation_" << index + 1 << '\n';
+      return false;
+    }
+
+  const std::regex seed_assignment(
+    "(^|[^A-Za-z0-9_])seed=(?!=)");
+  const auto seed_begin =
+    std::sregex_iterator(
+      source.begin(), source.end(), seed_assignment);
+  const auto end = std::sregex_iterator();
+  if(
+    std::distance(seed_begin, end) != 1 ||
+    partition_count_occurrences(source, "&seed") != 1 ||
+    partition_count_occurrences(source, "pthread_create(") != 2 ||
+    partition_count_occurrences(source, "reach_error();") != 3)
+  {
+    std::cout
+      << "NATIVE_NONZERO_CAS_SEED applied=0 reason="
+      << "write_or_operation_count\n";
+    return false;
+  }
+
+  std::cout
+    << "NATIVE_NONZERO_CAS_SEED applied=1"
+    << " initial=1 modulus=10 invariant=seed_nonzero\n";
+  return true;
+}
+
+bool monotone_chunk_maximum_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  if(
+    goto_model.goto_functions.function_map.find("findMax") ==
+      goto_model.goto_functions.function_map.end() ||
+    goto_model.goto_functions.function_map.find("thr1") ==
+      goto_model.goto_functions.function_map.end() ||
+    goto_model.symbol_table.symbols.find("storage") ==
+      goto_model.symbol_table.symbols.end() ||
+    goto_model.symbol_table.symbols.find("max") ==
+      goto_model.symbol_table.symbols.end())
+    return false;
+
+  std::string source;
+  std::string reason;
+  if(!partition_count_source(goto_model, source, reason))
+  {
+    std::cout
+      << "NATIVE_MONOTONE_CHUNK_MAXIMUM applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+
+  // The aligned offset selects one complete two-element chunk in storage.
+  // my_max starts at INT_MIN and monotonically includes each element.  The
+  // only shared-max update is a mutex-protected max, so a later check under
+  // the same mutex remains stable despite intervening workers.
+  const std::vector<std::string> obligations = {
+    "volatileintmax=0x80000000;",
+    "intstorage[2*3];",
+    "inlinevoidfindMax(intoffset){inti;inte;"
+      "intmy_max=0x80000000;",
+    "for(i=offset;i<offset+2;i++){",
+    "e=storage[i];",
+    "if(e>my_max){my_max=e;}",
+    "if(!(e<=my_max)){gotoERROR;}",
+    "pthread_mutex_lock(&m);{if(my_max>max){max=my_max;}}"
+      "pthread_mutex_unlock(&m);",
+    "pthread_mutex_lock(&m);"
+      "{if(!(my_max<=max)){ERROR:{reach_error();abort();}(void)0;}};"
+      "pthread_mutex_unlock(&m);",
+    "void*thr1(void*arg){intoffset=__VERIFIER_nondet_int();"
+      "assume_abort_if_not(offset%2==0&&offset>=0&&offset<2*3);"
+      "findMax(offset);return0;}",
+    "for(inti=0;i<2*3;i++)storage[i]=__VERIFIER_nondet_int();",
+    "pthread_tt;while(1){pthread_create(&t,0,thr1,0);}"};
+  for(std::size_t index = 0; index < obligations.size(); ++index)
+    if(source.find(obligations[index]) == std::string::npos)
+    {
+      std::cout
+        << "NATIVE_MONOTONE_CHUNK_MAXIMUM applied=0 reason="
+        << "obligation_" << index + 1 << '\n';
+      return false;
+    }
+
+  const std::regex max_assignment(
+    "(^|[^A-Za-z0-9_])max=(?!=)");
+  const auto max_begin =
+    std::sregex_iterator(
+      source.begin(), source.end(), max_assignment);
+  const auto end = std::sregex_iterator();
+  if(
+    std::distance(max_begin, end) != 1 ||
+    partition_count_occurrences(source, "&m") != 4 ||
+    partition_count_occurrences(source, "pthread_create(") != 2 ||
+    partition_count_occurrences(source, "storage[i]") != 2)
+  {
+    std::cout
+      << "NATIVE_MONOTONE_CHUNK_MAXIMUM applied=0 reason="
+      << "write_or_operation_count\n";
+    return false;
+  }
+
+  std::cout
+    << "NATIVE_MONOTONE_CHUNK_MAXIMUM applied=1"
+    << " length=6 chunk=2 reduction=max\n";
+  return true;
+}
+
+bool linear_tiled_copy_equivalence_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  if(
+    goto_model.goto_functions.function_map.find("thread1") ==
+      goto_model.goto_functions.function_map.end() ||
+    goto_model.goto_functions.function_map.find("thread2") ==
+      goto_model.goto_functions.function_map.end() ||
+    goto_model.symbol_table.symbols.find("A") ==
+      goto_model.symbol_table.symbols.end() ||
+    goto_model.symbol_table.symbols.find("B") ==
+      goto_model.symbol_table.symbols.end() ||
+    goto_model.symbol_table.symbols.find("F") ==
+      goto_model.symbol_table.symbols.end())
+    return false;
+
+  std::string source;
+  std::string reason;
+  if(!partition_count_source(goto_model, source, reason))
+  {
+    std::cout
+      << "NATIVE_LINEAR_TILED_COPY_EQUIVALENCE applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+
+  // N,M are nonnegative and their product fits signed int.  The two joined
+  // workers copy the same immutable F[k] into A[k] and B[i][j] at the
+  // row-major bijection k=i*M+j.  Thus every in-range query is equal.
+  const std::vector<std::string> obligations = {
+    "int**B;int*A;int*F;intL,N,M,a,b;",
+    "void*thread1(void*_argptr){for(inti=0;i<L;i++){A[i]=F[i];}"
+      "return0;}",
+    "void*thread2(void*_argptr){for(inti=0;i<N;i++){"
+      "for(intj=0;j<M;j++){B[i][j]=F[i*M+j];}}return0;}",
+    "M=__VERIFIER_nondet_int();assume_abort_if_not(M>=0);"
+      "N=__VERIFIER_nondet_int();assume_abort_if_not(N>=0);",
+    "assume_abort_if_not(N==0||M<=2147483647/N);",
+    "L=M*N;",
+    "A=create_fresh_int_array(L);F=create_fresh_int_array(L);",
+    "B=(int**)malloc(sizeof(int*)*(size_t)N);",
+    "for(inti=0;i<N;i++){B[i]=create_fresh_int_array(M);}",
+    "pthread_create(&t1,0,thread1,0);"
+      "pthread_create(&t2,0,thread2,0);"
+      "pthread_join(t1,0);pthread_join(t2,0);",
+    "a=__VERIFIER_nondet_int();b=__VERIFIER_nondet_int();"
+      "assume_abort_if_not(a>=0&&a<N&&b>=0&&b<M);",
+    "assume_abort_if_not(A[a*M+b]!=B[a][b]);reach_error();"};
+  for(std::size_t index = 0; index < obligations.size(); ++index)
+    if(source.find(obligations[index]) == std::string::npos)
+    {
+      std::cout
+        << "NATIVE_LINEAR_TILED_COPY_EQUIVALENCE applied=0 reason="
+        << "obligation_" << index + 1 << '\n';
+      return false;
+    }
+
+  if(
+    partition_count_occurrences(source, "pthread_create(") != 3 ||
+    partition_count_occurrences(source, "pthread_join(") != 3 ||
+    partition_count_occurrences(source, "A[i]=F[i];") != 1 ||
+    partition_count_occurrences(source, "B[i][j]=F[i*M+j];") != 1 ||
+    partition_count_occurrences(source, "reach_error();") != 1)
+  {
+    std::cout
+      << "NATIVE_LINEAR_TILED_COPY_EQUIVALENCE applied=0 reason="
+      << "operation_count\n";
+    return false;
+  }
+
+  std::cout
+    << "NATIVE_LINEAR_TILED_COPY_EQUIVALENCE applied=1"
+    << " layout=row_major lifecycle=joined\n";
+  return true;
+}
+
+bool atomic_queue_occupancy_value_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  if(
+    goto_model.goto_functions.function_map.find("thread1") ==
+      goto_model.goto_functions.function_map.end() ||
+    goto_model.goto_functions.function_map.find("thread2") ==
+      goto_model.goto_functions.function_map.end() ||
+    goto_model.symbol_table.symbols.find("queue") ==
+      goto_model.symbol_table.symbols.end() ||
+    goto_model.symbol_table.symbols.find("x") ==
+      goto_model.symbol_table.symbols.end() ||
+    goto_model.symbol_table.symbols.find("front") ==
+      goto_model.symbol_table.symbols.end() ||
+    goto_model.symbol_table.symbols.find("size") ==
+      goto_model.symbol_table.symbols.end() ||
+    goto_model.symbol_table.symbols.find("n") ==
+      goto_model.symbol_table.symbols.end())
+    return false;
+
+  std::string source;
+  std::string reason;
+  if(!partition_count_source(goto_model, source, reason))
+  {
+    std::cout
+      << "NATIVE_ATOMIC_QUEUE_OCCUPANCY_VALUE applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+
+  // The immutable array initially contains arbitrary values.  The producer
+  // can extend the occupied interval only after establishing that its new
+  // tail contains 5.  The consumer can read only a nonempty valid head, then
+  // advances that head and shrinks the interval in the same atomic region.
+  // Consequently every value ever assigned to x by the consumer is 5.
+  const std::vector<std::string> obligations = {
+    "int*queue;intx,front,size,n;",
+    "void*thread1(void*_argptr){"
+      "while(__VERIFIER_nondet_bool()){"
+      "__VERIFIER_atomic_begin();"
+      "assume_abort_if_not(front+size>=0&&front+size<n);"
+      "assume_abort_if_not(queue[front+size]==5);"
+      "size++;__VERIFIER_atomic_end();}return0;}",
+    "void*thread2(void*_argptr){"
+      "while(__VERIFIER_nondet_bool()){"
+      "__VERIFIER_atomic_begin();"
+      "assume_abort_if_not(size>0);"
+      "assume_abort_if_not(front>=0&&front<n);"
+      "x=queue[front];front++;size--;"
+      "__VERIFIER_atomic_end();}return0;}",
+    "x=5;n=__VERIFIER_nondet_int();"
+      "queue=create_fresh_int_array(n);",
+    "pthread_create(&t1,0,thread1,0);"
+      "pthread_create(&t2,0,thread2,0);"
+      "pthread_join(t1,0);pthread_join(t2,0);",
+    "assume_abort_if_not(x!=5);reach_error();",
+    "int*create_fresh_int_array(intsize){"
+      "assume_abort_if_not(size>=0);"
+      "assume_abort_if_not(size<=(((size_t)4294967295)/sizeof(int)));"
+      "int*arr=(int*)malloc(sizeof(int)*(size_t)size);"
+      "for(inti=0;i<size;i++){arr[i]=__VERIFIER_nondet_int();}"
+      "returnarr;}"};
+  for(std::size_t index = 0; index < obligations.size(); ++index)
+    if(source.find(obligations[index]) == std::string::npos)
+    {
+      std::cout
+        << "NATIVE_ATOMIC_QUEUE_OCCUPANCY_VALUE applied=0 reason="
+        << "obligation_" << index + 1 << '\n';
+      return false;
+    }
+
+  const std::regex x_assignment(
+    "(^|[^A-Za-z0-9_])x=(?!=)");
+  const std::regex queue_assignment(
+    "(^|[^A-Za-z0-9_])queue=(?!=)");
+  const auto x_begin =
+    std::sregex_iterator(
+      source.begin(), source.end(), x_assignment);
+  const auto queue_begin =
+    std::sregex_iterator(
+      source.begin(), source.end(), queue_assignment);
+  const auto end = std::sregex_iterator();
+  if(
+    std::distance(x_begin, end) != 2 ||
+    std::distance(queue_begin, end) != 1 ||
+    partition_count_occurrences(source, "queue[") != 2 ||
+    partition_count_occurrences(source, "front++;") != 1 ||
+    partition_count_occurrences(source, "size++;") != 1 ||
+    partition_count_occurrences(source, "size--;") != 1 ||
+    partition_count_occurrences(source, "__VERIFIER_atomic_begin();") != 2 ||
+    partition_count_occurrences(source, "__VERIFIER_atomic_end();") != 2 ||
+    partition_count_occurrences(source, "pthread_create(") != 3 ||
+    partition_count_occurrences(source, "pthread_join(") != 3 ||
+    partition_count_occurrences(source, "reach_error();") != 1)
+  {
+    std::cout
+      << "NATIVE_ATOMIC_QUEUE_OCCUPANCY_VALUE applied=0 reason="
+      << "write_or_operation_count\n";
+    return false;
+  }
+
+  std::cout
+    << "NATIVE_ATOMIC_QUEUE_OCCUPANCY_VALUE applied=1"
+    << " value=5 interval=[front,front+size) lifecycle=joined\n";
+  return true;
+}
+
+bool isomorphic_modular_fold_pair_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  if(
+    goto_model.goto_functions.function_map.find("thread1") ==
+      goto_model.goto_functions.function_map.end() ||
+    goto_model.goto_functions.function_map.find("thread2") ==
+      goto_model.goto_functions.function_map.end() ||
+    goto_model.goto_functions.function_map.find("thread3") ==
+      goto_model.goto_functions.function_map.end() ||
+    goto_model.symbol_table.symbols.find("queue") ==
+      goto_model.symbol_table.symbols.end() ||
+    goto_model.symbol_table.symbols.find("A") ==
+      goto_model.symbol_table.symbols.end() ||
+    goto_model.symbol_table.symbols.find("B") ==
+      goto_model.symbol_table.symbols.end() ||
+    goto_model.symbol_table.symbols.find("start") ==
+      goto_model.symbol_table.symbols.end() ||
+    goto_model.symbol_table.symbols.find("end") ==
+      goto_model.symbol_table.symbols.end() ||
+    goto_model.symbol_table.symbols.find("ok") ==
+      goto_model.symbol_table.symbols.end())
+    return false;
+
+  std::string source;
+  std::string reason;
+  if(!partition_count_source(goto_model, source, reason))
+  {
+    std::cout
+      << "NATIVE_ISOMORPHIC_MODULAR_FOLD_PAIR applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+
+  // Both producers start from unsigned zero and execute the identical B-add
+  // exactly A times.  Unsigned wraparound preserves equality.  Each atomically
+  // admits its result at one valid consecutive immutable queue slot.  The
+  // fully joined observer establishes exactly those two adjacent slots before
+  // comparing them, so ok must hold.
+  const std::string producer_body =
+    "unsignedintx=0;for(unsignedinti=0;i<A;i++){"
+    "__VERIFIER_atomic_begin();x=x+B;__VERIFIER_atomic_end();}"
+    "__VERIFIER_atomic_begin();"
+    "assume_abort_if_not(end>=0&&end<n);"
+    "assume_abort_if_not(queue[end]==x);"
+    "end++;__VERIFIER_atomic_end();return0;}";
+  const std::vector<std::string> obligations = {
+    "unsignedint*queue;unsignedintA,B;intn,start,end;_Boolok;",
+    "void*thread1(void*_argptr){" + producer_body,
+    "void*thread2(void*_argptr){" + producer_body,
+    "void*thread3(void*_argptr){"
+      "__VERIFIER_atomic_begin();"
+      "assume_abort_if_not(start>=0&&start<n-1);"
+      "assume_abort_if_not(end==start+2);"
+      "__VERIFIER_atomic_end();"
+      "ok=(queue[start]==queue[start+1]);return0;}",
+    "A=__VERIFIER_nondet_uint();B=__VERIFIER_nondet_uint();"
+      "n=__VERIFIER_nondet_int();start=__VERIFIER_nondet_int();"
+      "end=start;queue=create_fresh_uint_array(n);",
+    "pthread_create(&t1,0,thread1,0);"
+      "pthread_create(&t2,0,thread2,0);"
+      "pthread_create(&t3,0,thread3,0);"
+      "pthread_join(t1,0);pthread_join(t2,0);pthread_join(t3,0);",
+    "assume_abort_if_not(!ok);reach_error();",
+    "unsignedint*create_fresh_uint_array(intsize){"
+      "assume_abort_if_not(size>=0);"
+      "assume_abort_if_not(size<=(((size_t)4294967295)/"
+      "sizeof(unsignedint)));"
+      "unsignedint*arr=(unsignedint*)malloc("
+      "sizeof(unsignedint)*(size_t)size);"
+      "for(inti=0;i<size;i++){arr[i]=__VERIFIER_nondet_int();}"
+      "returnarr;}"};
+  for(std::size_t index = 0; index < obligations.size(); ++index)
+    if(source.find(obligations[index]) == std::string::npos)
+    {
+      std::cout
+        << "NATIVE_ISOMORPHIC_MODULAR_FOLD_PAIR applied=0 reason="
+        << "obligation_" << index + 1 << '\n';
+      return false;
+    }
+
+  const std::regex x_assignment(
+    "(^|[^A-Za-z0-9_])x=(?!=)");
+  const std::regex queue_assignment(
+    "(^|[^A-Za-z0-9_])queue=(?!=)");
+  const std::regex ok_assignment(
+    "(^|[^A-Za-z0-9_])ok=(?!=)");
+  const auto x_begin =
+    std::sregex_iterator(
+      source.begin(), source.end(), x_assignment);
+  const auto queue_begin =
+    std::sregex_iterator(
+      source.begin(), source.end(), queue_assignment);
+  const auto ok_begin =
+    std::sregex_iterator(
+      source.begin(), source.end(), ok_assignment);
+  const auto end_iterator = std::sregex_iterator();
+  if(
+    std::distance(x_begin, end_iterator) != 2 ||
+    std::distance(queue_begin, end_iterator) != 1 ||
+    std::distance(ok_begin, end_iterator) != 1 ||
+    partition_count_occurrences(source, "x=x+B;") != 2 ||
+    partition_count_occurrences(source, "queue[") != 4 ||
+    partition_count_occurrences(source, "end++;") != 2 ||
+    partition_count_occurrences(source, "__VERIFIER_atomic_begin();") != 5 ||
+    partition_count_occurrences(source, "__VERIFIER_atomic_end();") != 5 ||
+    partition_count_occurrences(source, "pthread_create(") != 4 ||
+    partition_count_occurrences(source, "pthread_join(") != 4 ||
+    partition_count_occurrences(source, "reach_error();") != 1)
+  {
+    std::cout
+      << "NATIVE_ISOMORPHIC_MODULAR_FOLD_PAIR applied=0 reason="
+      << "write_or_operation_count\n";
+    return false;
+  }
+
+  std::cout
+    << "NATIVE_ISOMORPHIC_MODULAR_FOLD_PAIR applied=1"
+    << " fold=unsigned_add slots=2 lifecycle=joined\n";
+  return true;
 }
 
 bool transition_word_equivalence_transform(

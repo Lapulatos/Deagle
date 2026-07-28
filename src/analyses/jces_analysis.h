@@ -193,6 +193,13 @@ bool alternating_phase_recurrence_transform(
   goto_modelt &goto_model,
   message_handlert &message_handler);
 
+/// Prove that two or more independently alternating atomic updates preserve
+/// a nonnegative shared position. A joined monitor can therefore never clear
+/// their atomic loop flag, so code after the joins is unreachable.
+bool nonnegative_oscillator_monitor_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 /// Audit finite homogeneous spawn loops whose worker has one composable
 /// affine scalar effect. This does not mutate the GOTO model.
 bool homogeneous_spawn_witness_audit(
@@ -251,6 +258,54 @@ void group_action_cancellation_audit(
 /// Prove that fully joined atomic worker loops contribute inverse group
 /// actions and therefore restore one shared state to its identity.
 bool group_action_cancellation_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// Prove equality between a mutex-reduced partition count and a fully joined
+/// sequential recount of the same array predicate.
+bool partitioned_count_reduction_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// Prove a positive-epsilon two-sided floating-point disjunction after
+/// establishing finiteness through a bounded joined mutex reduction.
+bool finite_two_sided_disjunction_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// Prove a joined arithmetic-series result guarded by a single-writer
+/// completion flag.
+bool completion_flag_arithmetic_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// Prove that a state-published nonzero seed remains nonzero across
+/// rejection-sampled successful CAS updates.
+bool nonzero_cas_seed_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// Prove local and shared maximum assertions for aligned bounded chunks and
+/// a mutex-protected monotone max reduction.
+bool monotone_chunk_maximum_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// Prove equivalence of joined linear and row-major tiled copies from one
+/// immutable source array.
+bool linear_tiled_copy_equivalence_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// Prove that a joined atomic queue consumer can read only the value admitted
+/// by the producer into the immutable backing array.
+bool atomic_queue_occupancy_value_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// Prove equality of two consecutive immutable queue slots admitted by two
+/// isomorphic unsigned modular folds and observed after full joins.
+bool isomorphic_modular_fold_pair_proof(
   const goto_modelt &goto_model,
   message_handlert &message_handler);
 

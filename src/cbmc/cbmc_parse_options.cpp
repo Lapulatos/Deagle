@@ -43,6 +43,7 @@ Author: Daniel Kroening, kroening@kroening.com
 #endif
 
 #include <langapi/language.h>
+#include <langapi/language_util.h>
 
 #include <ansi-c/c_preprocess.h>
 #include <ansi-c/cprover_library.h>
@@ -91,6 +92,8 @@ Author: Daniel Kroening, kroening@kroening.com
 #include <goto-programs/show_properties.h>
 #include <goto-programs/show_symbol_table.h>
 
+#include <xmllang/graphml.h>
+
 #include <goto-instrument/cover.h>
 #include <goto-instrument/full_slicer.h>
 #include <goto-instrument/nondet_bulk_init.h>
@@ -104,6 +107,126 @@ Author: Daniel Kroening, kroening@kroening.com
 #include <langapi/mode.h>
 
 #include "c_test_input_generator.h"
+
+namespace
+{
+struct native_witness_assertiont
+{
+  irep_idt function;
+  source_locationt source_location;
+  exprt condition;
+};
+
+using native_witness_assertionst =
+  std::vector<native_witness_assertiont>;
+
+native_witness_assertionst collect_native_witness_assertions(
+  const goto_modelt &goto_model)
+{
+  native_witness_assertionst assertions;
+  for(const auto &function : goto_model.goto_functions.function_map)
+  {
+    if(!function.second.body_available())
+      continue;
+    for(const auto &instruction : function.second.body.instructions)
+    {
+      if(instruction.is_assert())
+      {
+        assertions.push_back(
+          {function.first,
+           instruction.source_location(),
+           instruction.condition()});
+      }
+    }
+  }
+  return assertions;
+}
+
+bool output_native_correctness_witness(
+  const goto_modelt &goto_model,
+  const optionst &options,
+  const native_witness_assertionst &assertions)
+{
+  const std::string path = options.get_option("graphml-witness");
+  if(path.empty() || path == "-")
+  {
+    std::cout
+      << "NATIVE_CORRECTNESS_WITNESS applied=0 reason=invalid_path"
+      << " properties=" << assertions.size() << '\n';
+    return false;
+  }
+
+  const namespacet ns(goto_model.symbol_table);
+  graphmlt graph;
+  graph.key_values["witness-type"] = "correctness_witness";
+  graph.key_values["sourcecodelang"] = "C";
+
+  const auto entry = graph.add_node();
+  graph[entry].node_name = "N0";
+  graph[entry].is_violation = false;
+  graph[entry].has_invariant = false;
+
+  std::size_t property_count = 0;
+  for(const auto &assertion : assertions)
+  {
+    const auto node = graph.add_node();
+    graph[node].node_name = "P" + std::to_string(++property_count);
+    graph[node].file = assertion.source_location.get_file();
+    graph[node].line = assertion.source_location.get_line();
+    graph[node].is_violation = false;
+    graph[node].has_invariant = true;
+    graph[node].invariant =
+      from_expr(ns, assertion.function, assertion.condition);
+    graph[node].invariant_scope = id2string(assertion.function);
+    graph.add_edge(entry, node);
+
+    xmlt edge(
+      "edge",
+      {{"source", graph[entry].node_name},
+       {"target", graph[node].node_name}},
+      {});
+    if(!graph[node].file.empty())
+    {
+      xmlt &origin = edge.new_element("data");
+      origin.set_attribute("key", "originfile");
+      origin.data = id2string(graph[node].file);
+    }
+    if(!graph[node].line.empty())
+    {
+      xmlt &line = edge.new_element("data");
+      line.set_attribute("key", "startline");
+      line.data = id2string(graph[node].line);
+    }
+    graph[entry].out[node].xml_node = std::move(edge);
+  }
+  if(property_count == 0)
+  {
+    std::cout
+      << "NATIVE_CORRECTNESS_WITNESS applied=0 reason=no_properties"
+      << " properties=0\n";
+    return false;
+  }
+
+  std::ofstream output(path);
+  if(!output)
+  {
+    std::cout
+      << "NATIVE_CORRECTNESS_WITNESS applied=0 reason=open_failed"
+      << " properties=" << property_count << '\n';
+    return false;
+  }
+  const std::string filename = options.get_option("filename");
+  const bool write_failed = write_graphml(graph, output, filename, options);
+  if(write_failed || !output.good())
+  {
+    std::cout
+      << "NATIVE_CORRECTNESS_WITNESS applied=0 reason=write_failed"
+      << " properties=" << property_count << '\n';
+    return false;
+  }
+  return true;
+}
+}
 
 cbmc_parse_optionst::cbmc_parse_optionst(int argc, const char **argv)
   : parse_options_baset(
@@ -570,8 +693,16 @@ int cbmc_parse_optionst::doit()
     return CPROVER_EXIT_SUCCESS;
   }
 
-  int get_goto_program_ret =
-    get_goto_program(goto_model, options, cmdline, ui_message_handler);
+  native_witness_assertionst native_witness_assertions;
+  int get_goto_program_ret = get_goto_program(
+    goto_model,
+    options,
+    cmdline,
+    ui_message_handler,
+    [&native_witness_assertions](const goto_modelt &unprocessed_model) {
+      native_witness_assertions =
+        collect_native_witness_assertions(unprocessed_model);
+    });
 
   if(get_goto_program_ret!=-1)
     return get_goto_program_ret;
@@ -1041,6 +1172,12 @@ int cbmc_parse_optionst::doit()
         goto_model, ui_message_handler) ||
       native_model_transformed;
 
+  if(cmdline.isset("native-nonnegative-oscillator-monitor"))
+    native_model_transformed =
+      nonnegative_oscillator_monitor_transform(
+        goto_model, ui_message_handler) ||
+      native_model_transformed;
+
   if(cmdline.isset("native-homogeneous-spawn-witness"))
     native_model_transformed =
       homogeneous_spawn_witness_transform(
@@ -1051,7 +1188,9 @@ int cbmc_parse_optionst::doit()
     cmdline.isset("native-jces") &&
     !cmdline.isset("unwind-suggest") &&
     nested_iteration_homomorphism_proof(
-      goto_model, ui_message_handler))
+      goto_model, ui_message_handler) &&
+    output_native_correctness_witness(
+      goto_model, options, native_witness_assertions))
   {
     std::cout << "VERIFICATION SUCCESSFUL\n";
     return CPROVER_EXIT_SUCCESS;
@@ -1061,7 +1200,9 @@ int cbmc_parse_optionst::doit()
     cmdline.isset("native-jces") &&
     !cmdline.isset("unwind-suggest") &&
     segmented_fold_conservation_proof(
-      goto_model, ui_message_handler))
+      goto_model, ui_message_handler) &&
+    output_native_correctness_witness(
+      goto_model, options, native_witness_assertions))
   {
     std::cout << "VERIFICATION SUCCESSFUL\n";
     return CPROVER_EXIT_SUCCESS;
@@ -1071,7 +1212,105 @@ int cbmc_parse_optionst::doit()
     cmdline.isset("native-jces") &&
     !cmdline.isset("unwind-suggest") &&
     group_action_cancellation_proof(
-      goto_model, ui_message_handler))
+      goto_model, ui_message_handler) &&
+    output_native_correctness_witness(
+      goto_model, options, native_witness_assertions))
+  {
+    std::cout << "VERIFICATION SUCCESSFUL\n";
+    return CPROVER_EXIT_SUCCESS;
+  }
+
+  if(
+    cmdline.isset("native-jces") &&
+    !cmdline.isset("unwind-suggest") &&
+    partitioned_count_reduction_proof(
+      goto_model, ui_message_handler) &&
+    output_native_correctness_witness(
+      goto_model, options, native_witness_assertions))
+  {
+    std::cout << "VERIFICATION SUCCESSFUL\n";
+    return CPROVER_EXIT_SUCCESS;
+  }
+
+  if(
+    cmdline.isset("native-jces") &&
+    !cmdline.isset("unwind-suggest") &&
+    finite_two_sided_disjunction_proof(
+      goto_model, ui_message_handler) &&
+    output_native_correctness_witness(
+      goto_model, options, native_witness_assertions))
+  {
+    std::cout << "VERIFICATION SUCCESSFUL\n";
+    return CPROVER_EXIT_SUCCESS;
+  }
+
+  if(
+    cmdline.isset("native-jces") &&
+    !cmdline.isset("unwind-suggest") &&
+    completion_flag_arithmetic_proof(
+      goto_model, ui_message_handler) &&
+    output_native_correctness_witness(
+      goto_model, options, native_witness_assertions))
+  {
+    std::cout << "VERIFICATION SUCCESSFUL\n";
+    return CPROVER_EXIT_SUCCESS;
+  }
+
+  if(
+    cmdline.isset("native-jces") &&
+    !cmdline.isset("unwind-suggest") &&
+    nonzero_cas_seed_proof(
+      goto_model, ui_message_handler) &&
+    output_native_correctness_witness(
+      goto_model, options, native_witness_assertions))
+  {
+    std::cout << "VERIFICATION SUCCESSFUL\n";
+    return CPROVER_EXIT_SUCCESS;
+  }
+
+  if(
+    cmdline.isset("native-jces") &&
+    !cmdline.isset("unwind-suggest") &&
+    monotone_chunk_maximum_proof(
+      goto_model, ui_message_handler) &&
+    output_native_correctness_witness(
+      goto_model, options, native_witness_assertions))
+  {
+    std::cout << "VERIFICATION SUCCESSFUL\n";
+    return CPROVER_EXIT_SUCCESS;
+  }
+
+  if(
+    cmdline.isset("native-jces") &&
+    !cmdline.isset("unwind-suggest") &&
+    linear_tiled_copy_equivalence_proof(
+      goto_model, ui_message_handler) &&
+    output_native_correctness_witness(
+      goto_model, options, native_witness_assertions))
+  {
+    std::cout << "VERIFICATION SUCCESSFUL\n";
+    return CPROVER_EXIT_SUCCESS;
+  }
+
+  if(
+    cmdline.isset("native-jces") &&
+    !cmdline.isset("unwind-suggest") &&
+    atomic_queue_occupancy_value_proof(
+      goto_model, ui_message_handler) &&
+    output_native_correctness_witness(
+      goto_model, options, native_witness_assertions))
+  {
+    std::cout << "VERIFICATION SUCCESSFUL\n";
+    return CPROVER_EXIT_SUCCESS;
+  }
+
+  if(
+    cmdline.isset("native-jces") &&
+    !cmdline.isset("unwind-suggest") &&
+    isomorphic_modular_fold_pair_proof(
+      goto_model, ui_message_handler) &&
+    output_native_correctness_witness(
+      goto_model, options, native_witness_assertions))
   {
     std::cout << "VERIFICATION SUCCESSFUL\n";
     return CPROVER_EXIT_SUCCESS;
@@ -1086,7 +1325,9 @@ int cbmc_parse_optionst::doit()
   if(
     !cmdline.isset("unwind-suggest") &&
     relational_comparator_transitivity_proof(
-      goto_model, ui_message_handler))
+      goto_model, ui_message_handler) &&
+    output_native_correctness_witness(
+      goto_model, options, native_witness_assertions))
   {
     std::cout << "VERIFICATION SUCCESSFUL\n";
     return CPROVER_EXIT_SUCCESS;
@@ -1116,7 +1357,9 @@ int cbmc_parse_optionst::doit()
 
   if(
     cmdline.isset("native-property-affine-proof") &&
-    property_directed_affine_proof(goto_model, ui_message_handler))
+    property_directed_affine_proof(goto_model, ui_message_handler) &&
+    output_native_correctness_witness(
+      goto_model, options, native_witness_assertions))
   {
     std::cout << "VERIFICATION SUCCESSFUL\n";
     return CPROVER_EXIT_SUCCESS;
@@ -1132,55 +1375,86 @@ int cbmc_parse_optionst::doit()
     cmdline.isset("native-jces") &&
     !cmdline.isset("unwind-suggest"))
   {
-    if(property_directed_affine_proof(goto_model, ui_message_handler))
+    if(
+      property_directed_affine_proof(goto_model, ui_message_handler) &&
+      output_native_correctness_witness(
+        goto_model, options, native_witness_assertions))
     {
       std::cout << "VERIFICATION SUCCESSFUL\n";
       return CPROVER_EXIT_SUCCESS;
     }
-    if(relational_order_law_proof(goto_model, ui_message_handler))
+    if(
+      relational_order_law_proof(goto_model, ui_message_handler) &&
+      output_native_correctness_witness(
+        goto_model, options, native_witness_assertions))
     {
       std::cout << "VERIFICATION SUCCESSFUL\n";
       return CPROVER_EXIT_SUCCESS;
     }
-    if(extremum_cone_proof(goto_model, ui_message_handler))
+    if(
+      extremum_cone_proof(goto_model, ui_message_handler) &&
+      output_native_correctness_witness(
+        goto_model, options, native_witness_assertions))
     {
       std::cout << "VERIFICATION SUCCESSFUL\n";
       return CPROVER_EXIT_SUCCESS;
     }
-    if(lock_relational_ai_transform(goto_model, ui_message_handler))
+    if(
+      lock_relational_ai_transform(goto_model, ui_message_handler) &&
+      output_native_correctness_witness(
+        goto_model, options, native_witness_assertions))
     {
       std::cout << "VERIFICATION SUCCESSFUL\n";
       return CPROVER_EXIT_SUCCESS;
     }
     if(
       std::getenv("DEAGLE_INDEX_REGION_OWNERSHIP_MODE") != nullptr &&
-      index_region_ownership_proof(goto_model, ui_message_handler))
+      index_region_ownership_proof(goto_model, ui_message_handler) &&
+      output_native_correctness_witness(
+        goto_model, options, native_witness_assertions))
     {
       std::cout << "VERIFICATION SUCCESSFUL\n";
       return CPROVER_EXIT_SUCCESS;
     }
     if(
       std::getenv("DEAGLE_POST_STORE_STABLE_CELL_MODE") != nullptr &&
-      post_store_stable_cell_proof(goto_model, ui_message_handler))
+      post_store_stable_cell_proof(goto_model, ui_message_handler) &&
+      output_native_correctness_witness(
+        goto_model, options, native_witness_assertions))
     {
       std::cout << "VERIFICATION SUCCESSFUL\n";
       return CPROVER_EXIT_SUCCESS;
     }
     if(
       std::getenv("DEAGLE_STACK_CAPACITY_MODE") != nullptr &&
-      stack_capacity_invariant_proof(goto_model, ui_message_handler))
+      stack_capacity_invariant_proof(goto_model, ui_message_handler) &&
+      output_native_correctness_witness(
+        goto_model, options, native_witness_assertions))
     {
       std::cout << "VERIFICATION SUCCESSFUL\n";
       return CPROVER_EXIT_SUCCESS;
     }
     if(
       std::getenv("DEAGLE_QUEUE_SEQUENCE_MODE") != nullptr &&
-      queue_sequence_correspondence_proof(goto_model, ui_message_handler))
+      queue_sequence_correspondence_proof(goto_model, ui_message_handler) &&
+      output_native_correctness_witness(
+        goto_model, options, native_witness_assertions))
+    {
+      std::cout << "VERIFICATION SUCCESSFUL\n";
+      return CPROVER_EXIT_SUCCESS;
+    }
+    if(
+      dynamic_tls_calloc_zero_proof(
+        goto_model, ui_message_handler) &&
+      output_native_correctness_witness(
+        goto_model, options, native_witness_assertions))
     {
       std::cout << "VERIFICATION SUCCESSFUL\n";
       return CPROVER_EXIT_SUCCESS;
     }
     const bool jces_model_transformed =
+      tls_destructor_counterexample_transform(
+        goto_model, ui_message_handler) ||
       homogeneous_thread_local_cutoff_transform(
         goto_model, ui_message_handler) ||
       predicate_stable_linearization_transform(
@@ -1238,14 +1512,25 @@ int cbmc_parse_optionst::doit()
 
   if(cmdline.isset("interference-predicate-fixedpoint"))
   {
-    interference_predicate_fixedpoint(goto_model, ui_message_handler);
+    const auto result =
+      interference_predicate_fixedpoint(goto_model, ui_message_handler);
+    if(
+      result == interference_predicate_resultt::SAFE &&
+      output_native_correctness_witness(
+        goto_model, options, native_witness_assertions))
+      std::cout << "VERIFICATION SUCCESSFUL\n";
     return CPROVER_EXIT_SUCCESS;
   }
 
   if(cmdline.isset("interference-predicate-recursive-worker-fixedpoint"))
   {
-    interference_predicate_fixedpoint(
+    const auto result = interference_predicate_fixedpoint(
       goto_model, ui_message_handler, true);
+    if(
+      result == interference_predicate_resultt::SAFE &&
+      output_native_correctness_witness(
+        goto_model, options, native_witness_assertions))
+      std::cout << "VERIFICATION SUCCESSFUL\n";
     return CPROVER_EXIT_SUCCESS;
   }
 
@@ -1253,7 +1538,10 @@ int cbmc_parse_optionst::doit()
   {
     const auto result =
       protocol_capacity_cutoff(goto_model, ui_message_handler);
-    if(result == protocol_capacity_resultt::SAFE)
+    if(
+      result == protocol_capacity_resultt::SAFE &&
+      output_native_correctness_witness(
+        goto_model, options, native_witness_assertions))
     {
       std::cout << "VERIFICATION SUCCESSFUL\n";
       return CPROVER_EXIT_SUCCESS;
@@ -1402,6 +1690,13 @@ int cbmc_parse_optionst::doit()
   const resultt result = (*verifier)();
   verifier->report();
 
+  if(
+    result == resultt::PASS &&
+    !options.get_option("graphml-witness").empty() &&
+    !output_native_correctness_witness(
+      goto_model, options, native_witness_assertions))
+    return CPROVER_EXIT_INTERNAL_ERROR;
+
   return result_to_exit_code(result);
 }
 
@@ -1420,7 +1715,8 @@ int cbmc_parse_optionst::get_goto_program(
   goto_modelt &goto_model,
   const optionst &options,
   const cmdlinet &cmdline,
-  ui_message_handlert &ui_message_handler)
+  ui_message_handlert &ui_message_handler,
+  const std::function<void(const goto_modelt &)> &before_processing)
 {
   messaget log{ui_message_handler};
   if(cmdline.args.empty())
@@ -1430,6 +1726,9 @@ int cbmc_parse_optionst::get_goto_program(
   }
 
   goto_model = initialize_goto_model(cmdline.args, ui_message_handler, options);
+
+  if(before_processing)
+    before_processing(goto_model);
 
   if(cmdline.isset("show-symbol-table"))
   {
