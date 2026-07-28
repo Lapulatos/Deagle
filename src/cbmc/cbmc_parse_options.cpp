@@ -1084,6 +1084,15 @@ int cbmc_parse_optionst::doit()
       native_model_transformed;
 
   if(
+    !cmdline.isset("unwind-suggest") &&
+    relational_comparator_transitivity_proof(
+      goto_model, ui_message_handler))
+  {
+    std::cout << "VERIFICATION SUCCESSFUL\n";
+    return CPROVER_EXIT_SUCCESS;
+  }
+
+  if(
     cmdline.isset("native-jces") &&
     !cmdline.isset("unwind-suggest"))
     native_model_transformed =

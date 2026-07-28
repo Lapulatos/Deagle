@@ -10,6 +10,10 @@ Module: Relational Extremum-Cone Invariant
 class goto_modelt;
 class message_handlert;
 
+bool relational_comparator_transitivity_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 bool extremum_cone_proof(
   const goto_modelt &goto_model,
   message_handlert &message_handler);
