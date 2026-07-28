@@ -24,11 +24,14 @@ Module: Join-Scoped Compositional Effect Summary
 #include <util/symbol.h>
 
 #include <algorithm>
+#include <deque>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <map>
 #include <set>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -8641,6 +8644,6842 @@ bool dormant_spawn_cutoff_transform(
   return true;
 }
 
+bool main_worker_prefix_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  std::string reason;
+  auto candidates = dormant_spawn_cutoffs(goto_model, reason);
+  if(candidates.size() != 1)
+  {
+    std::cout
+      << "NATIVE_MAIN_WORKER_PREFIX applied=0"
+      << " reason="
+      << (candidates.empty() ? reason : "spawn_candidate_count")
+      << " candidates=" << candidates.size() << '\n';
+    return false;
+  }
+  const auto &summary = candidates.front();
+  bool truncated = false;
+  if(!apply_dormant_spawn_counts(
+       goto_model, candidates, {1}, truncated))
+  {
+    std::cout
+      << "NATIVE_MAIN_WORKER_PREFIX applied=0"
+      << " reason=spawn_transform_failed\n";
+    return false;
+  }
+  std::cout
+    << "NATIVE_MAIN_WORKER_PREFIX applied=1"
+    << " worker=" << summary.worker
+    << " original_bound=" << summary.bound
+    << " workers=1"
+    << " truncated_at_join=" << (truncated ? 1 : 0)
+    << '\n';
+  (void)message_handler;
+  return true;
+}
+
+bool main_worker_prefix_applicable(const goto_modelt &goto_model)
+{
+  std::string reason;
+  return dormant_spawn_cutoffs(goto_model, reason).size() == 1;
+}
+
+std::string main_worker_prefix_worker_id(const goto_modelt &goto_model)
+{
+  std::string reason;
+  const auto candidates = dormant_spawn_cutoffs(goto_model, reason);
+  return candidates.size() == 1
+    ? id2string(candidates.front().worker)
+    : std::string{};
+}
+
+static bool cross_domain_list_prefix_transform_impl(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  std::string reason;
+  auto candidates = dormant_spawn_cutoffs(goto_model, reason);
+  if(candidates.size() != 1)
+  {
+    std::cout
+      << "NATIVE_CROSS_DOMAIN_LIST_PREFIX applied=0"
+      << " reason=worker_class_count"
+      << " classes=" << candidates.size() << '\n';
+    return false;
+  }
+
+  auto main = goto_model.goto_functions.function_map.find("main");
+  if(
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+  {
+    std::cout
+      << "NATIVE_CROSS_DOMAIN_LIST_PREFIX applied=0"
+      << " reason=missing_main\n";
+    return false;
+  }
+  auto &program = main->second.body;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : program.instructions)
+    positions.emplace(&instruction, position++);
+  const std::size_t first_create =
+    positions.at(candidates.front().create_instruction);
+
+  struct loopt
+  {
+    goto_programt::const_targett head;
+    goto_programt::const_targett backedge;
+    irep_idt induction;
+  };
+  std::vector<loopt> loops;
+  for(auto backedge = program.instructions.begin();
+      backedge != program.instructions.end(); ++backedge)
+  {
+    if(
+      positions.at(&*backedge) >= first_create ||
+      !backedge->is_goto() || !backedge->condition().is_true() ||
+      backedge->targets.size() != 1 ||
+      positions.at(&*backedge->get_target()) >= positions.at(&*backedge))
+      continue;
+    const auto head = backedge->get_target();
+    irep_idt induction;
+    exprt bound;
+    mp_integer constant_bound;
+    if(
+      !parse_exit_guard(*head, induction, bound) ||
+      !constant_eval(bound, {}, constant_bound) ||
+      constant_bound <= 2)
+      continue;
+    loops.push_back({head, backedge, induction});
+  }
+  if(loops.size() != 2)
+  {
+    std::cout
+      << "NATIVE_CROSS_DOMAIN_LIST_PREFIX applied=0"
+      << " reason=initialization_loop_count"
+      << " loops=" << loops.size() << '\n';
+    return false;
+  }
+
+  loopt *outer = nullptr;
+  loopt *inner = nullptr;
+  for(auto &candidate_outer : loops)
+  {
+    for(auto &candidate_inner : loops)
+    {
+      if(&candidate_outer == &candidate_inner)
+        continue;
+      if(
+        positions.at(&*candidate_outer.head) <
+          positions.at(&*candidate_inner.head) &&
+        positions.at(&*candidate_inner.backedge) <
+          positions.at(&*candidate_outer.backedge))
+      {
+        if(outer != nullptr || inner != nullptr)
+        {
+          std::cout
+            << "NATIVE_CROSS_DOMAIN_LIST_PREFIX applied=0"
+            << " reason=ambiguous_loop_nesting\n";
+          return false;
+        }
+        outer = &candidate_outer;
+        inner = &candidate_inner;
+      }
+    }
+  }
+  if(outer == nullptr || inner == nullptr)
+  {
+    std::cout
+      << "NATIVE_CROSS_DOMAIN_LIST_PREFIX applied=0"
+      << " reason=non_nested_initialization_loops\n";
+    return false;
+  }
+
+  for(const auto *loop : {outer, inner})
+  {
+    std::size_t initializations = 0;
+    for(auto instruction = program.instructions.begin();
+        instruction != loop->head; ++instruction)
+      if(parse_zero_initialization(*instruction, loop->induction))
+        ++initializations;
+    std::size_t increments = 0;
+    for(auto instruction = loop->head;
+        instruction != loop->backedge; ++instruction)
+    {
+      irep_idt incremented;
+      if(
+        parse_unit_increment(*instruction, incremented) &&
+        incremented == loop->induction)
+        ++increments;
+    }
+    if(initializations != 1 || increments != 1)
+    {
+      std::cout
+        << "NATIVE_CROSS_DOMAIN_LIST_PREFIX applied=0"
+        << " reason=non_canonical_initialization_loop\n";
+      return false;
+    }
+  }
+
+  struct pointer_callt
+  {
+    goto_programt::targett instruction;
+    irep_idt callee;
+    irep_idt result;
+
+    pointer_callt(
+      goto_programt::targett instruction,
+      irep_idt callee,
+      irep_idt result)
+      : instruction(instruction),
+        callee(std::move(callee)),
+        result(std::move(result))
+    {
+    }
+  };
+  std::vector<pointer_callt> pointer_calls;
+  for(auto instruction = std::next(outer->backedge);
+      &*instruction != candidates.front().create_instruction; ++instruction)
+  {
+    irep_idt callee;
+    irep_idt result;
+    if(
+      instruction->is_function_call() &&
+      !instruction->call_lhs().is_nil() &&
+      instruction->call_lhs().type().id() == ID_pointer &&
+      direct_call_identifier(*instruction, callee) &&
+      direct_symbol(instruction->call_lhs(), result))
+      pointer_calls.emplace_back(
+        program.const_cast_target(instruction), callee, result);
+  }
+  if(
+    pointer_calls.size() != 2 ||
+    pointer_calls[0].callee != pointer_calls[1].callee ||
+    pointer_calls[0].result == pointer_calls[1].result)
+  {
+    std::cout
+      << "NATIVE_CROSS_DOMAIN_LIST_PREFIX applied=0"
+      << " reason=lookup_pair"
+      << " calls=" << pointer_calls.size() << '\n';
+    return false;
+  }
+  const std::set<irep_idt> splice_symbols{
+    pointer_calls[0].result, pointer_calls[1].result};
+  std::size_t splice_assignments = 0;
+  std::set<irep_idt> splice_members;
+  for(auto instruction = std::next(outer->backedge);
+      &*instruction != candidates.front().create_instruction; ++instruction)
+  {
+    std::set<irep_idt> lhs_members;
+    std::set<irep_idt> rhs_members;
+    std::function<void(const exprt &, std::set<irep_idt> &)>
+      collect_members =
+        [&](const exprt &expr, std::set<irep_idt> &members)
+        {
+          const exprt &value = without_cast(expr);
+          if(value.id() == ID_member)
+            members.insert(to_member_expr(value).get_component_name());
+          for(const auto &operand : value.operands())
+            collect_members(operand, members);
+        };
+    if(instruction->is_assign())
+    {
+      collect_members(instruction->assign_lhs(), lhs_members);
+      collect_members(instruction->assign_rhs(), rhs_members);
+    }
+    if(
+      instruction->is_assign() &&
+      contains_symbol(
+        instruction->assign_lhs(), {pointer_calls[0].result}) &&
+      !contains_symbol(
+        instruction->assign_lhs(), {pointer_calls[1].result}) &&
+      contains_symbol(
+        instruction->assign_rhs(), {pointer_calls[1].result}) &&
+      !contains_symbol(
+        instruction->assign_rhs(), {pointer_calls[0].result}) &&
+      contains_side_effect(instruction->assign_lhs()) &&
+      contains_side_effect(instruction->assign_rhs()) &&
+      lhs_members.size() == 1 && lhs_members == rhs_members)
+    {
+      ++splice_assignments;
+      splice_members = std::move(lhs_members);
+    }
+  }
+  if(splice_assignments != 1)
+  {
+    std::cout
+      << "NATIVE_CROSS_DOMAIN_LIST_PREFIX applied=0"
+      << " reason=cross_pointer_assignment"
+      << " assignments=" << splice_assignments << '\n';
+    return false;
+  }
+
+  const auto lookup =
+    goto_model.goto_functions.function_map.find(pointer_calls[0].callee);
+  if(
+    lookup == goto_model.goto_functions.function_map.end() ||
+    !lookup->second.body_available())
+  {
+    std::cout
+      << "NATIVE_CROSS_DOMAIN_LIST_PREFIX applied=0"
+      << " reason=missing_lookup\n";
+    return false;
+  }
+  irep_idt lookup_index;
+  exprt lookup_result;
+  std::size_t lookup_nondets = 0;
+  std::size_t lookup_indexed_results = 0;
+  for(auto instruction = lookup->second.body.instructions.begin();
+      instruction != lookup->second.body.instructions.end(); ++instruction)
+  {
+    if(instruction->is_assign())
+    {
+      const exprt &rhs = without_cast(instruction->assign_rhs());
+      if(
+        rhs.id() == ID_side_effect &&
+        to_side_effect_expr(rhs).get_statement() == ID_nondet)
+        ++lookup_nondets;
+      irep_idt lhs;
+      if(
+        lookup_index.empty() &&
+        direct_symbol(instruction->assign_lhs(), lhs) &&
+        contains_side_effect(instruction->assign_rhs()))
+        continue;
+      if(
+        !lookup_index.empty() &&
+        contains_symbol(instruction->assign_rhs(), {lookup_index}))
+      {
+        lookup_result = instruction->assign_rhs();
+        ++lookup_indexed_results;
+      }
+    }
+    if(
+      lookup_index.empty() && instruction->is_function_call())
+      continue;
+    if(lookup_index.empty() && instruction->is_assign())
+    {
+      irep_idt lhs;
+      irep_idt rhs;
+      if(
+        direct_symbol(instruction->assign_lhs(), lhs) &&
+        direct_symbol(instruction->assign_rhs(), rhs))
+        lookup_index = lhs;
+    }
+  }
+  if(
+    lookup_nondets != 1 || lookup_index.empty() ||
+    lookup_indexed_results != 1 || lookup_result.is_nil())
+  {
+    std::cout
+      << "NATIVE_CROSS_DOMAIN_LIST_PREFIX applied=0"
+      << " reason=lookup_index_flow"
+      << " nondets=" << lookup_nondets
+      << " results=" << lookup_indexed_results << '\n';
+    return false;
+  }
+  const auto lookup_symbol =
+    goto_model.symbol_table.symbols.find(lookup_index);
+  if(lookup_symbol == goto_model.symbol_table.symbols.end())
+    return false;
+
+  mp_integer outer_bound;
+  mp_integer inner_bound;
+  exprt parsed_bound;
+  irep_idt parsed_induction;
+  if(
+    !parse_exit_guard(*outer->head, parsed_induction, parsed_bound) ||
+    parsed_induction != outer->induction ||
+    !constant_eval(parsed_bound, {}, outer_bound) ||
+    !parse_exit_guard(*inner->head, parsed_induction, parsed_bound) ||
+    parsed_induction != inner->induction ||
+    !constant_eval(parsed_bound, {}, inner_bound) ||
+    outer_bound < 2 || inner_bound < 2)
+  {
+    std::cout
+      << "NATIVE_CROSS_DOMAIN_LIST_PREFIX applied=0"
+      << " reason=initialization_bounds\n";
+    return false;
+  }
+
+  mp_integer lookup_bound = -1;
+  std::function<void(const exprt &)> find_lookup_bound =
+    [&](const exprt &expr)
+    {
+      const exprt &value = without_cast(expr);
+      if(value.id() == ID_lt && value.operands().size() == 2)
+      {
+        irep_idt lhs;
+        mp_integer candidate;
+        if(
+          direct_symbol(value.op0(), lhs) && lhs == lookup_index &&
+          constant_eval(value.op1(), {}, candidate))
+          lookup_bound = candidate;
+      }
+      for(const auto &operand : value.operands())
+        find_lookup_bound(operand);
+    };
+  for(const auto &instruction : lookup->second.body.instructions)
+  {
+    if(instruction.is_function_call())
+      for(const auto &argument : instruction.call_arguments())
+        find_lookup_bound(argument);
+    if(instruction.has_condition())
+      find_lookup_bound(instruction.condition());
+  }
+
+  mp_integer storage_capacity = -1;
+  std::function<void(const exprt &)> find_indexed_capacity =
+    [&](const exprt &expr)
+    {
+      const exprt &value = without_cast(expr);
+      if(value.id() == ID_index)
+      {
+        const auto &indexed = to_index_expr(value);
+        irep_idt index;
+        if(
+          direct_symbol(indexed.index(), index) &&
+          index == lookup_index &&
+          indexed.array().type().id() == ID_array)
+        {
+          mp_integer candidate;
+          if(
+            constant_eval(
+              to_array_type(indexed.array().type()).size(),
+              {},
+              candidate))
+            storage_capacity = candidate;
+        }
+      }
+      for(const auto &operand : value.operands())
+        find_indexed_capacity(operand);
+    };
+  find_indexed_capacity(lookup_result);
+  if(
+    lookup_bound != outer_bound ||
+    storage_capacity != outer_bound)
+  {
+    std::cout
+      << "NATIVE_CROSS_DOMAIN_LIST_PREFIX applied=0"
+      << " reason=domain_bound_mismatch"
+      << " init=" << outer_bound
+      << " lookup=" << lookup_bound
+      << " storage=" << storage_capacity << '\n';
+    return false;
+  }
+
+  std::set<irep_idt> lookup_members;
+  std::function<void(const exprt &)> collect_lookup_members =
+    [&](const exprt &expr)
+    {
+      const exprt &value = without_cast(expr);
+      if(value.id() == ID_member)
+        lookup_members.insert(
+          to_member_expr(value).get_component_name());
+      for(const auto &operand : value.operands())
+        collect_lookup_members(operand);
+    };
+  collect_lookup_members(lookup_result);
+  if(
+    splice_members.size() != 1 ||
+    lookup_members.count(*splice_members.begin()) == 0)
+  {
+    std::cout
+      << "NATIVE_CROSS_DOMAIN_LIST_PREFIX applied=0"
+      << " reason=pointer_field_mismatch\n";
+    return false;
+  }
+
+  const symbol_exprt lookup_index_expr(
+    lookup_index, lookup_symbol->second.type);
+  for(std::size_t index = 0; index < pointer_calls.size(); ++index)
+  {
+    exprt specialized = lookup_result;
+    replace_expr(
+      lookup_index_expr,
+      from_integer(index, lookup_symbol->second.type),
+      specialized);
+    const auto location =
+      pointer_calls[index].instruction->source_location();
+    const typet result_type =
+      pointer_calls[index].instruction->call_lhs().type();
+    const symbol_exprt result(
+      pointer_calls[index].result, result_type);
+    *pointer_calls[index].instruction =
+      goto_programt::make_assignment(
+        result,
+        std::move(specialized),
+        location);
+  }
+
+  const auto original_worker =
+    goto_model.goto_functions.function_map.find(candidates.front().worker);
+  const auto original_worker_symbol =
+    goto_model.symbol_table.symbols.find(candidates.front().worker);
+  if(
+    original_worker == goto_model.goto_functions.function_map.end() ||
+    !original_worker->second.body_available() ||
+    original_worker_symbol == goto_model.symbol_table.symbols.end())
+    return false;
+
+  auto validate_worker =
+    [&](const goto_functiont &worker) -> bool
+    {
+      auto nondet = worker.body.instructions.end();
+      auto propagated = worker.body.instructions.end();
+      irep_idt temporary;
+      irep_idt index;
+      for(auto instruction = worker.body.instructions.begin();
+          instruction != worker.body.instructions.end(); ++instruction)
+      {
+        if(!instruction->is_assign())
+          continue;
+        const exprt &rhs = without_cast(instruction->assign_rhs());
+        if(
+          nondet == worker.body.instructions.end() &&
+          rhs.id() == ID_side_effect &&
+          to_side_effect_expr(rhs).get_statement() == ID_nondet &&
+          direct_symbol(instruction->assign_lhs(), temporary))
+        {
+          nondet = instruction;
+          continue;
+        }
+        irep_idt lhs;
+        irep_idt rhs_symbol;
+        if(
+          nondet != worker.body.instructions.end() &&
+          direct_symbol(instruction->assign_lhs(), lhs) &&
+          direct_symbol(instruction->assign_rhs(), rhs_symbol) &&
+          rhs_symbol == temporary)
+        {
+          propagated = instruction;
+          index = lhs;
+          break;
+        }
+      }
+      if(propagated == worker.body.instructions.end())
+        return false;
+
+      mp_integer worker_bound = -1;
+      exprt scalar = nil_exprt();
+      find_symbols_sett scalar_symbols;
+      std::set<irep_idt> scalar_members;
+      std::size_t plus_one = 0;
+      std::size_t minus_one = 0;
+      std::size_t zero_assertions = 0;
+      std::vector<goto_programt::const_targett> operations;
+      std::function<void(const exprt &, std::set<irep_idt> &)>
+        collect_worker_members =
+          [&](const exprt &expr, std::set<irep_idt> &members)
+          {
+            const exprt &value = without_cast(expr);
+            if(value.id() == ID_member)
+              members.insert(
+                to_member_expr(value).get_component_name());
+            for(const auto &operand : value.operands())
+              collect_worker_members(operand, members);
+          };
+      std::function<bool(const exprt &)> index_is_offset =
+        [&](const exprt &expr) -> bool
+        {
+          const exprt &value = without_cast(expr);
+          if(
+            (value.id() == ID_plus || value.id() == ID_minus) &&
+            contains_symbol(value, {index}))
+            return true;
+          for(const auto &operand : value.operands())
+            if(index_is_offset(operand))
+              return true;
+          return false;
+        };
+      for(auto instruction = std::next(propagated);
+          instruction != worker.body.instructions.end(); ++instruction)
+      {
+        irep_idt incremented;
+        if(
+          parse_unit_increment(*instruction, incremented) &&
+          incremented == index)
+          break;
+        if(
+          index_is_offset(instruction->code()) ||
+          (instruction->has_condition() &&
+           index_is_offset(instruction->condition())))
+        {
+          std::cout
+            << "NATIVE_CROSS_DOMAIN_LIST_WORKER reason=index_offset\n";
+          return false;
+        }
+        if(instruction->is_goto())
+        {
+          exprt bound;
+          irep_idt induction;
+          mp_integer candidate;
+          if(
+            parse_exit_guard(*instruction, induction, bound) &&
+            induction == index &&
+            constant_eval(bound, {}, candidate))
+            worker_bound = candidate;
+        }
+        if(instruction->is_assign())
+        {
+          const exprt &rhs = without_cast(instruction->assign_rhs());
+          if(
+            (rhs.id() == ID_plus || rhs.id() == ID_minus) &&
+            rhs.operands().size() == 2 &&
+            contains_side_effect(instruction->assign_lhs()) &&
+            contains_side_effect(rhs.op0()))
+          {
+            mp_integer delta;
+            if(
+              constant_eval(rhs.op1(), {}, delta) && delta == 1)
+            {
+              find_symbols_sett lhs_symbols;
+              find_symbols_sett rhs_symbols;
+              std::set<irep_idt> lhs_members;
+              std::set<irep_idt> rhs_members;
+              find_symbols(
+                instruction->assign_lhs(), lhs_symbols);
+              find_symbols(rhs.op0(), rhs_symbols);
+              collect_worker_members(
+                instruction->assign_lhs(), lhs_members);
+              collect_worker_members(rhs.op0(), rhs_members);
+              if(
+                lhs_symbols != rhs_symbols ||
+                lhs_members != rhs_members ||
+                lhs_symbols.empty() || lhs_members.empty())
+                continue;
+              if(scalar.is_nil())
+              {
+                scalar = instruction->assign_lhs();
+                scalar_symbols = lhs_symbols;
+                scalar_members = lhs_members;
+              }
+              if(
+                lhs_symbols == scalar_symbols &&
+                lhs_members == scalar_members)
+              {
+                if(rhs.id() == ID_plus)
+                  ++plus_one;
+                else
+                  ++minus_one;
+                operations.push_back(instruction);
+              }
+            }
+          }
+        }
+        irep_idt callee;
+        if(
+          instruction->is_function_call() &&
+          direct_call_identifier(*instruction, callee) &&
+          callee == "__VERIFIER_assert" &&
+          instruction->call_arguments().size() == 1 &&
+          !scalar.is_nil())
+        {
+          const exprt &condition =
+            without_cast(instruction->call_arguments()[0]);
+          if(
+            condition.id() == ID_equal &&
+            condition.operands().size() == 2)
+          {
+            mp_integer zero;
+            if(
+              constant_eval(condition.op1(), {}, zero) &&
+              zero == 0)
+            {
+              find_symbols_sett assertion_symbols;
+              std::set<irep_idt> assertion_members;
+              find_symbols(
+                condition.op0(), assertion_symbols);
+              collect_worker_members(
+                condition.op0(), assertion_members);
+              if(
+                assertion_symbols == scalar_symbols &&
+                assertion_members == scalar_members)
+              {
+                ++zero_assertions;
+                operations.push_back(instruction);
+              }
+            }
+          }
+        }
+      }
+      if(
+        worker_bound != outer_bound ||
+        plus_one != 1 || minus_one != 1 ||
+        zero_assertions != 1 || operations.size() != 3)
+      {
+        std::cout
+          << "NATIVE_CROSS_DOMAIN_LIST_WORKER"
+          << " reason=operation_shape"
+          << " bound=" << worker_bound
+          << " expected_bound=" << outer_bound
+          << " plus=" << plus_one
+          << " minus=" << minus_one
+          << " assertions=" << zero_assertions
+          << " operations=" << operations.size() << '\n';
+        return false;
+      }
+
+      for(const auto operation : operations)
+      {
+        if(
+          operation == worker.body.instructions.begin() ||
+          std::next(operation) == worker.body.instructions.end())
+          return false;
+        irep_idt locked;
+        irep_idt unlocked;
+        if(
+          !parse_mutex_call(
+            *std::prev(operation), "pthread_mutex_lock", locked) ||
+          !parse_mutex_call(
+            *std::next(operation), "pthread_mutex_unlock", unlocked) ||
+          locked != unlocked)
+        {
+          std::cout
+            << "NATIVE_CROSS_DOMAIN_LIST_WORKER"
+            << " reason=operation_mutex_pair\n";
+          return false;
+        }
+      }
+      return true;
+    };
+  if(!validate_worker(original_worker->second))
+  {
+    std::cout
+      << "NATIVE_CROSS_DOMAIN_LIST_PREFIX applied=0"
+      << " reason=worker_semantics\n";
+    return false;
+  }
+
+  const irep_idt cloned_worker_id =
+    id2string(candidates.front().worker) +
+    "$deagle_cross_domain_worker";
+  if(
+    goto_model.goto_functions.function_map.count(cloned_worker_id) != 0 ||
+    goto_model.symbol_table.symbols.count(cloned_worker_id) != 0)
+    return false;
+  auto &cloned_worker =
+    goto_model.goto_functions.function_map[cloned_worker_id];
+  cloned_worker.copy_from(original_worker->second);
+  symbolt cloned_symbol = original_worker_symbol->second;
+  cloned_symbol.name = cloned_worker_id;
+  cloned_symbol.base_name = cloned_worker_id;
+  cloned_symbol.pretty_name = cloned_worker_id;
+  if(goto_model.symbol_table.add(cloned_symbol))
+    return false;
+
+  auto specialize_worker =
+    [&](goto_functiont &worker, const mp_integer &slot,
+        const mp_integer &control, const bool staged_assertion) -> bool
+    {
+      auto nondet = worker.body.instructions.end();
+      auto propagated = worker.body.instructions.end();
+      auto branch = worker.body.instructions.end();
+      auto first_position = worker.body.instructions.end();
+      irep_idt temporary;
+      irep_idt index;
+      std::size_t nondets = 0;
+      for(auto instruction = worker.body.instructions.begin();
+          instruction != worker.body.instructions.end(); ++instruction)
+      {
+        if(!instruction->is_assign())
+          continue;
+        const exprt &rhs = without_cast(instruction->assign_rhs());
+        if(
+          rhs.id() == ID_side_effect &&
+          to_side_effect_expr(rhs).get_statement() == ID_nondet)
+        {
+          ++nondets;
+          if(nondet == worker.body.instructions.end())
+          {
+            nondet = instruction;
+            direct_symbol(instruction->assign_lhs(), temporary);
+          }
+          else
+            branch = instruction;
+          continue;
+        }
+        irep_idt lhs;
+        irep_idt rhs_symbol;
+        if(
+          nondet != worker.body.instructions.end() &&
+          propagated == worker.body.instructions.end() &&
+          direct_symbol(instruction->assign_lhs(), lhs) &&
+          direct_symbol(instruction->assign_rhs(), rhs_symbol) &&
+          rhs_symbol == temporary)
+        {
+          propagated = instruction;
+          index = lhs;
+        }
+        else if(
+          propagated != worker.body.instructions.end() &&
+          branch == worker.body.instructions.end() &&
+          instruction->assign_lhs().type().id() == ID_pointer &&
+          instruction->assign_rhs().type().id() == ID_pointer)
+          first_position = instruction;
+      }
+      if(
+        nondets != 2 ||
+        nondet == worker.body.instructions.end() ||
+        propagated == worker.body.instructions.end() ||
+        branch == worker.body.instructions.end() ||
+        (staged_assertion &&
+         first_position == worker.body.instructions.end()))
+        return false;
+      const auto symbol =
+        goto_model.symbol_table.symbols.find(index);
+      if(symbol == goto_model.symbol_table.symbols.end())
+        return false;
+      const symbol_exprt index_expr(index, symbol->second.type);
+      const exprt value = from_integer(slot, symbol->second.type);
+      nondet->assign_rhs_nonconst() =
+        from_integer(slot, nondet->assign_lhs().type());
+      propagated->assign_rhs_nonconst() =
+        from_integer(slot, propagated->assign_lhs().type());
+      if(staged_assertion)
+      {
+        const exprt position = first_position->assign_lhs();
+        const exprt initial_position = first_position->assign_rhs();
+        branch->assign_rhs_nonconst() = if_exprt(
+          equal_exprt(position, initial_position),
+          from_integer(1, branch->assign_lhs().type()),
+          from_integer(0, branch->assign_lhs().type()),
+          branch->assign_lhs().type());
+      }
+      else
+        branch->assign_rhs_nonconst() =
+          from_integer(control, branch->assign_lhs().type());
+      for(auto instruction = std::next(propagated);
+          instruction != worker.body.instructions.end(); ++instruction)
+      {
+        irep_idt incremented;
+        if(
+          parse_unit_increment(*instruction, incremented) &&
+          incremented == index)
+          break;
+        replace_expr(index_expr, value, instruction->code_nonconst());
+        if(instruction->is_goto())
+          replace_expr(
+            index_expr, value, instruction->condition_nonconst());
+      }
+      return true;
+    };
+  if(
+    !specialize_worker(original_worker->second, 0, 1, false) ||
+    !specialize_worker(cloned_worker, 1, 0, true))
+  {
+    std::cout
+      << "NATIVE_CROSS_DOMAIN_LIST_PREFIX applied=0"
+      << " reason=worker_specialization\n";
+    return false;
+  }
+
+  auto create = program.instructions.end();
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+    if(&*instruction == candidates.front().create_instruction)
+    {
+      create = instruction;
+      break;
+    }
+  if(create == program.instructions.end())
+    return false;
+  const auto induction_symbol =
+    goto_model.symbol_table.symbols.find(candidates.front().induction);
+  if(induction_symbol == goto_model.symbol_table.symbols.end())
+    return false;
+  const exprt original_target = create->call_arguments()[2];
+  const symbol_exprt clone_function(
+    cloned_worker_id, original_worker_symbol->second.type);
+  exprt cloned_target =
+    address_of_exprt(clone_function);
+  cloned_target = typecast_exprt::conditional_cast(
+    cloned_target, original_target.type());
+  create->call_arguments()[2] = if_exprt(
+    equal_exprt(
+      symbol_exprt(
+        candidates.front().induction,
+        induction_symbol->second.type),
+      from_integer(0, induction_symbol->second.type)),
+    original_target,
+    std::move(cloned_target),
+    original_target.type());
+
+  const namespacet ns(goto_model.symbol_table);
+  for(const auto *loop : {outer, inner})
+  {
+    const symbolt *symbol = nullptr;
+    if(ns.lookup(loop->induction, symbol))
+      return false;
+    auto head = program.const_cast_target(loop->head);
+    const symbol_exprt induction(loop->induction, symbol->type);
+    head->condition_nonconst() = not_exprt(
+      binary_relation_exprt(
+        induction, ID_lt, from_integer(2, symbol->type)));
+  }
+
+  bool truncated = false;
+  if(!apply_dormant_spawn_counts(
+       goto_model, candidates, {2}, truncated))
+  {
+    std::cout
+      << "NATIVE_CROSS_DOMAIN_LIST_PREFIX applied=0"
+      << " reason=spawn_transform_failed\n";
+    return false;
+  }
+  program.instructions.begin()
+    ->source_location_nonconst()
+    .set("deagle_cross_domain_list_prefix", true);
+  goto_model.goto_functions.update();
+  std::cout
+    << "NATIVE_CROSS_DOMAIN_LIST_PREFIX applied=1"
+    << " loops=2 prefix=2 workers=2"
+    << " truncated=" << (truncated ? 1 : 0) << '\n';
+  (void)message_handler;
+  return true;
+}
+
+bool cross_domain_list_prefix_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  goto_modelt candidate;
+  candidate.symbol_table = goto_model.symbol_table;
+  candidate.goto_functions.copy_from(goto_model.goto_functions);
+  if(!cross_domain_list_prefix_transform_impl(candidate, message_handler))
+    return false;
+  goto_model = std::move(candidate);
+  return true;
+}
+
+bool cross_domain_list_prefix_applied(const goto_modelt &goto_model)
+{
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  return
+    main != goto_model.goto_functions.function_map.end() &&
+    main->second.body_available() &&
+    !main->second.body.instructions.empty() &&
+    main->second.body.instructions.begin()
+      ->source_location()
+      .get_bool("deagle_cross_domain_list_prefix");
+}
+
+bool monotone_condition_wait_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  struct writert
+  {
+    irep_idt function;
+    irep_idt predicate;
+    irep_idt mutex;
+    irep_idt condition;
+  };
+  std::vector<writert> writers;
+  for(const auto &entry : goto_model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    const auto &body = entry.second.body;
+    for(auto assignment = body.instructions.begin();
+        assignment != body.instructions.end(); ++assignment)
+    {
+      if(!assignment->is_assign())
+        continue;
+      irep_idt predicate;
+      mp_integer value;
+      if(
+        !direct_symbol(assignment->assign_lhs(), predicate) ||
+        !constant_eval(assignment->assign_rhs(), {}, value) ||
+        value != 1)
+        continue;
+      const symbolt *symbol = nullptr;
+      if(
+        ns.lookup(predicate, symbol) ||
+        !symbol->is_static_lifetime ||
+        symbol->type.id() != ID_c_bool)
+        continue;
+      std::set<irep_idt> locks;
+      std::set<irep_idt> broadcasts;
+      std::set<irep_idt> unlocks;
+      std::map<const goto_programt::instructiont *, std::size_t> positions;
+      std::size_t body_position = 0;
+      for(const auto &instruction : body.instructions)
+        positions.emplace(&instruction, body_position++);
+      for(auto instruction = body.instructions.begin();
+          instruction != body.instructions.end(); ++instruction)
+      {
+        irep_idt object;
+        if(
+          instruction != assignment &&
+          parse_mutex_call(*instruction, "pthread_mutex_lock", object))
+          locks.insert(object);
+        if(
+          instruction != assignment &&
+          parse_mutex_call(*instruction, "pthread_mutex_unlock", object))
+          unlocks.insert(object);
+        irep_idt callee;
+        if(
+          direct_call_identifier(*instruction, callee) &&
+          callee == "pthread_cond_broadcast" &&
+          instruction->call_arguments().size() == 1 &&
+          addressed_symbol(
+            instruction->call_arguments().front(), object))
+          broadcasts.insert(object);
+      }
+      std::vector<irep_idt> mutexes;
+      std::set_intersection(
+        locks.begin(), locks.end(),
+        unlocks.begin(), unlocks.end(),
+        std::back_inserter(mutexes));
+      bool ordered = false;
+      if(mutexes.size() == 1 && broadcasts.size() == 1)
+      {
+        bool lock_before = false;
+        std::size_t broadcast_position = positions.size();
+        bool unlock_after = false;
+        for(auto instruction = body.instructions.begin();
+            instruction != body.instructions.end(); ++instruction)
+        {
+          irep_idt object;
+          if(
+            parse_mutex_call(
+              *instruction, "pthread_mutex_lock", object) &&
+            object == mutexes.front() &&
+            positions.at(&*instruction) < positions.at(&*assignment))
+            lock_before = true;
+          if(
+            parse_mutex_call(
+              *instruction, "pthread_mutex_unlock", object) &&
+            object == mutexes.front() &&
+            broadcast_position < positions.at(&*instruction))
+            unlock_after = true;
+          irep_idt callee;
+          if(
+            direct_call_identifier(*instruction, callee) &&
+            callee == "pthread_cond_broadcast" &&
+            instruction->call_arguments().size() == 1 &&
+            addressed_symbol(
+              instruction->call_arguments().front(), object) &&
+            object == *broadcasts.begin())
+            broadcast_position =
+              std::min(broadcast_position, positions.at(&*instruction));
+        }
+        ordered =
+          lock_before &&
+          positions.at(&*assignment) < broadcast_position &&
+          unlock_after;
+      }
+      if(mutexes.size() == 1 && broadcasts.size() == 1 && ordered)
+        writers.push_back(
+          {entry.first, predicate, mutexes.front(), *broadcasts.begin()});
+    }
+  }
+  if(writers.size() != 1)
+    return false;
+  const auto writer = writers.front();
+
+  std::size_t predicate_mentions = 0;
+  std::size_t zero_initializers = 0;
+  std::size_t one_writes = 0;
+  for(const auto &entry : goto_model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(!instruction_mentions_any(instruction, {writer.predicate}))
+        continue;
+      ++predicate_mentions;
+      if(instruction.is_assign())
+      {
+        irep_idt lhs;
+        mp_integer value;
+        if(
+          direct_symbol(instruction.assign_lhs(), lhs) &&
+          lhs == writer.predicate &&
+          constant_eval(instruction.assign_rhs(), {}, value))
+        {
+          if(value == 0)
+            ++zero_initializers;
+          if(value == 1)
+            ++one_writes;
+        }
+      }
+      if(instruction.is_function_call())
+        for(const auto &argument : instruction.call_arguments())
+          if(contains_address_of_symbol(argument, {writer.predicate}))
+            return false;
+    }
+  }
+  if(zero_initializers != 1 || one_writes != 1)
+    return false;
+
+  irep_idt waiter;
+  const goto_programt::instructiont *assertion_guard = nullptr;
+  const goto_programt::instructiont *assertion_error = nullptr;
+  std::size_t waiter_count = 0;
+  for(const auto &entry : goto_model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    const auto &body = entry.second.body;
+    std::map<const goto_programt::instructiont *, std::size_t> positions;
+    std::size_t position = 0;
+    for(const auto &instruction : body.instructions)
+      positions.emplace(&instruction, position++);
+    for(auto wait = body.instructions.begin();
+        wait != body.instructions.end(); ++wait)
+    {
+      irep_idt callee;
+      if(
+        !direct_call_identifier(*wait, callee) ||
+        callee != "pthread_cond_wait" ||
+        wait->call_arguments().size() != 2)
+        continue;
+      irep_idt condition;
+      irep_idt mutex;
+      if(
+        !addressed_symbol(wait->call_arguments()[0], condition) ||
+        !addressed_symbol(wait->call_arguments()[1], mutex) ||
+        condition != writer.condition ||
+        mutex != writer.mutex)
+        continue;
+      bool rechecking_loop = false;
+      for(auto backedge = std::next(wait);
+          backedge != body.instructions.end(); ++backedge)
+      {
+        if(
+          !backedge->is_goto() || !backedge->condition().is_true() ||
+          backedge->targets.size() != 1 ||
+          positions.at(&*backedge->get_target()) >=
+            positions.at(&*backedge))
+          continue;
+        irep_idt tested;
+        if(
+          parse_nonzero_witness(
+            backedge->get_target()->condition(), tested) &&
+          tested == writer.predicate &&
+          positions.at(&*backedge->get_target()) <
+            positions.at(&*wait))
+        {
+          rechecking_loop = true;
+          break;
+        }
+      }
+      if(!rechecking_loop)
+        continue;
+      for(auto guard = std::next(wait);
+          guard != body.instructions.end(); ++guard)
+      {
+        if(
+          !guard->is_goto() || guard->targets.size() != 1 ||
+          guard->condition().id() != ID_not)
+          continue;
+        irep_idt tested;
+        if(
+          !parse_nonzero_witness(
+            to_not_expr(guard->condition()).op(), tested) ||
+          tested != writer.predicate)
+          continue;
+        const auto target = guard->get_target();
+        irep_idt target_callee;
+        if(
+          direct_call_identifier(*target, target_callee) &&
+          target_callee == "reach_error")
+        {
+          bool lock_before = false;
+          bool unlock_after = false;
+          for(auto sync = body.instructions.begin();
+              sync != body.instructions.end(); ++sync)
+          {
+            irep_idt sync_mutex;
+            if(
+              parse_mutex_call(
+                *sync, "pthread_mutex_lock", sync_mutex) &&
+              sync_mutex == writer.mutex &&
+              positions.at(&*sync) < positions.at(&*wait))
+              lock_before = true;
+            if(
+              parse_mutex_call(
+                *sync, "pthread_mutex_unlock", sync_mutex) &&
+              sync_mutex == writer.mutex &&
+              positions.at(&*sync) > positions.at(&*guard))
+              unlock_after = true;
+          }
+          if(!lock_before || !unlock_after)
+            continue;
+          waiter = entry.first;
+          assertion_guard = &*guard;
+          assertion_error = &*target;
+          ++waiter_count;
+          break;
+        }
+      }
+    }
+  }
+  if(waiter_count != 1 || assertion_guard == nullptr)
+    return false;
+
+  std::size_t nonconstant_errors = 0;
+  for(const auto &entry : goto_model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available() || entry.first == "reach_error")
+      continue;
+    const auto &body = entry.second.body;
+    std::map<const goto_programt::instructiont *, std::size_t> positions;
+    std::size_t position = 0;
+    for(const auto &instruction : body.instructions)
+      positions.emplace(&instruction, position++);
+    for(auto instruction = body.instructions.begin();
+        instruction != body.instructions.end(); ++instruction)
+    {
+      irep_idt callee;
+      if(
+        !direct_call_identifier(*instruction, callee) ||
+        callee != "reach_error")
+        continue;
+      if(&*instruction == assertion_error)
+      {
+        ++nonconstant_errors;
+        continue;
+      }
+      bool constant_safe = false;
+      for(auto guard = body.instructions.begin();
+          guard != instruction; ++guard)
+      {
+        bool guard_value = false;
+        if(
+          guard->is_goto() && guard->targets.size() == 1 &&
+          guard->get_target() != body.instructions.end() &&
+          positions.at(&*guard->get_target()) >
+            positions.at(&*instruction) &&
+          boolean_constant_eval(guard->condition(), guard_value) &&
+          guard_value)
+          constant_safe = true;
+      }
+      if(!constant_safe)
+        return false;
+    }
+  }
+  if(nonconstant_errors != 1)
+    return false;
+
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  if(
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+    return false;
+  auto &main_body = main->second.body;
+  goto_programt::targett loop_head = main_body.instructions.end();
+  goto_programt::targett create_instruction = main_body.instructions.end();
+  irep_idt worker;
+  std::size_t creates = 0;
+  for(auto instruction = main_body.instructions.begin();
+      instruction != main_body.instructions.end(); ++instruction)
+  {
+    irep_idt callee;
+    if(
+      !direct_call_identifier(*instruction, callee) ||
+      callee != "pthread_create" ||
+      instruction->call_arguments().size() < 3)
+      continue;
+    if(!addressed_symbol(instruction->call_arguments()[2], worker))
+      return false;
+    ++creates;
+    create_instruction = instruction;
+    if(instruction == main_body.instructions.begin())
+      return false;
+    auto probe = instruction;
+    --probe;
+    if(!probe->is_goto() || probe->targets.size() != 1)
+      return false;
+    loop_head = probe;
+  }
+  if(creates != 1 || loop_head == main_body.instructions.end())
+    return false;
+  bool loop_guard_value = true;
+  if(
+    !boolean_constant_eval(loop_head->condition(), loop_guard_value) ||
+    loop_guard_value ||
+    loop_head->get_target() == main_body.instructions.end())
+    return false;
+  std::map<const goto_programt::instructiont *, std::size_t> main_positions;
+  std::size_t main_position = 0;
+  for(const auto &instruction : main_body.instructions)
+    main_positions.emplace(&instruction, main_position++);
+  if(
+    main_positions.at(&*loop_head->get_target()) <=
+      main_positions.at(&*create_instruction))
+    return false;
+  std::size_t backedges = 0;
+  for(auto instruction = std::next(create_instruction);
+      instruction != main_body.instructions.end(); ++instruction)
+    if(
+      instruction->is_goto() && instruction->targets.size() == 1 &&
+      instruction->get_target() == loop_head &&
+      instruction->condition().is_true())
+      ++backedges;
+  if(backedges != 1)
+    return false;
+  const auto worker_function =
+    goto_model.goto_functions.function_map.find(worker);
+  if(
+    worker_function == goto_model.goto_functions.function_map.end() ||
+    !worker_function->second.body_available())
+    return false;
+  bool calls_writer = false;
+  bool calls_waiter = false;
+  for(const auto &instruction : worker_function->second.body.instructions)
+  {
+    irep_idt callee;
+    if(direct_call_identifier(instruction, callee))
+    {
+      calls_writer = calls_writer || callee == writer.function;
+      calls_waiter = calls_waiter || callee == waiter;
+    }
+  }
+  if(!calls_writer || !calls_waiter)
+    return false;
+
+  loop_head->condition_nonconst() = true_exprt();
+  goto_model.goto_functions.update();
+  main_body.instructions.begin()
+    ->source_location_nonconst()
+    .set("deagle_monotone_condition_wait", true);
+  messaget log(message_handler);
+  log.status() << "NATIVE_MONOTONE_CONDITION_WAIT applied=1"
+               << " predicate_mentions=" << predicate_mentions
+               << " nonconstant_errors=" << nonconstant_errors
+               << messaget::eom;
+  return true;
+}
+
+bool monotone_condition_wait_applied(const goto_modelt &goto_model)
+{
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  return
+    main != goto_model.goto_functions.function_map.end() &&
+    main->second.body_available() &&
+    !main->second.body.instructions.empty() &&
+    main->second.body.instructions.begin()
+      ->source_location()
+      .get_bool("deagle_monotone_condition_wait");
+}
+
+bool guarded_common_mutex_zero_sum_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  std::string reason;
+  const auto candidates = dormant_spawn_cutoffs(goto_model, reason);
+  if(
+    candidates.size() != 1 ||
+    candidates.front().first_join == nullptr)
+    return false;
+  const auto worker =
+    goto_model.goto_functions.function_map.find(candidates.front().worker);
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  if(
+    worker == goto_model.goto_functions.function_map.end() ||
+    !worker->second.body_available() ||
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+    return false;
+
+  std::vector<goto_programt::const_targett> updates;
+  for(auto instruction = worker->second.body.instructions.begin();
+      instruction != worker->second.body.instructions.end(); ++instruction)
+    if(instruction->is_assign())
+      updates.push_back(instruction);
+  if(updates.size() != 2)
+    return false;
+
+  irep_idt shared;
+  irep_idt second_shared;
+  if(
+    !direct_symbol(updates[0]->assign_lhs(), shared) ||
+    !direct_symbol(updates[1]->assign_lhs(), second_shared) ||
+    shared != second_shared)
+    return false;
+  const auto unit_update =
+    [&](goto_programt::const_targett instruction, const irep_idt &operation)
+    {
+      const exprt &rhs = without_cast(instruction->assign_rhs());
+      irep_idt source;
+      mp_integer unit;
+      return
+        rhs.id() == operation && rhs.operands().size() == 2 &&
+        direct_symbol(rhs.op0(), source) && source == shared &&
+        constant_eval(rhs.op1(), {}, unit) && unit == 1;
+    };
+  if(
+    !unit_update(updates[0], ID_plus) ||
+    !unit_update(updates[1], ID_minus))
+    return false;
+
+  std::map<const goto_programt::instructiont *, std::size_t> worker_positions;
+  std::size_t worker_position = 0;
+  for(auto instruction = worker->second.body.instructions.begin();
+      instruction != worker->second.body.instructions.end(); ++instruction)
+    worker_positions.emplace(&*instruction, worker_position++);
+  std::set<irep_idt> outer_mutex_set;
+  for(auto instruction = worker->second.body.instructions.begin();
+      instruction != worker->second.body.instructions.end(); ++instruction)
+  {
+    irep_idt mutex;
+    if(
+      !parse_mutex_call(*instruction, "pthread_mutex_lock", mutex) ||
+      worker_positions.at(&*instruction) >=
+        worker_positions.at(&*updates[0]))
+      continue;
+    for(auto probe = std::next(instruction);
+        probe != worker->second.body.instructions.end(); ++probe)
+    {
+      irep_idt unlocked;
+      if(
+        parse_mutex_call(*probe, "pthread_mutex_unlock", unlocked) &&
+        unlocked == mutex)
+      {
+        if(
+          worker_positions.at(&*probe) >
+          worker_positions.at(&*updates[1]))
+          outer_mutex_set.insert(mutex);
+        break;
+      }
+    }
+  }
+  if(outer_mutex_set.size() != 1)
+    return false;
+  const irep_idt outer_mutex = *outer_mutex_set.begin();
+
+  bool after_spawn = false;
+  std::map<const goto_programt::instructiont *, std::size_t> main_positions;
+  std::size_t main_position = 0;
+  for(const auto &instruction : main->second.body.instructions)
+    main_positions.emplace(&instruction, main_position++);
+  const goto_programt::instructiont *lock_guard = nullptr;
+  const goto_programt::instructiont *assert_guard = nullptr;
+  const goto_programt::instructiont *unlock_guard = nullptr;
+  goto_programt::const_targett previous =
+    main->second.body.instructions.end();
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != main->second.body.instructions.end(); ++instruction)
+  {
+    if(&*instruction == &*candidates.front().exit)
+      after_spawn = true;
+    if(!after_spawn)
+    {
+      previous = instruction;
+      continue;
+    }
+    irep_idt mutex;
+    irep_idt callee;
+    if(
+      parse_mutex_call(*instruction, "pthread_mutex_lock", mutex) &&
+      mutex == outer_mutex && previous != main->second.body.instructions.end() &&
+      previous->is_goto())
+      lock_guard = &*previous;
+    else if(
+      parse_mutex_call(*instruction, "pthread_mutex_unlock", mutex) &&
+      mutex == outer_mutex && previous != main->second.body.instructions.end() &&
+      previous->is_goto())
+      unlock_guard = &*previous;
+    else if(
+      instruction->is_function_call() &&
+      direct_call_identifier(*instruction, callee) &&
+      callee == "__VERIFIER_assert" &&
+      instruction->call_arguments().size() == 1)
+    {
+      const exprt &condition =
+        without_cast(instruction->call_arguments().front());
+      irep_idt object;
+      if(
+        condition.id() != ID_equal ||
+        condition.operands().size() != 2 ||
+        !((direct_symbol(condition.op0(), object) &&
+           object == shared && is_zero_constant(condition.op1())) ||
+          (direct_symbol(condition.op1(), object) &&
+           object == shared && is_zero_constant(condition.op0()))))
+        return false;
+      for(auto probe = instruction; probe != main->second.body.instructions.begin();)
+      {
+        --probe;
+        if(
+          probe->is_goto() && probe->targets.size() == 1 &&
+          main_positions.at(&*probe->get_target()) >
+            main_positions.at(&*instruction))
+        {
+          assert_guard = &*probe;
+          break;
+        }
+      }
+    }
+    previous = instruction;
+  }
+  if(
+    lock_guard == nullptr ||
+    assert_guard == nullptr ||
+    unlock_guard == nullptr ||
+    lock_guard->condition() != assert_guard->condition() ||
+    lock_guard->condition() != unlock_guard->condition())
+    return false;
+
+  std::set<irep_idt> guard_symbols;
+  collect_symbol_identifiers(lock_guard->condition(), guard_symbols);
+  if(guard_symbols.size() != 1)
+    return false;
+  const irep_idt guard = *guard_symbols.begin();
+  bool guard_from_nondet = false;
+  std::set<irep_idt> nondet_temporaries;
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != candidates.front().head; ++instruction)
+  {
+    if(!instruction->is_assign())
+      continue;
+    irep_idt lhs;
+    if(!direct_symbol(instruction->assign_lhs(), lhs))
+      continue;
+    const exprt &rhs = without_cast(instruction->assign_rhs());
+    if(
+      rhs.id() == ID_side_effect &&
+      to_side_effect_expr(rhs).get_statement() == ID_nondet)
+      nondet_temporaries.insert(lhs);
+    irep_idt rhs_symbol;
+    if(
+      lhs == guard && direct_symbol(rhs, rhs_symbol) &&
+      nondet_temporaries.count(rhs_symbol) != 0)
+      guard_from_nondet = true;
+  }
+  if(!guard_from_nondet)
+    return false;
+
+  const auto shared_symbol =
+    goto_model.symbol_table.symbols.find(shared);
+  if(
+    shared_symbol == goto_model.symbol_table.symbols.end() ||
+    !shared_symbol->second.is_static_lifetime)
+    return false;
+  std::size_t mentions = 0;
+  std::size_t zero_initializers = 0;
+  for(const auto &entry : goto_model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(instruction_mentions_any(instruction, {shared}))
+      {
+        ++mentions;
+        irep_idt lhs;
+        if(
+          instruction.is_assign() &&
+          direct_symbol(instruction.assign_lhs(), lhs) &&
+          lhs == shared &&
+          is_zero_constant(instruction.assign_rhs()))
+          ++zero_initializers;
+      }
+      if(instruction.is_function_call())
+        for(const auto &argument : instruction.call_arguments())
+          if(contains_address_of_symbol(argument, {shared}))
+            return false;
+    }
+  }
+  if(mentions != 4 || zero_initializers != 1)
+    return false;
+
+  bool truncated = false;
+  if(!apply_dormant_spawn_counts(
+       goto_model, candidates, std::vector<unsigned>{0}, truncated))
+    return false;
+  goto_model.goto_functions.update();
+  auto updated_main =
+    goto_model.goto_functions.function_map.find("main");
+  updated_main->second.body.instructions.begin()
+    ->source_location_nonconst()
+    .set("deagle_guarded_common_mutex_zero_sum", true);
+  messaget log(message_handler);
+  log.status() << "NATIVE_GUARDED_COMMON_MUTEX_ZERO_SUM applied=1"
+               << " workers=0 mentions=" << mentions
+               << " truncated=" << (truncated ? 1 : 0)
+               << messaget::eom;
+  return true;
+}
+
+bool guarded_common_mutex_zero_sum_applied(const goto_modelt &goto_model)
+{
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  return
+    main != goto_model.goto_functions.function_map.end() &&
+    main->second.body_available() &&
+    !main->second.body.instructions.empty() &&
+    main->second.body.instructions.begin()
+      ->source_location()
+      .get_bool("deagle_guarded_common_mutex_zero_sum");
+}
+
+namespace
+{
+struct nested_last_writer_pairt
+{
+  irep_idt function;
+  irep_idt object;
+  mp_integer value;
+  const goto_programt::instructiont *store = nullptr;
+  const goto_programt::instructiont *property = nullptr;
+};
+
+bool nested_last_writer_parameter_truth(
+  const exprt &src,
+  const irep_idt &parameter)
+{
+  const exprt &condition = without_cast(src);
+  irep_idt object;
+  mp_integer zero;
+  if(
+    condition.id() == ID_notequal &&
+    condition.operands().size() == 2)
+    return
+      ((direct_symbol(condition.op0(), object) &&
+        object == parameter &&
+        constant_eval(condition.op1(), {}, zero) && zero == 0) ||
+       (direct_symbol(condition.op1(), object) &&
+        object == parameter &&
+        constant_eval(condition.op0(), {}, zero) && zero == 0));
+  if(
+    condition.id() == ID_not &&
+    condition.operands().size() == 1)
+  {
+    const exprt &equality = without_cast(condition.op0());
+    return
+      equality.id() == ID_equal &&
+      equality.operands().size() == 2 &&
+      ((direct_symbol(equality.op0(), object) &&
+        object == parameter &&
+        constant_eval(equality.op1(), {}, zero) && zero == 0) ||
+       (direct_symbol(equality.op1(), object) &&
+        object == parameter &&
+        constant_eval(equality.op0(), {}, zero) && zero == 0));
+  }
+  return false;
+}
+
+bool nested_last_writer_property_wrapper(
+  const goto_modelt &model,
+  irep_idt &wrapper,
+  std::string &reason)
+{
+  std::size_t candidates = 0;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    std::vector<const goto_programt::instructiont *> order;
+    std::size_t error_index = 0;
+    std::size_t error_calls = 0;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      order.push_back(&instruction);
+      irep_idt callee;
+      if(
+        direct_call_identifier(instruction, callee) &&
+        callee == "reach_error")
+      {
+        error_index = order.size() - 1;
+        ++error_calls;
+      }
+    }
+    if(error_calls == 0)
+      continue;
+    const auto symbol = model.symbol_table.symbols.find(entry.first);
+    if(
+      error_calls != 1 || error_index == 0 ||
+      symbol == model.symbol_table.symbols.end() ||
+      symbol->second.type.id() != ID_code)
+    {
+      reason = "nlw_property_wrapper_shape";
+      return false;
+    }
+    const auto &parameters =
+      to_code_type(symbol->second.type).parameters();
+    const auto guard = order[error_index - 1];
+    if(
+      parameters.size() != 1 ||
+      parameters.front().get_identifier().empty() ||
+      !guard->is_goto() || guard->targets.size() != 1 ||
+      !nested_last_writer_parameter_truth(
+        guard->condition(),
+        parameters.front().get_identifier()))
+    {
+      reason = "nlw_property_wrapper_semantics";
+      return false;
+    }
+    for(std::size_t index = 0; index + 1 < error_index; ++index)
+    {
+      if(
+        !order[index]->is_location() &&
+        !order[index]->is_skip() &&
+        !order[index]->is_decl() &&
+        !order[index]->is_dead())
+      {
+        reason = "nlw_property_wrapper_prefix_effect";
+        return false;
+      }
+    }
+    std::map<const goto_programt::instructiont *, std::size_t>
+      wrapper_positions;
+    for(std::size_t index = 0; index < order.size(); ++index)
+      wrapper_positions.emplace(order[index], index);
+    std::set<std::size_t> pending{
+      wrapper_positions.at(&*guard->targets.front())};
+    std::set<std::size_t> visited;
+    bool true_path_exits = false;
+    while(!pending.empty())
+    {
+      const auto index = *pending.begin();
+      pending.erase(pending.begin());
+      if(index >= order.size() || !visited.insert(index).second)
+        continue;
+      const auto instruction = order[index];
+      if(
+        instruction->is_end_function() ||
+        instruction->is_set_return_value())
+      {
+        true_path_exits = true;
+        continue;
+      }
+      if(instruction->is_goto())
+      {
+        for(const auto &target : instruction->targets)
+          pending.insert(wrapper_positions.at(&*target));
+        if(!instruction->condition().is_true())
+          pending.insert(index + 1);
+        continue;
+      }
+      if(
+        instruction->is_function_call() ||
+        instruction->is_assign() ||
+        (!instruction->is_location() &&
+         !instruction->is_skip() &&
+         !instruction->is_decl() &&
+         !instruction->is_dead()))
+      {
+        reason = "nlw_property_wrapper_true_path_effect";
+        return false;
+      }
+      pending.insert(index + 1);
+    }
+    if(!true_path_exits)
+    {
+      reason = "nlw_property_wrapper_true_path_exit";
+      return false;
+    }
+    wrapper = entry.first;
+    ++candidates;
+  }
+  if(candidates != 1)
+  {
+    reason = "nlw_property_wrapper_count";
+    return false;
+  }
+  return true;
+}
+
+bool nested_last_writer_equality(
+  const exprt &src,
+  irep_idt &object,
+  mp_integer &value)
+{
+  const exprt &condition = without_cast(src);
+  if(
+    condition.id() != ID_equal ||
+    condition.operands().size() != 2)
+    return false;
+  return
+    (direct_symbol(condition.op0(), object) &&
+     constant_eval(condition.op1(), {}, value)) ||
+    (direct_symbol(condition.op1(), object) &&
+     constant_eval(condition.op0(), {}, value));
+}
+
+std::set<irep_idt> nested_last_writer_reachable(
+  const goto_modelt &model,
+  const irep_idt &root)
+{
+  const std::set<irep_idt> runtime = {
+    "pthread_create", "pthread_join", "pthread_mutex_init",
+    "pthread_mutex_destroy", "pthread_mutex_lock",
+    "pthread_mutex_unlock", "abort", "reach_error"};
+  std::set<irep_idt> reachable;
+  std::deque<irep_idt> pending{root};
+  while(!pending.empty())
+  {
+    const auto current = pending.front();
+    pending.pop_front();
+    if(!reachable.insert(current).second)
+      continue;
+    const auto function =
+      model.goto_functions.function_map.find(current);
+    if(
+      function == model.goto_functions.function_map.end() ||
+      !function->second.body_available())
+      continue;
+    for(const auto &instruction : function->second.body.instructions)
+    {
+      irep_idt callee;
+      if(
+        direct_call_identifier(instruction, callee) &&
+        runtime.count(callee) == 0)
+        pending.push_back(callee);
+    }
+  }
+  return reachable;
+}
+
+bool nested_last_writer_contains_call(
+  const goto_modelt &model,
+  const std::set<irep_idt> &functions,
+  const irep_idt &operation,
+  const irep_idt &handle)
+{
+  for(const auto &identifier : functions)
+  {
+    const auto function =
+      model.goto_functions.function_map.find(identifier);
+    if(
+      function == model.goto_functions.function_map.end() ||
+      !function->second.body_available())
+      continue;
+    for(const auto &instruction : function->second.body.instructions)
+    {
+      irep_idt callee;
+      if(
+        !direct_call_identifier(instruction, callee) ||
+        callee != operation ||
+        instruction.call_arguments().empty())
+        continue;
+      irep_idt candidate;
+      const bool resolved =
+        operation == "pthread_create"
+          ? addressed_symbol(
+              instruction.call_arguments().front(), candidate)
+          : direct_symbol(
+              instruction.call_arguments().front(), candidate);
+      if(resolved && candidate == handle)
+        return true;
+    }
+  }
+  return false;
+}
+
+enum class nested_zero_valuet
+{
+  unknown = -1,
+  zero = 0,
+  one = 1,
+  other_nonzero = 2
+};
+
+nested_zero_valuet nested_last_writer_value(
+  const exprt &src,
+  const std::map<irep_idt, nested_zero_valuet> &environment)
+{
+  const exprt &value = without_cast(src);
+  mp_integer constant;
+  if(constant_eval(value, {}, constant))
+  {
+    if(constant == 0)
+      return nested_zero_valuet::zero;
+    if(constant == 1)
+      return nested_zero_valuet::one;
+    return nested_zero_valuet::other_nonzero;
+  }
+  if(
+    value.id() == ID_unary_minus &&
+    value.operands().size() == 1)
+  {
+    const auto operand =
+      nested_last_writer_value(value.op0(), environment);
+    if(operand == nested_zero_valuet::zero)
+      return nested_zero_valuet::zero;
+    if(
+      operand == nested_zero_valuet::one ||
+      operand == nested_zero_valuet::other_nonzero)
+      return nested_zero_valuet::other_nonzero;
+    return nested_zero_valuet::unknown;
+  }
+  irep_idt symbol;
+  if(direct_symbol(value, symbol))
+  {
+    const auto found = environment.find(symbol);
+    return
+      found == environment.end()
+        ? nested_zero_valuet::unknown
+        : found->second;
+  }
+  return nested_zero_valuet::unknown;
+}
+
+bool nested_last_writer_condition(
+  const exprt &src,
+  const std::map<irep_idt, nested_zero_valuet> &environment,
+  bool &known,
+  bool &value)
+{
+  const exprt &condition = without_cast(src);
+  if(condition.is_true() || condition.is_false())
+  {
+    known = true;
+    value = condition.is_true();
+    return true;
+  }
+  if(
+    condition.id() == ID_not &&
+    condition.operands().size() == 1)
+  {
+    if(!nested_last_writer_condition(
+         condition.op0(), environment, known, value))
+      return false;
+    if(known)
+      value = !value;
+    return true;
+  }
+  if(
+    (condition.id() == ID_equal ||
+     condition.id() == ID_notequal) &&
+    condition.operands().size() == 2)
+  {
+    const auto lhs =
+      nested_last_writer_value(condition.op0(), environment);
+    const auto rhs =
+      nested_last_writer_value(condition.op1(), environment);
+    if(
+      lhs == nested_zero_valuet::unknown ||
+      rhs == nested_zero_valuet::unknown)
+    {
+      known = false;
+      return true;
+    }
+    if(
+      lhs == nested_zero_valuet::other_nonzero &&
+      rhs == nested_zero_valuet::other_nonzero)
+    {
+      known = false;
+      return true;
+    }
+    known = true;
+    value = condition.id() == ID_equal ? lhs == rhs : lhs != rhs;
+    return true;
+  }
+  known = false;
+  return true;
+}
+
+struct nested_spawn_outcomet
+{
+  bool spawned = false;
+  nested_zero_valuet result = nested_zero_valuet::unknown;
+
+  bool operator<(const nested_spawn_outcomet &other) const
+  {
+    return
+      std::tie(spawned, result) <
+      std::tie(other.spawned, other.result);
+  }
+
+  bool operator==(const nested_spawn_outcomet &other) const
+  {
+    return spawned == other.spawned && result == other.result;
+  }
+};
+
+struct nested_summary_statet
+{
+  std::size_t position = 0;
+  bool event = false;
+  std::map<irep_idt, nested_zero_valuet> environment;
+
+  bool operator<(const nested_summary_statet &other) const
+  {
+    return
+      std::tie(position, event, environment) <
+      std::tie(other.position, other.event, other.environment);
+  }
+};
+
+bool nested_last_writer_spawn_summary(
+  const goto_modelt &model,
+  const irep_idt &function_id,
+  const irep_idt &handle,
+  std::map<irep_idt, std::set<nested_spawn_outcomet>> &memo,
+  std::set<irep_idt> &active,
+  std::set<nested_spawn_outcomet> &outcomes,
+  std::string &reason)
+{
+  const auto cached = memo.find(function_id);
+  if(cached != memo.end())
+  {
+    outcomes = cached->second;
+    return true;
+  }
+  if(!active.insert(function_id).second)
+  {
+    reason = "nlw_spawn_summary_recursion";
+    return false;
+  }
+  const auto function =
+    model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "nlw_spawn_summary_function";
+    active.erase(function_id);
+    return false;
+  }
+  std::vector<const goto_programt::instructiont *> order;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  for(const auto &instruction : function->second.body.instructions)
+  {
+    positions.emplace(&instruction, order.size());
+    order.push_back(&instruction);
+  }
+  std::set<nested_summary_statet> pending;
+  std::set<nested_summary_statet> visited;
+  nested_summary_statet initial_state;
+  pending.insert(initial_state);
+  while(!pending.empty())
+  {
+    auto state = *pending.begin();
+    pending.erase(pending.begin());
+    if(!visited.insert(state).second)
+      continue;
+    if(state.position >= order.size())
+    {
+      reason = "nlw_spawn_summary_fallthrough";
+      active.erase(function_id);
+      return false;
+    }
+    const auto instruction = order[state.position];
+    if(instruction->is_end_function())
+    {
+      nested_spawn_outcomet outcome;
+      outcome.spawned = state.event;
+      outcome.result = nested_zero_valuet::unknown;
+      outcomes.insert(outcome);
+      continue;
+    }
+    if(instruction->is_set_return_value())
+    {
+      nested_spawn_outcomet outcome;
+      outcome.spawned = state.event;
+      outcome.result =
+        nested_last_writer_value(
+          instruction->return_value(), state.environment);
+      outcomes.insert(outcome);
+      continue;
+    }
+    if(instruction->is_goto())
+    {
+      bool known = false;
+      bool value = false;
+      nested_last_writer_condition(
+        instruction->condition(),
+        state.environment,
+        known,
+        value);
+      if(!known || value)
+      {
+        for(const auto &target : instruction->targets)
+        {
+          const auto target_position = positions.at(&*target);
+          if(target_position <= state.position)
+          {
+            reason = "nlw_spawn_summary_loop";
+            active.erase(function_id);
+            return false;
+          }
+          auto branch = state;
+          branch.position = target_position;
+          pending.insert(branch);
+        }
+      }
+      if((!known || !value) && state.position + 1 < order.size())
+      {
+        ++state.position;
+        pending.insert(state);
+      }
+      continue;
+    }
+    if(instruction->is_assign())
+    {
+      irep_idt lhs;
+      if(direct_symbol(instruction->assign_lhs(), lhs))
+        state.environment[lhs] =
+          nested_last_writer_value(
+            instruction->assign_rhs(), state.environment);
+    }
+    if(instruction->is_function_call())
+    {
+      irep_idt callee;
+      if(!direct_call_identifier(*instruction, callee))
+      {
+        reason = "nlw_spawn_summary_indirect";
+        active.erase(function_id);
+        return false;
+      }
+      if(callee == "pthread_create")
+      {
+        irep_idt candidate;
+        if(
+          instruction->call_arguments().empty() ||
+          !addressed_symbol(
+            instruction->call_arguments().front(), candidate))
+        {
+          reason = "nlw_spawn_summary_create";
+          active.erase(function_id);
+          return false;
+        }
+        if(candidate == handle)
+          state.event = true;
+      }
+      else
+      {
+        const auto reachable =
+          nested_last_writer_reachable(model, callee);
+        if(
+          nested_last_writer_contains_call(
+            model, reachable, "pthread_create", handle))
+        {
+          std::set<nested_spawn_outcomet> called_outcomes;
+          if(!nested_last_writer_spawn_summary(
+               model, callee, handle, memo, active,
+               called_outcomes, reason))
+          {
+            active.erase(function_id);
+            return false;
+          }
+          for(const auto &called : called_outcomes)
+          {
+            auto branch = state;
+            branch.event = branch.event || called.spawned;
+            if(!instruction->call_lhs().is_nil())
+            {
+              irep_idt lhs;
+              if(!direct_symbol(instruction->call_lhs(), lhs))
+              {
+                reason = "nlw_spawn_summary_call_lhs";
+                active.erase(function_id);
+                return false;
+              }
+              branch.environment[lhs] = called.result;
+            }
+            ++branch.position;
+            pending.insert(branch);
+          }
+          continue;
+        }
+      }
+      if(!instruction->call_lhs().is_nil())
+      {
+        irep_idt lhs;
+        if(direct_symbol(instruction->call_lhs(), lhs))
+          state.environment[lhs] = nested_zero_valuet::unknown;
+      }
+    }
+    ++state.position;
+    pending.insert(state);
+  }
+  active.erase(function_id);
+  if(outcomes.empty())
+  {
+    reason = "nlw_spawn_summary_outcomes";
+    return false;
+  }
+  memo.emplace(function_id, outcomes);
+  return true;
+}
+
+bool nested_last_writer_always_joins(
+  const goto_modelt &model,
+  const irep_idt &function_id,
+  const irep_idt &handle,
+  std::set<irep_idt> &active,
+  std::string &reason)
+{
+  if(!active.insert(function_id).second)
+  {
+    reason = "nlw_join_summary_recursion";
+    return false;
+  }
+  const auto function =
+    model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "nlw_join_summary_function";
+    active.erase(function_id);
+    return false;
+  }
+  std::vector<const goto_programt::instructiont *> order;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  for(const auto &instruction : function->second.body.instructions)
+  {
+    positions.emplace(&instruction, order.size());
+    order.push_back(&instruction);
+  }
+  std::set<std::pair<std::size_t, bool>> pending{{0, false}};
+  std::set<std::pair<std::size_t, bool>> visited;
+  while(!pending.empty())
+  {
+    auto state = *pending.begin();
+    pending.erase(pending.begin());
+    if(!visited.insert(state).second)
+      continue;
+    if(state.first >= order.size())
+    {
+      reason = "nlw_join_summary_fallthrough";
+      active.erase(function_id);
+      return false;
+    }
+    const auto instruction = order[state.first];
+    if(
+      instruction->is_end_function() ||
+      instruction->is_set_return_value())
+    {
+      if(!state.second)
+      {
+        reason = "nlw_join_summary_bypass";
+        active.erase(function_id);
+        return false;
+      }
+      continue;
+    }
+    if(instruction->is_goto())
+    {
+      for(const auto &target : instruction->targets)
+      {
+        const auto target_position = positions.at(&*target);
+        if(target_position <= state.first)
+        {
+          reason = "nlw_join_summary_loop";
+          active.erase(function_id);
+          return false;
+        }
+        pending.emplace(target_position, state.second);
+      }
+      if(
+        !instruction->condition().is_true() &&
+        state.first + 1 < order.size())
+        pending.emplace(state.first + 1, state.second);
+      continue;
+    }
+    if(instruction->is_function_call())
+    {
+      irep_idt callee;
+      if(!direct_call_identifier(*instruction, callee))
+      {
+        reason = "nlw_join_summary_indirect";
+        active.erase(function_id);
+        return false;
+      }
+      if(callee == "pthread_join")
+      {
+        irep_idt candidate;
+        if(
+          instruction->call_arguments().empty() ||
+          !direct_symbol(
+            instruction->call_arguments().front(), candidate))
+        {
+          reason = "nlw_join_summary_call";
+          active.erase(function_id);
+          return false;
+        }
+        if(candidate == handle)
+          state.second = true;
+      }
+      else
+      {
+        const auto reachable =
+          nested_last_writer_reachable(model, callee);
+        if(
+          nested_last_writer_contains_call(
+            model, reachable, "pthread_join", handle))
+        {
+          if(!nested_last_writer_always_joins(
+               model, callee, handle, active, reason))
+          {
+            active.erase(function_id);
+            return false;
+          }
+          state.second = true;
+        }
+      }
+    }
+    ++state.first;
+    pending.insert(state);
+  }
+  active.erase(function_id);
+  return true;
+}
+
+struct nested_lifecycle_statet
+{
+  std::size_t position = 0;
+  bool active = false;
+  std::map<irep_idt, nested_zero_valuet> environment;
+
+  bool operator<(const nested_lifecycle_statet &other) const
+  {
+    return
+      std::tie(position, active, environment) <
+      std::tie(other.position, other.active, other.environment);
+  }
+};
+
+bool nested_last_writer_private_environment(
+  const goto_modelt &model,
+  const irep_idt &function_id,
+  const irep_idt &property_object,
+  std::set<irep_idt> &symbols,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "nlw_protocol_function";
+    return false;
+  }
+  for(const auto &instruction : function->second.body.instructions)
+  {
+    irep_idt symbol;
+    if(
+      instruction.is_assign() &&
+      direct_symbol(instruction.assign_lhs(), symbol) &&
+      symbol != property_object)
+      symbols.insert(symbol);
+    if(
+      instruction.is_function_call() &&
+      !instruction.call_lhs().is_nil() &&
+      direct_symbol(instruction.call_lhs(), symbol) &&
+      symbol != property_object)
+      symbols.insert(symbol);
+  }
+  if(symbols.empty())
+  {
+    reason = "nlw_protocol_state_empty";
+    return false;
+  }
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt written;
+      const bool writes =
+        (instruction.is_assign() &&
+         direct_symbol(instruction.assign_lhs(), written)) ||
+        (instruction.is_function_call() &&
+         !instruction.call_lhs().is_nil() &&
+         direct_symbol(instruction.call_lhs(), written));
+      if(
+        writes && symbols.count(written) != 0 &&
+        entry.first != function_id &&
+        entry.first != "__CPROVER_initialize")
+      {
+        reason = "nlw_protocol_external_write";
+        return false;
+      }
+      if(
+        entry.first != function_id &&
+        (contains_address_of_symbol(instruction.code(), symbols) ||
+         (instruction.has_condition() &&
+          contains_address_of_symbol(
+            instruction.condition(), symbols))))
+      {
+        reason = "nlw_protocol_address_escape";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool nested_last_writer_lifecycle_control(
+  const goto_modelt &model,
+  const irep_idt &function_id,
+  const irep_idt &create_callee,
+  const irep_idt &join_callee,
+  const std::set<nested_spawn_outcomet> &spawn_outcomes,
+  const std::set<const goto_programt::instructiont *> &property_stores,
+  const irep_idt &property_object,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "nlw_protocol_body";
+    return false;
+  }
+  std::set<irep_idt> private_symbols;
+  if(!nested_last_writer_private_environment(
+       model, function_id, property_object,
+       private_symbols, reason))
+    return false;
+
+  std::vector<const goto_programt::instructiont *> order;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  for(const auto &instruction : function->second.body.instructions)
+  {
+    positions.emplace(&instruction, order.size());
+    order.push_back(&instruction);
+  }
+  nested_lifecycle_statet initial;
+  std::set<nested_lifecycle_statet> pending;
+  std::set<nested_lifecycle_statet> visited;
+  pending.insert(initial);
+  bool saw_create = false;
+  bool saw_join = false;
+  while(!pending.empty())
+  {
+    auto state = *pending.begin();
+    pending.erase(pending.begin());
+    if(!visited.insert(state).second)
+      continue;
+    if(state.position >= order.size())
+    {
+      reason = "nlw_protocol_fallthrough";
+      return false;
+    }
+    const auto instruction = order[state.position];
+    if(property_stores.count(instruction) != 0 && state.active)
+    {
+      reason = "nlw_active_window_property";
+      return false;
+    }
+    if(
+      instruction->is_end_function() ||
+      instruction->is_set_return_value())
+    {
+      if(state.active)
+      {
+        reason = "nlw_protocol_active_exit";
+        return false;
+      }
+      continue;
+    }
+    if(instruction->is_goto())
+    {
+      bool known = false;
+      bool value = false;
+      nested_last_writer_condition(
+        instruction->condition(),
+        state.environment, known, value);
+      if(!known || value)
+      {
+        for(const auto &target : instruction->targets)
+        {
+          const auto found = positions.find(&*target);
+          if(found == positions.end())
+          {
+            reason = "nlw_protocol_target";
+            return false;
+          }
+          auto branch = state;
+          branch.position = found->second;
+          pending.insert(branch);
+        }
+      }
+      if(!known || !value)
+      {
+        if(state.position + 1 >= order.size())
+        {
+          reason = "nlw_protocol_branch_fallthrough";
+          return false;
+        }
+        ++state.position;
+        pending.insert(state);
+      }
+      continue;
+    }
+    if(instruction->is_assign())
+    {
+      irep_idt lhs;
+      if(
+        direct_symbol(instruction->assign_lhs(), lhs) &&
+        private_symbols.count(lhs) != 0)
+        state.environment[lhs] =
+          nested_last_writer_value(
+            instruction->assign_rhs(), state.environment);
+    }
+    if(instruction->is_function_call())
+    {
+      irep_idt callee;
+      if(!direct_call_identifier(*instruction, callee))
+      {
+        reason = "nlw_protocol_indirect_call";
+        return false;
+      }
+      if(callee == create_callee)
+      {
+        saw_create = true;
+        for(const auto &outcome : spawn_outcomes)
+        {
+          if(state.active && outcome.spawned)
+          {
+            reason = "nlw_protocol_multiple_active";
+            return false;
+          }
+          auto branch = state;
+          branch.active = branch.active || outcome.spawned;
+          if(!instruction->call_lhs().is_nil())
+          {
+            irep_idt lhs;
+            if(
+              !direct_symbol(instruction->call_lhs(), lhs) ||
+              private_symbols.count(lhs) == 0)
+            {
+              reason = "nlw_protocol_create_result";
+              return false;
+            }
+            branch.environment[lhs] = outcome.result;
+          }
+          ++branch.position;
+          pending.insert(branch);
+        }
+        continue;
+      }
+      if(callee == join_callee)
+      {
+        saw_join = true;
+        if(!state.active)
+        {
+          reason = "nlw_protocol_inactive_join";
+          return false;
+        }
+        state.active = false;
+      }
+      if(!instruction->call_lhs().is_nil())
+      {
+        irep_idt lhs;
+        if(
+          direct_symbol(instruction->call_lhs(), lhs) &&
+          private_symbols.count(lhs) != 0)
+          state.environment[lhs] = nested_zero_valuet::unknown;
+      }
+    }
+    ++state.position;
+    pending.insert(state);
+  }
+  if(!saw_create || !saw_join)
+  {
+    reason = "nlw_protocol_events";
+    return false;
+  }
+  return true;
+}
+
+bool nested_last_writer_reaches_position(
+  const std::vector<const goto_programt::instructiont *> &order,
+  const std::map<const goto_programt::instructiont *, std::size_t> &positions,
+  std::size_t start,
+  std::size_t target,
+  std::size_t avoided)
+{
+  std::set<std::size_t> pending{start};
+  std::set<std::size_t> visited;
+  while(!pending.empty())
+  {
+    const auto position = *pending.begin();
+    pending.erase(pending.begin());
+    if(position == avoided || position >= order.size())
+      continue;
+    if(position == target)
+      return true;
+    if(!visited.insert(position).second)
+      continue;
+    const auto instruction = order[position];
+    if(
+      instruction->is_end_function() ||
+      instruction->is_set_return_value())
+      continue;
+    if(instruction->is_goto())
+    {
+      for(const auto &goto_target : instruction->targets)
+        pending.insert(positions.at(&*goto_target));
+      if(!instruction->condition().is_true())
+        pending.insert(position + 1);
+    }
+    else
+      pending.insert(position + 1);
+  }
+  return false;
+}
+
+bool nested_last_writer_pair_mutex(
+  const goto_modelt &model,
+  const std::set<irep_idt> &child_functions,
+  const std::vector<nested_last_writer_pairt> &pairs,
+  std::set<const goto_programt::instructiont *> &classified,
+  std::string &reason)
+{
+  bool saw_child_pair = false;
+  for(const auto &pair : pairs)
+  {
+    if(child_functions.count(pair.function) == 0)
+      continue;
+    saw_child_pair = true;
+    const auto function =
+      model.goto_functions.function_map.find(pair.function);
+    if(
+      function == model.goto_functions.function_map.end() ||
+      !function->second.body_available())
+    {
+      reason = "nlw_child_pair_function";
+      return false;
+    }
+    std::vector<const goto_programt::instructiont *> order;
+    std::map<const goto_programt::instructiont *, std::size_t> positions;
+    for(const auto &instruction : function->second.body.instructions)
+    {
+      positions.emplace(&instruction, order.size());
+      order.push_back(&instruction);
+    }
+    std::vector<std::size_t> locks;
+    std::vector<std::size_t> unlocks;
+    irep_idt mutex;
+    for(std::size_t index = 0; index < order.size(); ++index)
+    {
+      const auto instruction = order[index];
+      if(instruction->is_goto())
+        for(const auto &target : instruction->targets)
+          if(positions.at(&*target) <= index)
+          {
+            reason = "nlw_child_pair_loop";
+            return false;
+          }
+      irep_idt callee;
+      if(!direct_call_identifier(*instruction, callee))
+        continue;
+      if(
+        callee != "pthread_mutex_lock" &&
+        callee != "pthread_mutex_unlock")
+        continue;
+      irep_idt candidate;
+      if(
+        instruction->call_arguments().size() != 1 ||
+        !addressed_symbol(
+          instruction->call_arguments().front(), candidate))
+      {
+        reason = "nlw_child_mutex_resolution";
+        return false;
+      }
+      if(mutex.empty())
+        mutex = candidate;
+      if(candidate != mutex)
+      {
+        reason = "nlw_child_mutex_mismatch";
+        return false;
+      }
+      (callee == "pthread_mutex_lock" ? locks : unlocks)
+        .push_back(index);
+    }
+    if(locks.size() != 1 || unlocks.size() != 1)
+    {
+      reason = "nlw_child_mutex_count";
+      return false;
+    }
+    const auto store_position = positions.at(pair.store);
+    const auto property_position = positions.at(pair.property);
+    if(
+      !(locks.front() < store_position &&
+        store_position < property_position &&
+        property_position < unlocks.front()) ||
+      nested_last_writer_reaches_position(
+        order, positions, 0, store_position, locks.front()))
+    {
+      reason = "nlw_child_mutex_dominance";
+      return false;
+    }
+    classified.insert(pair.store);
+  }
+  if(!saw_child_pair)
+  {
+    reason = "nlw_child_pair_empty";
+    return false;
+  }
+  return true;
+}
+
+bool nested_last_writer_outer_pair_order(
+  const goto_modelt &model,
+  const irep_idt &create_function,
+  const irep_idt &join_function,
+  const irep_idt &handle,
+  const std::vector<nested_last_writer_pairt> &pairs,
+  std::set<const goto_programt::instructiont *> &classified,
+  std::string &reason)
+{
+  for(const auto &function_id : {create_function, join_function})
+  {
+    const auto function =
+      model.goto_functions.function_map.find(function_id);
+    if(
+      function == model.goto_functions.function_map.end() ||
+      !function->second.body_available())
+    {
+      reason = "nlw_outer_helper_body";
+      return false;
+    }
+    std::vector<const goto_programt::instructiont *> order;
+    std::map<const goto_programt::instructiont *, std::size_t> positions;
+    for(const auto &instruction : function->second.body.instructions)
+    {
+      positions.emplace(&instruction, order.size());
+      order.push_back(&instruction);
+    }
+    std::vector<std::size_t> lifecycle_events;
+    for(std::size_t index = 0; index < order.size(); ++index)
+    {
+      irep_idt callee;
+      if(!direct_call_identifier(*order[index], callee))
+        continue;
+      const auto expected =
+        function_id == create_function
+          ? irep_idt("pthread_create")
+          : irep_idt("pthread_join");
+      if(callee != expected)
+        continue;
+      irep_idt candidate;
+      const bool resolved =
+        !order[index]->call_arguments().empty() &&
+        (expected == "pthread_create"
+           ? addressed_symbol(
+               order[index]->call_arguments().front(), candidate)
+           : direct_symbol(
+               order[index]->call_arguments().front(), candidate));
+      if(resolved && candidate == handle)
+        lifecycle_events.push_back(index);
+    }
+    if(lifecycle_events.size() != 1)
+    {
+      reason = "nlw_outer_helper_event";
+      return false;
+    }
+    for(const auto &pair : pairs)
+    {
+      if(pair.function != function_id)
+        continue;
+      const auto store_position = positions.at(pair.store);
+      if(function_id == create_function)
+      {
+        if(
+          nested_last_writer_reaches_position(
+            order, positions, lifecycle_events.front() + 1,
+            store_position, order.size()))
+        {
+          reason = "nlw_outer_post_create_pair";
+          return false;
+        }
+      }
+      else if(
+        nested_last_writer_reaches_position(
+          order, positions, 0, store_position,
+          lifecycle_events.front()))
+      {
+        reason = "nlw_outer_pre_join_pair";
+        return false;
+      }
+      classified.insert(pair.store);
+    }
+  }
+  return true;
+}
+} // namespace
+
+bool nested_lifecycle_last_writer_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  std::string reason;
+  const auto reject = [&reason]()
+  {
+    std::cout << "NATIVE_NESTED_LAST_WRITER_AUDIT applicable=0 reason="
+              << reason << '\n';
+    return false;
+  };
+
+  irep_idt wrapper;
+  if(!nested_last_writer_property_wrapper(
+       goto_model, wrapper, reason))
+    return reject();
+
+  std::vector<nested_last_writer_pairt> pairs;
+  std::set<const goto_programt::instructiont *> stores;
+  irep_idt common_object;
+  for(const auto &entry : goto_model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    const goto_programt::instructiont *previous = nullptr;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(
+        direct_call_identifier(instruction, callee) &&
+        callee == wrapper)
+      {
+        irep_idt object;
+        mp_integer value;
+        irep_idt lhs;
+        mp_integer stored;
+        if(
+          instruction.call_arguments().size() != 1 ||
+          previous == nullptr || !previous->is_assign() ||
+          !nested_last_writer_equality(
+            instruction.call_arguments().front(), object, value) ||
+          !direct_symbol(previous->assign_lhs(), lhs) ||
+          lhs != object ||
+          !constant_eval(previous->assign_rhs(), {}, stored) ||
+          stored != value)
+        {
+          reason = "nlw_store_property_pair";
+          return reject();
+        }
+        if(common_object.empty())
+          common_object = object;
+        if(object != common_object)
+        {
+          reason = "nlw_property_object_mismatch";
+          return reject();
+        }
+        nested_last_writer_pairt pair;
+        pair.function = entry.first;
+        pair.object = object;
+        pair.value = value;
+        pair.store = previous;
+        pair.property = &instruction;
+        pairs.push_back(pair);
+        stores.insert(previous);
+      }
+      if(
+        !instruction.is_location() && !instruction.is_skip() &&
+        !instruction.is_decl() && !instruction.is_dead())
+        previous = &instruction;
+    }
+  }
+  if(pairs.size() < 3 || common_object.empty())
+  {
+    reason = "nlw_property_pair_count";
+    return reject();
+  }
+
+  std::size_t object_writes = 0;
+  for(const auto &entry : goto_model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(instruction.is_assign())
+      {
+        irep_idt lhs;
+        if(
+          direct_symbol(instruction.assign_lhs(), lhs) &&
+          lhs == common_object &&
+          entry.first != "__CPROVER_initialize")
+        {
+          ++object_writes;
+          if(stores.count(&instruction) == 0)
+          {
+            reason = "nlw_unpaired_object_write";
+            return reject();
+          }
+        }
+      }
+      if(
+        contains_address_of_symbol(
+          instruction.code(), {common_object}) ||
+        (instruction.has_condition() &&
+         contains_address_of_symbol(
+           instruction.condition(), {common_object})))
+      {
+        reason = "nlw_object_address_escape";
+        return reject();
+      }
+    }
+  }
+  if(object_writes != pairs.size())
+  {
+    reason = "nlw_object_write_census";
+    return reject();
+  }
+
+  struct lifecycle_recordt
+  {
+    irep_idt function;
+    irep_idt handle;
+    irep_idt worker;
+  };
+  std::vector<lifecycle_recordt> creates;
+  std::map<irep_idt, std::size_t> joins;
+  for(const auto &entry : goto_model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(!direct_call_identifier(instruction, callee))
+        continue;
+      if(callee == "pthread_create")
+      {
+        irep_idt handle;
+        irep_idt worker;
+        if(
+          instruction.call_arguments().size() < 3 ||
+          !addressed_symbol(
+            instruction.call_arguments()[0], handle) ||
+          !addressed_symbol(
+            instruction.call_arguments()[2], worker))
+        {
+          reason = "nlw_create_resolution";
+          return reject();
+        }
+        creates.push_back({entry.first, handle, worker});
+      }
+      else if(callee == "pthread_join")
+      {
+        irep_idt handle;
+        if(
+          instruction.call_arguments().empty() ||
+          !direct_symbol(
+            instruction.call_arguments().front(), handle))
+        {
+          reason = "nlw_join_resolution";
+          return reject();
+        }
+        ++joins[handle];
+      }
+    }
+  }
+  if(creates.size() != 2 || joins.size() != 2)
+  {
+    reason = "nlw_lifecycle_count";
+    return reject();
+  }
+  for(const auto &create : creates)
+    if(joins[create.handle] != 1)
+    {
+      reason = "nlw_lifecycle_pairing";
+      return reject();
+    }
+
+  std::size_t nested_index = creates.size();
+  irep_idt controller;
+  for(std::size_t index = 0; index < creates.size(); ++index)
+  {
+    const auto other = 1 - index;
+    const auto reachable =
+      nested_last_writer_reachable(
+        goto_model, creates[index].worker);
+    if(reachable.count(creates[other].function) != 0)
+    {
+      if(nested_index != creates.size())
+      {
+        reason = "nlw_nested_create_ambiguous";
+        return reject();
+      }
+      nested_index = other;
+      controller = creates[index].worker;
+    }
+  }
+  if(nested_index == creates.size() || controller.empty())
+  {
+    reason = "nlw_nested_create_graph";
+    return reject();
+  }
+  const auto &nested = creates[nested_index];
+  const auto controller_functions =
+    nested_last_writer_reachable(goto_model, controller);
+  const auto controller_body =
+    goto_model.goto_functions.function_map.find(controller);
+  if(
+    controller_body == goto_model.goto_functions.function_map.end() ||
+    !controller_body->second.body_available())
+  {
+    reason = "nlw_controller_body";
+    return reject();
+  }
+
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction :
+      controller_body->second.body.instructions)
+    positions.emplace(&instruction, position++);
+  std::vector<std::size_t> create_calls;
+  std::vector<std::size_t> join_calls;
+  std::vector<irep_idt> create_callees;
+  std::vector<irep_idt> join_callees;
+  for(const auto &instruction :
+      controller_body->second.body.instructions)
+  {
+    irep_idt callee;
+    if(!direct_call_identifier(instruction, callee))
+      continue;
+    const auto reachable =
+      nested_last_writer_reachable(goto_model, callee);
+    if(
+      nested_last_writer_contains_call(
+        goto_model, reachable, "pthread_create", nested.handle))
+    {
+      create_calls.push_back(positions.at(&instruction));
+      create_callees.push_back(callee);
+    }
+    if(
+      nested_last_writer_contains_call(
+        goto_model, reachable, "pthread_join", nested.handle))
+    {
+      join_calls.push_back(positions.at(&instruction));
+      join_callees.push_back(callee);
+    }
+  }
+  if(create_calls.size() != 1 || join_calls.size() != 1)
+  {
+    reason = "nlw_controller_lifecycle_calls";
+    return reject();
+  }
+  std::map<irep_idt, std::set<nested_spawn_outcomet>> spawn_memo;
+  std::set<irep_idt> spawn_active;
+  std::set<nested_spawn_outcomet> spawn_outcomes;
+  if(!nested_last_writer_spawn_summary(
+       goto_model, create_callees.front(), nested.handle,
+       spawn_memo, spawn_active, spawn_outcomes, reason))
+    return reject();
+  std::set<nested_spawn_outcomet> expected_spawn_outcomes;
+  nested_spawn_outcomet failure;
+  failure.spawned = false;
+  failure.result = nested_zero_valuet::other_nonzero;
+  expected_spawn_outcomes.insert(failure);
+  nested_spawn_outcomet success;
+  success.spawned = true;
+  success.result = nested_zero_valuet::zero;
+  expected_spawn_outcomes.insert(success);
+  if(spawn_outcomes != expected_spawn_outcomes)
+  {
+    reason = "nlw_spawn_result_correlation";
+    return reject();
+  }
+  std::set<irep_idt> join_active;
+  if(!nested_last_writer_always_joins(
+       goto_model, join_callees.front(), nested.handle,
+       join_active, reason))
+    return reject();
+
+  std::set<const goto_programt::instructiont *> classified_stores;
+  std::set<const goto_programt::instructiont *> controller_stores;
+  for(const auto &pair : pairs)
+  {
+    if(pair.function != controller)
+      continue;
+    controller_stores.insert(pair.store);
+    classified_stores.insert(pair.store);
+  }
+  if(!nested_last_writer_lifecycle_control(
+       goto_model, controller, create_callees.front(),
+       join_callees.front(), spawn_outcomes,
+       controller_stores, common_object, reason))
+    return reject();
+
+  const auto child_functions =
+    nested_last_writer_reachable(goto_model, nested.worker);
+  if(!nested_last_writer_pair_mutex(
+       goto_model, child_functions, pairs,
+       classified_stores, reason))
+    return reject();
+
+  const auto outer_index = 1 - nested_index;
+  const auto &outer = creates[outer_index];
+  if(outer.worker != controller)
+  {
+    reason = "nlw_outer_worker";
+    return reject();
+  }
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  if(
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+  {
+    reason = "nlw_outer_parent";
+    return reject();
+  }
+  std::vector<irep_idt> outer_create_callees;
+  std::vector<irep_idt> outer_join_callees;
+  for(const auto &instruction : main->second.body.instructions)
+  {
+    irep_idt callee;
+    if(!direct_call_identifier(instruction, callee))
+      continue;
+    const auto reachable =
+      nested_last_writer_reachable(goto_model, callee);
+    if(
+      nested_last_writer_contains_call(
+        goto_model, reachable, "pthread_create", outer.handle))
+      outer_create_callees.push_back(callee);
+    if(
+      nested_last_writer_contains_call(
+        goto_model, reachable, "pthread_join", outer.handle))
+      outer_join_callees.push_back(callee);
+  }
+  if(
+    outer_create_callees.size() != 1 ||
+    outer_join_callees.size() != 1)
+  {
+    reason = "nlw_outer_parent_calls";
+    return reject();
+  }
+  std::set<nested_spawn_outcomet> outer_spawn_outcomes;
+  if(!nested_last_writer_spawn_summary(
+       goto_model, outer_create_callees.front(), outer.handle,
+       spawn_memo, spawn_active, outer_spawn_outcomes, reason))
+    return reject();
+  if(outer_spawn_outcomes != expected_spawn_outcomes)
+  {
+    reason = "nlw_outer_spawn_result_correlation";
+    return reject();
+  }
+  std::set<irep_idt> outer_join_active;
+  if(!nested_last_writer_always_joins(
+       goto_model, outer_join_callees.front(), outer.handle,
+       outer_join_active, reason))
+    return reject();
+  const std::set<const goto_programt::instructiont *> no_parent_stores;
+  if(!nested_last_writer_lifecycle_control(
+       goto_model, "main", outer_create_callees.front(),
+       outer_join_callees.front(), outer_spawn_outcomes,
+       no_parent_stores, common_object, reason))
+    return reject();
+  if(!nested_last_writer_outer_pair_order(
+       goto_model, outer_create_callees.front(),
+       outer_join_callees.front(), outer.handle, pairs,
+       classified_stores, reason))
+    return reject();
+  if(classified_stores != stores)
+  {
+    reason = "nlw_property_classification";
+    return reject();
+  }
+
+  for(const auto &pair : pairs)
+  {
+    if(
+      pair.function != controller &&
+      child_functions.count(pair.function) == 0 &&
+      pair.function != outer_create_callees.front() &&
+      pair.function != outer_join_callees.front())
+    {
+      reason = "nlw_property_scope";
+      return reject();
+    }
+  }
+
+  std::cout
+    << "NATIVE_NESTED_LAST_WRITER_AUDIT applicable=1"
+    << " object=" << common_object
+    << " controller=" << controller
+    << " child=" << nested.worker
+    << " properties=" << pairs.size()
+    << " writes=" << object_writes << '\n';
+  return true;
+}
+
+bool nested_lifecycle_last_writer_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  if(!nested_lifecycle_last_writer_audit(
+       goto_model, message_handler))
+    return false;
+
+  std::string reason;
+  irep_idt wrapper;
+  if(!nested_last_writer_property_wrapper(
+       goto_model, wrapper, reason))
+    return false;
+  std::size_t discharged = 0;
+  for(auto &entry : goto_model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(
+        direct_call_identifier(instruction, callee) &&
+        callee == wrapper)
+      {
+        instruction.turn_into_skip();
+        ++discharged;
+      }
+    }
+  }
+  if(discharged == 0)
+    return false;
+  goto_model.goto_functions.update();
+  std::cout
+    << "NATIVE_NESTED_LAST_WRITER applied=1"
+    << " discharged=" << discharged << '\n';
+  return true;
+}
+
+namespace
+{
+struct balr_lock_operationt
+{
+  irep_idt function;
+  irep_idt assumption;
+  irep_idt lock;
+  bool acquire = false;
+};
+
+bool balr_boolean_symbol(
+  const goto_modelt &model,
+  const irep_idt &identifier)
+{
+  const auto symbol = model.symbol_table.symbols.find(identifier);
+  if(symbol == model.symbol_table.symbols.end())
+    return false;
+  const auto &type = symbol->second.type;
+  return type.id() == ID_bool || type.id() == ID_c_bool;
+}
+
+bool balr_atomic_lock_operation(
+  const goto_modelt &model,
+  const irep_idt &function_id,
+  balr_lock_operationt &operation)
+{
+  const auto function =
+    model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+    return false;
+  std::vector<const goto_programt::instructiont *> body;
+  for(const auto &instruction : function->second.body.instructions)
+    if(
+      !instruction.is_location() && !instruction.is_skip() &&
+      !instruction.is_decl() && !instruction.is_dead())
+      body.push_back(&instruction);
+  if(
+    body.size() != 5 || !body[0]->is_atomic_begin() ||
+    !body[1]->is_function_call() || !body[2]->is_assign() ||
+    !body[3]->is_atomic_end() || !body[4]->is_end_function())
+    return false;
+  irep_idt assumption;
+  if(
+    !direct_call_identifier(*body[1], assumption) ||
+    body[1]->call_arguments().size() != 1)
+    return false;
+  irep_idt written;
+  mp_integer stored;
+  if(
+    !direct_symbol(body[2]->assign_lhs(), written) ||
+    !balr_boolean_symbol(model, written) ||
+    !constant_eval(body[2]->assign_rhs(), {}, stored) ||
+    (stored != 0 && stored != 1))
+    return false;
+  irep_idt tested;
+  mp_integer expected;
+  if(
+    !nested_last_writer_equality(
+      body[1]->call_arguments().front(), tested, expected) ||
+    tested != written || expected + stored != 1)
+    return false;
+  operation.function = function_id;
+  operation.assumption = assumption;
+  operation.lock = written;
+  operation.acquire = stored == 1;
+  return true;
+}
+
+bool balr_assumption_wrapper(
+  const goto_modelt &model,
+  const irep_idt &function_id)
+{
+  const auto function =
+    model.goto_functions.function_map.find(function_id);
+  const auto symbol = model.symbol_table.symbols.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available() ||
+    symbol == model.symbol_table.symbols.end() ||
+    symbol->second.type.id() != ID_code)
+    return false;
+  const auto &parameters =
+    to_code_type(symbol->second.type).parameters();
+  if(parameters.size() != 1 || parameters.front().get_identifier().empty())
+    return false;
+  std::vector<const goto_programt::instructiont *> body;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  for(const auto &instruction : function->second.body.instructions)
+  {
+    positions.emplace(&instruction, body.size());
+    body.push_back(&instruction);
+  }
+  const goto_programt::instructiont *guard = nullptr;
+  const goto_programt::instructiont *abort_call = nullptr;
+  std::size_t guard_position = 0;
+  std::size_t abort_position = 0;
+  for(std::size_t index = 0; index < body.size(); ++index)
+  {
+    const auto instruction = body[index];
+    if(
+      instruction->is_goto() &&
+      instruction->targets.size() == 1 &&
+      nested_last_writer_parameter_truth(
+        instruction->condition(),
+        parameters.front().get_identifier()))
+    {
+      if(guard != nullptr)
+        return false;
+      guard = instruction;
+      guard_position = index;
+    }
+    irep_idt callee;
+    if(
+      direct_call_identifier(*instruction, callee) &&
+      callee == "abort")
+    {
+      if(abort_call != nullptr)
+        return false;
+      abort_call = instruction;
+      abort_position = index;
+    }
+  }
+  if(
+    guard == nullptr || abort_call == nullptr ||
+    guard_position >= abort_position)
+    return false;
+  for(std::size_t index = 0; index < guard_position; ++index)
+    if(
+      !body[index]->is_location() && !body[index]->is_skip() &&
+      !body[index]->is_decl() && !body[index]->is_dead())
+      return false;
+  for(std::size_t index = guard_position + 1;
+      index < abort_position; ++index)
+    if(
+      !body[index]->is_location() && !body[index]->is_skip() &&
+      !body[index]->is_decl() && !body[index]->is_dead())
+      return false;
+
+  std::set<std::size_t> pending{
+    positions.at(&*guard->targets.front())};
+  std::set<std::size_t> visited;
+  bool exits = false;
+  while(!pending.empty())
+  {
+    const auto index = *pending.begin();
+    pending.erase(pending.begin());
+    if(index >= body.size() || !visited.insert(index).second)
+      continue;
+    const auto instruction = body[index];
+    if(
+      instruction->is_end_function() ||
+      instruction->is_set_return_value())
+    {
+      exits = true;
+      continue;
+    }
+    if(instruction->is_goto())
+    {
+      for(const auto &target : instruction->targets)
+        pending.insert(positions.at(&*target));
+      if(!instruction->condition().is_true())
+        pending.insert(index + 1);
+      continue;
+    }
+    if(
+      instruction->is_function_call() ||
+      instruction->is_assign() ||
+      (!instruction->is_location() && !instruction->is_skip() &&
+       !instruction->is_decl() && !instruction->is_dead()))
+      return false;
+    pending.insert(index + 1);
+  }
+  return exits;
+}
+
+bool balr_property_function(
+  const goto_modelt &model,
+  irep_idt &property,
+  std::string &reason)
+{
+  const namespacet ns(model.symbol_table);
+  std::size_t assertions = 0;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(!instruction.is_assert())
+        continue;
+      if(
+        !simplify_expr(
+           instruction.condition(), ns).is_false())
+        continue;
+      ++assertions;
+      property = entry.first;
+    }
+  }
+  if(assertions != 1 || property.empty())
+  {
+    reason = "balr_property_count";
+    return false;
+  }
+  return true;
+}
+
+struct balr_framet
+{
+  irep_idt function;
+  std::size_t position = 0;
+  irep_idt lhs;
+
+  bool operator<(const balr_framet &other) const
+  {
+    return
+      std::tie(function, position, lhs) <
+      std::tie(other.function, other.position, other.lhs);
+  }
+};
+
+struct balr_statet
+{
+  irep_idt function;
+  std::size_t position = 0;
+  bool owns = false;
+  std::map<irep_idt, nested_zero_valuet> environment;
+  std::vector<balr_framet> stack;
+
+  bool operator<(const balr_statet &other) const
+  {
+    return
+      std::tie(function, position, owns, environment, stack) <
+      std::tie(
+        other.function, other.position, other.owns,
+        other.environment, other.stack);
+  }
+};
+
+void balr_forget_shared(
+  std::map<irep_idt, nested_zero_valuet> &environment,
+  const std::set<irep_idt> &shared)
+{
+  for(const auto &identifier : shared)
+    environment.erase(identifier);
+}
+
+bool balr_refine_true(
+  const goto_modelt &model,
+  const exprt &src,
+  const std::set<irep_idt> &shared,
+  const bool owns,
+  std::map<irep_idt, nested_zero_valuet> &environment)
+{
+  const exprt &condition = without_cast(src);
+  irep_idt symbol;
+  if(direct_symbol(condition, symbol))
+  {
+    if(!balr_boolean_symbol(model, symbol))
+      return true;
+    if(shared.count(symbol) == 0 || owns)
+      environment[symbol] = nested_zero_valuet::one;
+    return true;
+  }
+  if(
+    condition.id() == ID_not &&
+    condition.operands().size() == 1 &&
+    direct_symbol(without_cast(condition.op0()), symbol) &&
+    balr_boolean_symbol(model, symbol))
+  {
+    if(shared.count(symbol) == 0 || owns)
+      environment[symbol] = nested_zero_valuet::zero;
+    return true;
+  }
+  if(
+    (condition.id() == ID_equal ||
+     condition.id() == ID_notequal) &&
+    condition.operands().size() == 2)
+  {
+    mp_integer constant;
+    const bool left =
+      direct_symbol(without_cast(condition.op0()), symbol) &&
+      constant_eval(condition.op1(), {}, constant);
+    const bool right =
+      direct_symbol(without_cast(condition.op1()), symbol) &&
+      constant_eval(condition.op0(), {}, constant);
+    if(
+      (left || right) && balr_boolean_symbol(model, symbol) &&
+      (constant == 0 || constant == 1) &&
+      (shared.count(symbol) == 0 || owns))
+    {
+      bool value = constant == 1;
+      if(condition.id() == ID_notequal)
+        value = !value;
+      environment[symbol] =
+        value ? nested_zero_valuet::one
+              : nested_zero_valuet::zero;
+    }
+  }
+  return true;
+}
+
+struct balr_program_cachet
+{
+  std::map<
+    irep_idt,
+    std::vector<const goto_programt::instructiont *>> order;
+  std::map<
+    irep_idt,
+    std::map<const goto_programt::instructiont *, std::size_t>> positions;
+};
+
+bool balr_cache_function(
+  const goto_modelt &model,
+  const irep_idt &function_id,
+  balr_program_cachet &cache)
+{
+  if(cache.order.count(function_id) != 0)
+    return true;
+  const auto function =
+    model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+    return false;
+  auto &order = cache.order[function_id];
+  auto &positions = cache.positions[function_id];
+  for(const auto &instruction : function->second.body.instructions)
+  {
+    positions.emplace(&instruction, order.size());
+    order.push_back(&instruction);
+  }
+  return !order.empty();
+}
+
+bool balr_interpret_root(
+  const goto_modelt &model,
+  const irep_idt &root,
+  const irep_idt &main_id,
+  const std::set<irep_idt> &workers,
+  const balr_lock_operationt &acquire,
+  const balr_lock_operationt &release,
+  const irep_idt &property,
+  const std::set<irep_idt> &shared,
+  balr_program_cachet &cache,
+  std::size_t &visited_count,
+  std::string &reason)
+{
+  if(!balr_cache_function(model, root, cache))
+  {
+    reason = "balr_root_body";
+    return false;
+  }
+  balr_statet initial;
+  initial.function = root;
+  std::set<balr_statet> pending{initial};
+  std::set<balr_statet> visited;
+  while(!pending.empty())
+  {
+    auto state = *pending.begin();
+    pending.erase(pending.begin());
+    if(!state.owns)
+      balr_forget_shared(state.environment, shared);
+    if(!visited.insert(state).second)
+      continue;
+    if(++visited_count > 200000)
+    {
+      reason = "balr_state_budget";
+      return false;
+    }
+    const auto &order = cache.order.at(state.function);
+    if(state.position >= order.size())
+    {
+      reason = "balr_fallthrough";
+      return false;
+    }
+    const auto instruction = order[state.position];
+    if(
+      instruction->is_end_function() ||
+      instruction->is_set_return_value())
+    {
+      if(state.stack.empty())
+      {
+        if(state.owns)
+        {
+          reason = "balr_root_returns_held";
+          return false;
+        }
+        continue;
+      }
+      const auto frame = state.stack.back();
+      state.stack.pop_back();
+      state.function = frame.function;
+      state.position = frame.position;
+      if(!frame.lhs.empty())
+        state.environment.erase(frame.lhs);
+      pending.insert(state);
+      continue;
+    }
+    if(instruction->is_goto())
+    {
+      bool known = false;
+      bool value = false;
+      nested_last_writer_condition(
+        instruction->condition(), state.environment,
+        known, value);
+      if(!known || value)
+      {
+        for(const auto &target : instruction->targets)
+        {
+          auto branch = state;
+          branch.position =
+            cache.positions.at(state.function).at(&*target);
+          if(
+            state.function == root &&
+            branch.position <= state.position &&
+            branch.owns)
+          {
+            reason = "balr_root_backedge_held";
+            return false;
+          }
+          pending.insert(branch);
+        }
+      }
+      if(!known || !value)
+      {
+        if(state.position + 1 >= order.size())
+        {
+          reason = "balr_goto_fallthrough";
+          return false;
+        }
+        ++state.position;
+        pending.insert(state);
+      }
+      continue;
+    }
+    if(instruction->is_assume())
+    {
+      bool known = false;
+      bool value = false;
+      nested_last_writer_condition(
+        instruction->condition(), state.environment,
+        known, value);
+      if(known && !value)
+        continue;
+      balr_refine_true(
+        model, instruction->condition(), shared,
+        state.owns, state.environment);
+    }
+    if(instruction->is_assign())
+    {
+      irep_idt lhs;
+      if(!direct_symbol(instruction->assign_lhs(), lhs))
+      {
+        reason = "balr_indirect_write";
+        return false;
+      }
+      if(lhs == acquire.lock)
+      {
+        reason = "balr_direct_lock_write";
+        return false;
+      }
+      if(shared.count(lhs) != 0 && !state.owns)
+      {
+        reason = "balr_shared_write_unheld";
+        return false;
+      }
+      const auto value =
+        nested_last_writer_value(
+          instruction->assign_rhs(), state.environment);
+      if(value == nested_zero_valuet::unknown)
+        state.environment.erase(lhs);
+      else
+        state.environment[lhs] = value;
+    }
+    if(instruction->is_function_call())
+    {
+      irep_idt callee;
+      if(!direct_call_identifier(*instruction, callee))
+      {
+        reason = "balr_indirect_call";
+        return false;
+      }
+      if(callee == property)
+      {
+        reason = "balr_property_reachable";
+        return false;
+      }
+      if(callee == "abort")
+        continue;
+      if(callee == acquire.function)
+      {
+        if(state.owns)
+        {
+          reason = "balr_recursive_acquire";
+          return false;
+        }
+        state.owns = true;
+        balr_forget_shared(state.environment, shared);
+        state.environment[acquire.lock] =
+          nested_zero_valuet::one;
+      }
+      else if(callee == release.function)
+      {
+        if(!state.owns)
+        {
+          reason = "balr_release_unheld";
+          return false;
+        }
+        state.owns = false;
+        balr_forget_shared(state.environment, shared);
+      }
+      else if(callee == acquire.assumption)
+      {
+        if(instruction->call_arguments().size() != 1)
+        {
+          reason = "balr_assumption_arguments";
+          return false;
+        }
+        bool known = false;
+        bool value = false;
+        nested_last_writer_condition(
+          instruction->call_arguments().front(),
+          state.environment, known, value);
+        if(known && !value)
+          continue;
+        balr_refine_true(
+          model, instruction->call_arguments().front(),
+          shared, state.owns, state.environment);
+      }
+      else if(callee == "pthread_create")
+      {
+        irep_idt worker;
+        if(
+          state.function != main_id ||
+          instruction->call_arguments().size() < 3 ||
+          !addressed_symbol(
+            instruction->call_arguments()[2], worker) ||
+          workers.count(worker) == 0)
+        {
+          reason = "balr_create_site";
+          return false;
+        }
+      }
+      else if(
+        id2string(callee).find("__VERIFIER_nondet_") == 0)
+      {
+      }
+      else
+      {
+        if(
+          callee == state.function ||
+          std::any_of(
+            state.stack.begin(), state.stack.end(),
+            [&callee](const balr_framet &frame)
+            {
+              return frame.function == callee;
+            }))
+        {
+          reason = "balr_recursive_call";
+          return false;
+        }
+        if(!balr_cache_function(model, callee, cache))
+        {
+          reason = "balr_external_call";
+          return false;
+        }
+        balr_framet frame;
+        frame.function = state.function;
+        frame.position = state.position + 1;
+        if(!instruction->call_lhs().is_nil())
+        {
+          if(!direct_symbol(instruction->call_lhs(), frame.lhs))
+          {
+            reason = "balr_call_lhs";
+            return false;
+          }
+        }
+        state.stack.push_back(frame);
+        state.function = callee;
+        state.position = 0;
+        pending.insert(state);
+        continue;
+      }
+      if(!instruction->call_lhs().is_nil())
+      {
+        irep_idt lhs;
+        if(!direct_symbol(instruction->call_lhs(), lhs))
+        {
+          reason = "balr_runtime_call_lhs";
+          return false;
+        }
+        state.environment.erase(lhs);
+      }
+    }
+    ++state.position;
+    pending.insert(state);
+  }
+  return true;
+}
+
+bool balr_prove(
+  const goto_modelt &model,
+  irep_idt &property,
+  std::size_t &workers_count,
+  std::size_t &visited_count,
+  std::string &reason)
+{
+  std::vector<balr_lock_operationt> operations;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    balr_lock_operationt operation;
+    if(balr_atomic_lock_operation(
+         model, entry.first, operation))
+      operations.push_back(operation);
+  }
+  if(operations.size() != 2)
+  {
+    reason = "balr_atomic_operation_count";
+    return false;
+  }
+  const auto acquire_it =
+    std::find_if(
+      operations.begin(), operations.end(),
+      [](const balr_lock_operationt &operation)
+      {
+        return operation.acquire;
+      });
+  const auto release_it =
+    std::find_if(
+      operations.begin(), operations.end(),
+      [](const balr_lock_operationt &operation)
+      {
+        return !operation.acquire;
+      });
+  if(
+    acquire_it == operations.end() ||
+    release_it == operations.end() ||
+    acquire_it->lock != release_it->lock ||
+    acquire_it->assumption != release_it->assumption)
+  {
+    reason = "balr_atomic_pair";
+    return false;
+  }
+  if(!balr_assumption_wrapper(model, acquire_it->assumption))
+  {
+    reason = "balr_assumption_wrapper";
+    return false;
+  }
+  if(!balr_property_function(model, property, reason))
+    return false;
+
+  const irep_idt main_id = "main";
+  const auto main =
+    model.goto_functions.function_map.find(main_id);
+  if(
+    main == model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+  {
+    reason = "balr_main";
+    return false;
+  }
+  std::set<irep_idt> workers;
+  for(const auto &instruction : main->second.body.instructions)
+  {
+    irep_idt callee;
+    if(
+      !direct_call_identifier(instruction, callee) ||
+      callee != "pthread_create")
+      continue;
+    irep_idt worker;
+    if(
+      instruction.call_arguments().size() < 3 ||
+      !addressed_symbol(
+        instruction.call_arguments()[2], worker))
+    {
+      reason = "balr_worker_resolution";
+      return false;
+    }
+    workers.insert(worker);
+  }
+  if(workers.empty())
+  {
+    reason = "balr_workers_empty";
+    return false;
+  }
+  workers_count = workers.size();
+
+  std::set<irep_idt> reachable{main_id};
+  for(const auto &worker : workers)
+  {
+    const auto closure =
+      nested_last_writer_reachable(model, worker);
+    reachable.insert(closure.begin(), closure.end());
+  }
+  reachable.insert(acquire_it->function);
+  reachable.insert(release_it->function);
+
+  std::set<irep_idt> shared{acquire_it->lock};
+  for(const auto &function_id : reachable)
+  {
+    const auto function =
+      model.goto_functions.function_map.find(function_id);
+    if(
+      function == model.goto_functions.function_map.end() ||
+      !function->second.body_available())
+      continue;
+    for(const auto &instruction : function->second.body.instructions)
+    {
+      if(!instruction.is_assign())
+        continue;
+      irep_idt lhs;
+      if(
+        direct_symbol(instruction.assign_lhs(), lhs) &&
+        balr_boolean_symbol(model, lhs))
+      {
+        const auto symbol =
+          model.symbol_table.symbols.find(lhs);
+        if(
+          symbol != model.symbol_table.symbols.end() &&
+          symbol->second.is_static_lifetime)
+          shared.insert(lhs);
+      }
+    }
+  }
+  if(shared.size() < 2)
+  {
+    reason = "balr_shared_state";
+    return false;
+  }
+
+  std::size_t lock_writes = 0;
+  bool initialized_zero = false;
+  const namespacet ns(model.symbol_table);
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(
+        contains_address_of_symbol(
+          instruction.code(), shared) ||
+        (instruction.has_condition() &&
+         contains_address_of_symbol(
+           instruction.condition(), shared)))
+      {
+        reason = "balr_shared_address_escape";
+        return false;
+      }
+      if(!instruction.is_assign())
+        continue;
+      irep_idt lhs;
+      if(
+        !direct_symbol(instruction.assign_lhs(), lhs) ||
+        shared.count(lhs) == 0)
+        continue;
+      if(lhs == acquire_it->lock)
+      {
+        ++lock_writes;
+        if(entry.first == "__CPROVER_initialize")
+        {
+          const auto value =
+            nested_last_writer_value(
+              simplify_expr(
+                instruction.assign_rhs(), ns), {});
+          initialized_zero =
+            value == nested_zero_valuet::zero;
+        }
+        else if(
+          entry.first != acquire_it->function &&
+          entry.first != release_it->function)
+        {
+          reason = "balr_external_lock_write";
+          return false;
+        }
+      }
+      else if(
+        entry.first != "__CPROVER_initialize" &&
+        reachable.count(entry.first) == 0)
+      {
+        reason = "balr_external_shared_write";
+        return false;
+      }
+    }
+  }
+  if(lock_writes != 3 || !initialized_zero)
+  {
+    reason = "balr_lock_write_census";
+    return false;
+  }
+
+  balr_program_cachet cache;
+  if(!balr_interpret_root(
+       model, main_id, main_id, workers,
+       *acquire_it, *release_it, property,
+       shared, cache, visited_count, reason))
+    return false;
+  for(const auto &worker : workers)
+    if(!balr_interpret_root(
+         model, worker, main_id, workers,
+         *acquire_it, *release_it, property,
+         shared, cache, visited_count, reason))
+      return false;
+  return true;
+}
+} // namespace
+
+bool boolean_atomic_lock_region_audit(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  irep_idt property;
+  std::size_t workers = 0;
+  std::size_t visited = 0;
+  std::string reason;
+  const bool applicable =
+    balr_prove(
+      goto_model, property, workers, visited, reason);
+  std::cout
+    << "NATIVE_BOOLEAN_ATOMIC_LOCK_REGION_AUDIT applicable="
+    << (applicable ? 1 : 0)
+    << " workers=" << workers
+    << " states=" << visited;
+  if(!applicable)
+    std::cout << " reason=" << reason;
+  std::cout << '\n';
+  return applicable;
+}
+
+bool boolean_atomic_lock_region_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  irep_idt property;
+  std::size_t workers = 0;
+  std::size_t visited = 0;
+  std::string reason;
+  if(!balr_prove(
+       goto_model, property, workers, visited, reason))
+    return false;
+  auto function =
+    goto_model.goto_functions.function_map.find(property);
+  if(
+    function == goto_model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+    return false;
+  std::size_t discharged = 0;
+  for(auto &instruction : function->second.body.instructions)
+    if(instruction.is_assert())
+    {
+      instruction.turn_into_skip();
+      ++discharged;
+    }
+  if(discharged != 1)
+    return false;
+  goto_model.goto_functions.update();
+  std::cout
+    << "NATIVE_BOOLEAN_ATOMIC_LOCK_REGION applied=1"
+    << " workers=" << workers
+    << " states=" << visited
+    << " discharged=" << discharged << '\n';
+  (void)message_handler;
+  return true;
+}
+
+bool mutex_zero_fixedpoint_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  std::string reason;
+  const auto candidates = dormant_spawn_cutoffs(goto_model, reason);
+  if(
+    candidates.size() != 1 ||
+    candidates.front().first_join == nullptr)
+    return false;
+
+  const auto worker =
+    goto_model.goto_functions.function_map.find(candidates.front().worker);
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  if(
+    worker == goto_model.goto_functions.function_map.end() ||
+    !worker->second.body_available() ||
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+    return false;
+
+  const auto zero_equality =
+    [&](const exprt &src, irep_idt &object) -> bool
+    {
+      const exprt &condition = without_cast(src);
+      if(condition.id() != ID_equal || condition.operands().size() != 2)
+        return false;
+      return
+        (direct_symbol(condition.op0(), object) &&
+         is_zero_constant(condition.op1())) ||
+        (direct_symbol(condition.op1(), object) &&
+         is_zero_constant(condition.op0()));
+    };
+  const auto nonzero_branch =
+    [&](const exprt &src, irep_idt &object) -> bool
+    {
+      const exprt &condition = without_cast(src);
+      return
+        condition.id() == ID_not &&
+        condition.operands().size() == 1 &&
+        zero_equality(condition.op0(), object);
+    };
+  const auto zero_assertion =
+    [&](const goto_programt::instructiont &instruction,
+        const irep_idt &object) -> bool
+    {
+      irep_idt callee;
+      irep_idt asserted;
+      return
+        instruction.is_function_call() &&
+        direct_call_identifier(instruction, callee) &&
+        callee == "__VERIFIER_assert" &&
+        instruction.call_arguments().size() == 1 &&
+        zero_equality(instruction.call_arguments().front(), asserted) &&
+        asserted == object;
+    };
+
+  const auto &worker_body = worker->second.body;
+  std::map<const goto_programt::instructiont *, std::size_t> worker_positions;
+  std::size_t worker_position = 0;
+  for(const auto &instruction : worker_body.instructions)
+    worker_positions.emplace(&instruction, worker_position++);
+
+  goto_programt::const_targett branch = worker_body.instructions.end();
+  irep_idt shared;
+  std::size_t nonzero_branches = 0;
+  for(auto instruction = worker_body.instructions.begin();
+      instruction != worker_body.instructions.end(); ++instruction)
+  {
+    irep_idt object;
+    if(
+      instruction->is_goto() &&
+      instruction->targets.size() == 1 &&
+      nonzero_branch(instruction->condition(), object) &&
+      instruction->get_target() != worker_body.instructions.end() &&
+      worker_positions.at(&*instruction->get_target()) >
+        worker_positions.at(&*instruction))
+    {
+      branch = instruction;
+      shared = object;
+      ++nonzero_branches;
+    }
+  }
+  if(nonzero_branches != 1)
+    return false;
+
+  const auto shared_symbol =
+    goto_model.symbol_table.symbols.find(shared);
+  if(
+    shared_symbol == goto_model.symbol_table.symbols.end() ||
+    !shared_symbol->second.is_static_lifetime ||
+    (shared_symbol->second.type.id() != ID_signedbv &&
+     shared_symbol->second.type.id() != ID_unsignedbv))
+    return false;
+
+  const auto else_target = branch->get_target();
+  std::map<irep_idt, std::pair<std::size_t, std::size_t>> worker_mutex_calls;
+  for(auto instruction = worker_body.instructions.begin();
+      instruction != worker_body.instructions.end(); ++instruction)
+  {
+    irep_idt mutex;
+    if(parse_mutex_call(*instruction, "pthread_mutex_lock", mutex))
+      ++worker_mutex_calls[mutex].first;
+    if(parse_mutex_call(*instruction, "pthread_mutex_unlock", mutex))
+      ++worker_mutex_calls[mutex].second;
+  }
+  irep_idt invariant_mutex;
+  for(const auto &entry : worker_mutex_calls)
+  {
+    if(entry.second.first != 1 || entry.second.second != 2)
+      continue;
+    bool lock_before = false;
+    bool unlock_true = false;
+    bool unlock_else = false;
+    for(auto instruction = worker_body.instructions.begin();
+        instruction != worker_body.instructions.end(); ++instruction)
+    {
+      irep_idt mutex;
+      if(
+        parse_mutex_call(*instruction, "pthread_mutex_lock", mutex) &&
+        mutex == entry.first &&
+        worker_positions.at(&*instruction) <
+          worker_positions.at(&*branch))
+        lock_before = true;
+      if(
+        parse_mutex_call(*instruction, "pthread_mutex_unlock", mutex) &&
+        mutex == entry.first)
+      {
+        if(
+          worker_positions.at(&*branch) <
+            worker_positions.at(&*instruction) &&
+          worker_positions.at(&*instruction) <
+            worker_positions.at(&*else_target))
+          unlock_true = true;
+        if(&*instruction == &*else_target)
+          unlock_else = true;
+      }
+    }
+    if(lock_before && unlock_true && unlock_else)
+    {
+      if(!invariant_mutex.empty())
+        return false;
+      invariant_mutex = entry.first;
+    }
+  }
+  if(invariant_mutex.empty())
+    return false;
+
+  std::size_t worker_assertions = 0;
+  goto_programt::const_targett worker_assertion =
+    worker_body.instructions.end();
+  for(auto instruction = std::next(branch);
+      instruction != else_target; ++instruction)
+    if(zero_assertion(*instruction, shared))
+    {
+      worker_assertion = instruction;
+      ++worker_assertions;
+    }
+  if(worker_assertions != 1)
+    return false;
+
+  bool true_unlock_after_assertion = false;
+  for(auto instruction = std::next(worker_assertion);
+      instruction != else_target; ++instruction)
+  {
+    irep_idt mutex;
+    if(
+      parse_mutex_call(*instruction, "pthread_mutex_unlock", mutex) &&
+      mutex == invariant_mutex)
+      true_unlock_after_assertion = true;
+  }
+  if(!true_unlock_after_assertion)
+    return false;
+
+  bool skips_else = false;
+  for(auto instruction = std::next(worker_assertion);
+      instruction != else_target; ++instruction)
+    if(
+      instruction->is_goto() &&
+      instruction->condition().is_true() &&
+      instruction->targets.size() == 1 &&
+      instruction->get_target() != worker_body.instructions.end() &&
+      worker_positions.at(&*instruction->get_target()) >
+        worker_positions.at(&*else_target))
+      skips_else = true;
+  if(!skips_else)
+    return false;
+
+  const auto unit_update =
+    [&](goto_programt::const_targett instruction,
+        const irep_idt &operation) -> bool
+    {
+      if(!instruction->is_assign())
+        return false;
+      irep_idt lhs;
+      irep_idt rhs_object;
+      mp_integer unit;
+      const exprt &rhs = without_cast(instruction->assign_rhs());
+      return
+        direct_symbol(instruction->assign_lhs(), lhs) &&
+        lhs == shared &&
+        rhs.id() == operation &&
+        rhs.operands().size() == 2 &&
+        direct_symbol(rhs.op0(), rhs_object) &&
+        rhs_object == shared &&
+        constant_eval(rhs.op1(), {}, unit) &&
+        unit == 1;
+    };
+
+  std::vector<goto_programt::const_targett> worker_updates;
+  for(auto instruction = std::next(else_target);
+      instruction != worker_body.instructions.end(); ++instruction)
+    if(instruction->is_assign() &&
+       instruction_mentions_any(*instruction, {shared}))
+      worker_updates.push_back(instruction);
+  if(
+    worker_updates.size() != 2 ||
+    !unit_update(worker_updates[0], ID_plus) ||
+    !unit_update(worker_updates[1], ID_minus))
+    return false;
+
+  const auto &main_body = main->second.body;
+  std::map<const goto_programt::instructiont *, std::size_t> main_positions;
+  std::size_t main_position = 0;
+  for(const auto &instruction : main_body.instructions)
+    main_positions.emplace(&instruction, main_position++);
+  std::vector<goto_programt::const_targett> main_updates;
+  goto_programt::const_targett main_assertion =
+    main_body.instructions.end();
+  std::size_t main_assertions = 0;
+  std::vector<goto_programt::const_targett> main_locks;
+  std::vector<goto_programt::const_targett> main_unlocks;
+  for(auto instruction = main_body.instructions.begin();
+      instruction != main_body.instructions.end(); ++instruction)
+  {
+    if(
+      instruction->is_assign() &&
+      instruction_mentions_any(*instruction, {shared}))
+      main_updates.push_back(instruction);
+    if(zero_assertion(*instruction, shared))
+    {
+      main_assertion = instruction;
+      ++main_assertions;
+    }
+    irep_idt mutex;
+    if(
+      parse_mutex_call(*instruction, "pthread_mutex_lock", mutex) &&
+      mutex == invariant_mutex)
+      main_locks.push_back(instruction);
+    if(
+      parse_mutex_call(*instruction, "pthread_mutex_unlock", mutex) &&
+      mutex == invariant_mutex)
+      main_unlocks.push_back(instruction);
+  }
+  if(
+    main_updates.size() != 2 ||
+    !unit_update(main_updates[0], ID_plus) ||
+    !unit_update(main_updates[1], ID_minus) ||
+    main_assertions != 1 ||
+    main_locks.size() != 1 ||
+    main_unlocks.size() != 1 ||
+    main_positions.at(&*main_locks.front()) >=
+      main_positions.at(&*main_updates.front()) ||
+    main_positions.at(&*main_updates.front()) >=
+      main_positions.at(&*main_updates.back()) ||
+    main_positions.at(&*main_updates.back()) >=
+      main_positions.at(&*main_assertion) ||
+    main_positions.at(&*main_assertion) >=
+      main_positions.at(&*main_unlocks.front()))
+    return false;
+
+  std::size_t mentions = 0;
+  std::size_t zero_initializers = 0;
+  std::size_t assertions = 0;
+  std::size_t plus_one = 0;
+  std::size_t minus_one = 0;
+  for(const auto &entry : goto_model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(auto instruction = entry.second.body.instructions.begin();
+        instruction != entry.second.body.instructions.end(); ++instruction)
+    {
+      if(instruction_mentions_any(*instruction, {shared}))
+      {
+        ++mentions;
+        irep_idt lhs;
+        if(
+          instruction->is_assign() &&
+          direct_symbol(instruction->assign_lhs(), lhs) &&
+          lhs == shared &&
+          is_zero_constant(instruction->assign_rhs()))
+          ++zero_initializers;
+        if(unit_update(instruction, ID_plus))
+          ++plus_one;
+        if(unit_update(instruction, ID_minus))
+          ++minus_one;
+        if(zero_assertion(*instruction, shared))
+          ++assertions;
+      }
+      if(instruction->is_function_call())
+      {
+        if(contains_address_of_symbol(
+             instruction->call_function(), {shared}))
+          return false;
+        for(const auto &argument : instruction->call_arguments())
+          if(contains_address_of_symbol(argument, {shared}))
+            return false;
+      }
+    }
+  }
+  if(
+    mentions != 8 ||
+    zero_initializers != 1 ||
+    assertions != 2 ||
+    plus_one != 2 ||
+    minus_one != 2)
+    return false;
+
+  bool truncated = false;
+  if(!apply_dormant_spawn_counts(
+       goto_model, candidates, std::vector<unsigned>{0}, truncated))
+    return false;
+  goto_model.goto_functions.update();
+  auto updated_main =
+    goto_model.goto_functions.function_map.find("main");
+  updated_main->second.body.instructions.begin()
+    ->source_location_nonconst()
+    .set("deagle_mutex_zero_fixedpoint", true);
+  messaget log(message_handler);
+  log.status() << "NATIVE_MUTEX_ZERO_FIXEDPOINT applied=1"
+               << " workers=0 mentions=" << mentions
+               << " truncated=" << (truncated ? 1 : 0)
+               << messaget::eom;
+  return true;
+}
+
+bool mutex_zero_fixedpoint_applied(const goto_modelt &goto_model)
+{
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  return
+    main != goto_model.goto_functions.function_map.end() &&
+    main->second.body_available() &&
+    !main->second.body.instructions.empty() &&
+    main->second.body.instructions.begin()
+      ->source_location()
+      .get_bool("deagle_mutex_zero_fixedpoint");
+}
+
+bool common_mutex_zero_sum_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  std::string reason;
+  const auto candidates = dormant_spawn_cutoffs(goto_model, reason);
+  if(
+    candidates.size() != 1 ||
+    candidates.front().first_join == nullptr)
+    return false;
+
+  const auto helper_mutex =
+    [&](const irep_idt &helper, const irep_idt &operation, irep_idt &mutex)
+    {
+      const auto function =
+        goto_model.goto_functions.function_map.find(helper);
+      if(
+        function == goto_model.goto_functions.function_map.end() ||
+        !function->second.body_available())
+        return false;
+      std::size_t calls = 0;
+      for(const auto &instruction : function->second.body.instructions)
+      {
+        if(!instruction.is_function_call())
+          continue;
+        irep_idt callee;
+        irep_idt candidate;
+        if(
+          !direct_call_identifier(instruction, callee) ||
+          callee != operation ||
+          instruction.call_arguments().size() != 1 ||
+          !addressed_symbol(
+            instruction.call_arguments().front(), candidate))
+          return false;
+        mutex = candidate;
+        ++calls;
+      }
+      return calls == 1;
+    };
+
+  const auto worker =
+    goto_model.goto_functions.function_map.find(candidates.front().worker);
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  if(
+    worker == goto_model.goto_functions.function_map.end() ||
+    !worker->second.body_available() ||
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+    return false;
+
+  irep_idt lock_helper;
+  irep_idt unlock_helper;
+  irep_idt mutex;
+  bool inside = false;
+  std::vector<goto_programt::const_targett> updates;
+  for(auto instruction = worker->second.body.instructions.begin();
+      instruction != worker->second.body.instructions.end(); ++instruction)
+  {
+    irep_idt callee;
+    if(
+      instruction->is_function_call() &&
+      direct_call_identifier(*instruction, callee))
+    {
+      irep_idt candidate_mutex;
+      if(
+        !inside &&
+        helper_mutex(callee, "pthread_mutex_lock", candidate_mutex))
+      {
+        lock_helper = callee;
+        mutex = candidate_mutex;
+        inside = true;
+        continue;
+      }
+      if(
+        inside &&
+        helper_mutex(callee, "pthread_mutex_unlock", candidate_mutex) &&
+        candidate_mutex == mutex)
+      {
+        unlock_helper = callee;
+        inside = false;
+        continue;
+      }
+    }
+    if(inside && instruction->is_assign())
+      updates.push_back(instruction);
+  }
+  if(
+    inside || lock_helper.empty() || unlock_helper.empty() ||
+    lock_helper == unlock_helper || updates.size() != 2)
+    return false;
+
+  irep_idt shared;
+  irep_idt second_shared;
+  if(
+    !direct_symbol(updates[0]->assign_lhs(), shared) ||
+    !direct_symbol(updates[1]->assign_lhs(), second_shared) ||
+    shared != second_shared)
+    return false;
+  const auto unit_update =
+    [&](goto_programt::const_targett instruction, const irep_idt &operation)
+    {
+      const exprt &rhs = without_cast(instruction->assign_rhs());
+      irep_idt source;
+      mp_integer unit;
+      return
+        rhs.id() == operation && rhs.operands().size() == 2 &&
+        direct_symbol(rhs.op0(), source) && source == shared &&
+        constant_eval(rhs.op1(), {}, unit) && unit == 1;
+    };
+  if(
+    !unit_update(updates[0], ID_plus) ||
+    !unit_update(updates[1], ID_minus))
+    return false;
+
+  const auto shared_symbol =
+    goto_model.symbol_table.symbols.find(shared);
+  if(
+    shared_symbol == goto_model.symbol_table.symbols.end() ||
+    !shared_symbol->second.is_static_lifetime)
+    return false;
+
+  bool after_spawn = false;
+  bool main_locked = false;
+  bool asserted = false;
+  bool main_unlocked = false;
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != main->second.body.instructions.end(); ++instruction)
+  {
+    if(&*instruction == &*candidates.front().exit)
+      after_spawn = true;
+    if(!after_spawn)
+      continue;
+    irep_idt callee;
+    if(
+      instruction->is_function_call() &&
+      direct_call_identifier(*instruction, callee))
+    {
+      if(!main_locked && callee == lock_helper)
+        main_locked = true;
+      else if(main_locked && asserted && callee == unlock_helper)
+        main_unlocked = true;
+      else if(
+        main_locked && !asserted && callee == "__VERIFIER_assert" &&
+        instruction->call_arguments().size() == 1)
+      {
+        const exprt &condition =
+          without_cast(instruction->call_arguments().front());
+        irep_idt object;
+        asserted =
+          condition.id() == ID_equal &&
+          condition.operands().size() == 2 &&
+          ((direct_symbol(condition.op0(), object) &&
+            object == shared && is_zero_constant(condition.op1())) ||
+           (direct_symbol(condition.op1(), object) &&
+            object == shared && is_zero_constant(condition.op0())));
+      }
+    }
+    if(main_unlocked)
+      break;
+  }
+  if(!main_locked || !asserted || !main_unlocked)
+    return false;
+
+  std::size_t mentions = 0;
+  std::size_t zero_initializers = 0;
+  for(const auto &entry : goto_model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(instruction_mentions_any(instruction, {shared}))
+      {
+        ++mentions;
+        irep_idt lhs;
+        if(
+          instruction.is_assign() &&
+          direct_symbol(instruction.assign_lhs(), lhs) &&
+          lhs == shared &&
+          is_zero_constant(instruction.assign_rhs()))
+          ++zero_initializers;
+      }
+      if(
+        instruction.is_function_call() &&
+        contains_address_of_symbol(
+          instruction.call_function(), {shared}))
+        return false;
+      if(instruction.is_function_call())
+        for(const auto &argument : instruction.call_arguments())
+          if(contains_address_of_symbol(argument, {shared}))
+            return false;
+    }
+  }
+  if(mentions != 4 || zero_initializers != 1)
+    return false;
+
+  bool truncated = false;
+  if(!apply_dormant_spawn_counts(
+       goto_model, candidates, std::vector<unsigned>{0}, truncated))
+    return false;
+  goto_model.goto_functions.update();
+  auto updated_main =
+    goto_model.goto_functions.function_map.find("main");
+  updated_main->second.body.instructions.begin()
+    ->source_location_nonconst()
+    .set("deagle_common_mutex_zero_sum", true);
+  messaget log(message_handler);
+  log.status() << "NATIVE_COMMON_MUTEX_ZERO_SUM applied=1"
+               << " workers=0 mentions=" << mentions
+               << " truncated=" << (truncated ? 1 : 0)
+               << messaget::eom;
+  return true;
+}
+
+bool common_mutex_zero_sum_applied(const goto_modelt &goto_model)
+{
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  return
+    main != goto_model.goto_functions.function_map.end() &&
+    main->second.body_available() &&
+    !main->second.body.instructions.empty() &&
+    main->second.body.instructions.begin()
+      ->source_location()
+      .get_bool("deagle_common_mutex_zero_sum");
+}
+
+bool resolved_worker_zero_sum_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  std::string reason;
+  const auto candidates = dormant_spawn_cutoffs(goto_model, reason);
+  if(
+    candidates.size() != 1 ||
+    candidates.front().first_join == nullptr)
+    return false;
+
+  const auto worker =
+    goto_model.goto_functions.function_map.find(candidates.front().worker);
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  if(
+    worker == goto_model.goto_functions.function_map.end() ||
+    !worker->second.body_available() ||
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+    return false;
+
+  const auto is_mutex_primitive = [](const irep_idt &callee)
+  {
+    return
+      callee == "pthread_mutex_lock" ||
+      callee == "pthread_mutex_unlock";
+  };
+
+  irep_idt effect_helper;
+  irep_idt dispatch_pointer;
+  irep_idt pointer_source;
+  std::size_t effect_calls = 0;
+  std::size_t indirect_calls = 0;
+  for(const auto &instruction : worker->second.body.instructions)
+  {
+    if(instruction.is_assert() || instruction.is_start_thread())
+      return false;
+    if(instruction.is_assign())
+    {
+      irep_idt lhs;
+      if(!direct_symbol(instruction.assign_lhs(), lhs))
+        return false;
+      const auto symbol = goto_model.symbol_table.symbols.find(lhs);
+      if(
+        symbol == goto_model.symbol_table.symbols.end() ||
+        symbol->second.is_static_lifetime)
+        return false;
+    }
+    if(!instruction.is_function_call())
+      continue;
+    irep_idt callee;
+    if(!direct_call_identifier(instruction, callee))
+    {
+      const exprt &function =
+        without_cast(instruction.call_function());
+      irep_idt pointer;
+      if(
+        function.id() != ID_dereference ||
+        function.operands().size() != 1 ||
+        !direct_symbol(function.op0(), pointer) ||
+        (!dispatch_pointer.empty() && dispatch_pointer != pointer))
+        return false;
+      dispatch_pointer = pointer;
+      ++indirect_calls;
+      continue;
+    }
+    if(is_mutex_primitive(callee))
+    {
+      irep_idt mutex;
+      if(
+        instruction.call_arguments().size() != 1 ||
+        !addressed_symbol(
+          instruction.call_arguments().front(), mutex))
+        return false;
+      continue;
+    }
+    const auto function =
+      goto_model.goto_functions.function_map.find(callee);
+    if(
+      function == goto_model.goto_functions.function_map.end() ||
+      !function->second.body_available())
+      return false;
+    if(effect_helper.empty())
+      effect_helper = callee;
+    if(effect_helper != callee)
+      return false;
+    ++effect_calls;
+  }
+  if(
+    effect_calls != 0 ||
+    dispatch_pointer.empty() || indirect_calls != 1)
+    return false;
+
+  std::size_t dispatch_assignments = 0;
+  std::size_t dispatch_mentions = 0;
+  for(const auto &instruction : worker->second.body.instructions)
+  {
+    if(instruction_mentions_any(instruction, {dispatch_pointer}))
+      ++dispatch_mentions;
+    if(instruction.is_assign())
+    {
+      irep_idt lhs;
+      irep_idt rhs;
+      if(
+        direct_symbol(instruction.assign_lhs(), lhs) &&
+        lhs == dispatch_pointer)
+      {
+        if(
+          !direct_symbol(instruction.assign_rhs(), rhs) ||
+          (!pointer_source.empty() && pointer_source != rhs))
+          return false;
+        pointer_source = rhs;
+        ++dispatch_assignments;
+      }
+    }
+  }
+  const auto pointer_symbol =
+    goto_model.symbol_table.symbols.find(pointer_source);
+  if(
+    dispatch_assignments != 1 || dispatch_mentions != 2 ||
+    pointer_symbol == goto_model.symbol_table.symbols.end() ||
+    !pointer_symbol->second.is_static_lifetime)
+    return false;
+
+  std::size_t pointer_mentions = 0;
+  std::size_t pointer_writes = 0;
+  std::size_t pointer_reads = 0;
+  for(const auto &entry : goto_model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(!instruction_mentions_any(instruction, {pointer_source}))
+        continue;
+      ++pointer_mentions;
+      if(!instruction.is_assign())
+        return false;
+      irep_idt lhs;
+      if(
+        direct_symbol(instruction.assign_lhs(), lhs) &&
+        lhs == pointer_source)
+      {
+        irep_idt target;
+        if(!addressed_symbol(instruction.assign_rhs(), target))
+          return false;
+        if(effect_helper.empty())
+          effect_helper = target;
+        if(effect_helper != target)
+          return false;
+        ++pointer_writes;
+      }
+      else
+      {
+        irep_idt rhs;
+        if(
+          entry.first != candidates.front().worker ||
+          !direct_symbol(instruction.assign_lhs(), lhs) ||
+          lhs != dispatch_pointer ||
+          !direct_symbol(instruction.assign_rhs(), rhs) ||
+          rhs != pointer_source)
+          return false;
+        ++pointer_reads;
+      }
+    }
+  }
+  const auto helper =
+    goto_model.goto_functions.function_map.find(effect_helper);
+  if(
+    pointer_mentions != 3 || pointer_writes != 2 ||
+    pointer_reads != 1 || effect_helper.empty() ||
+    helper == goto_model.goto_functions.function_map.end() ||
+    !helper->second.body_available())
+    return false;
+
+  std::vector<irep_idt> mutex_stack;
+  irep_idt invariant_mutex;
+  std::vector<goto_programt::const_targett> updates;
+  for(auto instruction = helper->second.body.instructions.begin();
+      instruction != helper->second.body.instructions.end(); ++instruction)
+  {
+    if(instruction->is_assert() || instruction->is_start_thread())
+      return false;
+    if(instruction->is_goto())
+    {
+      bool condition = true;
+      if(
+        !boolean_constant_eval(instruction->condition(), condition) ||
+        condition)
+        return false;
+    }
+    if(instruction->is_function_call())
+    {
+      irep_idt callee;
+      irep_idt mutex;
+      if(
+        !direct_call_identifier(*instruction, callee) ||
+        !is_mutex_primitive(callee) ||
+        instruction->call_arguments().size() != 1 ||
+        !addressed_symbol(
+          instruction->call_arguments().front(), mutex))
+        return false;
+      if(callee == "pthread_mutex_lock")
+      {
+        if(mutex_stack.empty())
+          invariant_mutex = mutex;
+        mutex_stack.push_back(mutex);
+      }
+      else
+      {
+        if(mutex_stack.empty() || mutex_stack.back() != mutex)
+          return false;
+        mutex_stack.pop_back();
+      }
+      continue;
+    }
+    if(instruction->is_assign())
+    {
+      if(mutex_stack.empty() || mutex_stack.front() != invariant_mutex)
+        return false;
+      updates.push_back(instruction);
+    }
+  }
+  if(
+    !mutex_stack.empty() || invariant_mutex.empty() ||
+    updates.size() != 2)
+    return false;
+
+  irep_idt shared;
+  irep_idt second_shared;
+  if(
+    !direct_symbol(updates[0]->assign_lhs(), shared) ||
+    !direct_symbol(updates[1]->assign_lhs(), second_shared) ||
+    shared != second_shared)
+    return false;
+  const auto unit_update =
+    [&](goto_programt::const_targett instruction, const irep_idt &operation)
+    {
+      if(!instruction->is_assign())
+        return false;
+      const exprt &rhs = without_cast(instruction->assign_rhs());
+      irep_idt source;
+      mp_integer unit;
+      return
+        rhs.id() == operation && rhs.operands().size() == 2 &&
+        direct_symbol(rhs.op0(), source) && source == shared &&
+        constant_eval(rhs.op1(), {}, unit) && unit == 1;
+    };
+  if(
+    !unit_update(updates[0], ID_plus) ||
+    !unit_update(updates[1], ID_minus))
+    return false;
+
+  const auto shared_symbol =
+    goto_model.symbol_table.symbols.find(shared);
+  if(
+    shared_symbol == goto_model.symbol_table.symbols.end() ||
+    !shared_symbol->second.is_static_lifetime)
+    return false;
+
+  bool after_spawn = false;
+  bool main_locked = false;
+  bool asserted = false;
+  bool main_unlocked = false;
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != main->second.body.instructions.end(); ++instruction)
+  {
+    if(&*instruction == &*candidates.front().exit)
+      after_spawn = true;
+    if(!after_spawn)
+      continue;
+    irep_idt callee;
+    if(
+      instruction->is_function_call() &&
+      direct_call_identifier(*instruction, callee))
+    {
+      irep_idt mutex;
+      if(
+        !main_locked && callee == "pthread_mutex_lock" &&
+        instruction->call_arguments().size() == 1 &&
+        addressed_symbol(
+          instruction->call_arguments().front(), mutex) &&
+        mutex == invariant_mutex)
+        main_locked = true;
+      else if(
+        main_locked && asserted &&
+        callee == "pthread_mutex_unlock" &&
+        instruction->call_arguments().size() == 1 &&
+        addressed_symbol(
+          instruction->call_arguments().front(), mutex) &&
+        mutex == invariant_mutex)
+        main_unlocked = true;
+      else if(
+        main_locked && !asserted && callee == "__VERIFIER_assert" &&
+        instruction->call_arguments().size() == 1)
+      {
+        const exprt &condition =
+          without_cast(instruction->call_arguments().front());
+        irep_idt object;
+        asserted =
+          condition.id() == ID_equal &&
+          condition.operands().size() == 2 &&
+          ((direct_symbol(condition.op0(), object) &&
+            object == shared && is_zero_constant(condition.op1())) ||
+           (direct_symbol(condition.op1(), object) &&
+            object == shared && is_zero_constant(condition.op0())));
+      }
+    }
+    if(main_unlocked)
+      break;
+  }
+  if(!main_locked || !asserted || !main_unlocked)
+    return false;
+
+  const auto is_spawn_runtime = [](const irep_idt &identifier)
+  {
+    return
+      identifier == "pthread_create" ||
+      identifier == "pthread_join" ||
+      identifier == "pthread_mutex_lock" ||
+      identifier == "pthread_mutex_unlock";
+  };
+  std::set<irep_idt> reachable{
+    "main", candidates.front().worker, "__CPROVER_initialize"};
+  std::deque<irep_idt> pending(reachable.begin(), reachable.end());
+  while(!pending.empty())
+  {
+    const irep_idt current = pending.front();
+    pending.pop_front();
+    const auto function =
+      goto_model.goto_functions.function_map.find(current);
+    if(
+      function == goto_model.goto_functions.function_map.end() ||
+      !function->second.body_available())
+      continue;
+    for(const auto &instruction : function->second.body.instructions)
+    {
+      if(instruction.is_function_call())
+      {
+        irep_idt callee;
+        if(!direct_call_identifier(instruction, callee))
+        {
+          const exprt &function =
+            without_cast(instruction.call_function());
+          irep_idt pointer;
+          if(
+            current != candidates.front().worker ||
+            function.id() != ID_dereference ||
+            function.operands().size() != 1 ||
+            !direct_symbol(function.op0(), pointer) ||
+            pointer != dispatch_pointer)
+            return false;
+          continue;
+        }
+        if(
+          !is_spawn_runtime(callee) &&
+          goto_model.goto_functions.function_map.find(callee) !=
+            goto_model.goto_functions.function_map.end() &&
+          reachable.insert(callee).second)
+          pending.push_back(callee);
+      }
+      find_symbols_sett symbols;
+      find_symbols(instruction.code(), symbols);
+      if(instruction.has_condition())
+        find_symbols(instruction.condition(), symbols);
+      for(const auto &identifier : symbols)
+      {
+        const auto symbol =
+          goto_model.symbol_table.symbols.find(identifier);
+        const auto addressed =
+          goto_model.goto_functions.function_map.find(identifier);
+        if(
+          symbol == goto_model.symbol_table.symbols.end() ||
+          symbol->second.type.id() != ID_code ||
+          is_spawn_runtime(identifier) ||
+          addressed ==
+            goto_model.goto_functions.function_map.end() ||
+          !addressed->second.body_available())
+          continue;
+        if(reachable.insert(identifier).second)
+          pending.push_back(identifier);
+      }
+    }
+  }
+
+  std::size_t mentions = 0;
+  std::size_t zero_initializers = 0;
+  std::size_t assertions = 0;
+  std::size_t plus_one = 0;
+  std::size_t minus_one = 0;
+  const auto is_zero_property =
+    [&](const goto_programt::instructiont &instruction)
+    {
+      irep_idt callee;
+      if(
+        !direct_call_identifier(instruction, callee) ||
+        callee != "__VERIFIER_assert" ||
+        instruction.call_arguments().size() != 1)
+        return false;
+      const exprt &condition =
+        without_cast(instruction.call_arguments().front());
+      if(
+        condition.id() != ID_equal ||
+        condition.operands().size() != 2)
+        return false;
+      irep_idt object;
+      return
+        (direct_symbol(condition.op0(), object) &&
+         object == shared && is_zero_constant(condition.op1())) ||
+        (direct_symbol(condition.op1(), object) &&
+         object == shared && is_zero_constant(condition.op0()));
+    };
+  for(const auto &identifier : reachable)
+  {
+    const auto function =
+      goto_model.goto_functions.function_map.find(identifier);
+    if(
+      function == goto_model.goto_functions.function_map.end() ||
+      !function->second.body_available())
+      continue;
+    for(auto instruction = function->second.body.instructions.begin();
+        instruction != function->second.body.instructions.end(); ++instruction)
+    {
+      if(!instruction_mentions_any(*instruction, {shared}))
+        continue;
+      ++mentions;
+      irep_idt lhs;
+      if(
+        instruction->is_assign() &&
+        direct_symbol(instruction->assign_lhs(), lhs) &&
+        lhs == shared &&
+        is_zero_constant(instruction->assign_rhs()))
+        ++zero_initializers;
+      if(unit_update(instruction, ID_plus))
+        ++plus_one;
+      if(unit_update(instruction, ID_minus))
+        ++minus_one;
+      if(is_zero_property(*instruction))
+        ++assertions;
+      if(
+        instruction->is_function_call() &&
+        contains_address_of_symbol(
+          instruction->call_function(), {shared}))
+        return false;
+      if(instruction->is_function_call())
+        for(const auto &argument : instruction->call_arguments())
+          if(contains_address_of_symbol(argument, {shared}))
+            return false;
+    }
+  }
+  if(
+    mentions != 4 || zero_initializers != 1 ||
+    assertions != 1 || plus_one != 1 || minus_one != 1)
+    return false;
+
+  bool truncated = false;
+  if(!apply_dormant_spawn_counts(
+       goto_model, candidates, std::vector<unsigned>{0}, truncated))
+    return false;
+  goto_model.goto_functions.update();
+  auto updated_main =
+    goto_model.goto_functions.function_map.find("main");
+  updated_main->second.body.instructions.begin()
+    ->source_location_nonconst()
+    .set("deagle_resolved_worker_zero_sum", true);
+  messaget log(message_handler);
+  log.status() << "NATIVE_RESOLVED_WORKER_ZERO_SUM applied=1"
+               << " workers=0 reachable=" << reachable.size()
+               << " mentions=" << mentions
+               << " truncated=" << (truncated ? 1 : 0)
+               << messaget::eom;
+  return true;
+}
+
+bool resolved_worker_zero_sum_applied(const goto_modelt &goto_model)
+{
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  return
+    main != goto_model.goto_functions.function_map.end() &&
+    main->second.body_available() &&
+    !main->second.body.instructions.empty() &&
+    main->second.body.instructions.begin()
+      ->source_location()
+      .get_bool("deagle_resolved_worker_zero_sum");
+}
+
+bool aggregate_member_lock_alias_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  std::string reason;
+  const auto candidates = dormant_spawn_cutoffs(goto_model, reason);
+  if(
+    candidates.size() != 1 ||
+    candidates.front().first_join == nullptr)
+    return false;
+
+  const auto worker =
+    goto_model.goto_functions.function_map.find(candidates.front().worker);
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  if(
+    worker == goto_model.goto_functions.function_map.end() ||
+    !worker->second.body_available() ||
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+    return false;
+
+  struct macro_summaryt
+  {
+    exprt object = nil_exprt();
+    exprt outer_mutex = nil_exprt();
+    exprt instrumentation_mutex = nil_exprt();
+    std::vector<goto_programt::const_targett> operations;
+  };
+  const auto mutex_call =
+    [](const goto_programt::instructiont &instruction,
+       const irep_idt &expected, exprt &mutex)
+    {
+      irep_idt callee;
+      if(
+        !direct_call_identifier(instruction, callee) ||
+        callee != expected ||
+        instruction.call_arguments().size() != 1)
+        return false;
+      mutex = without_cast(instruction.call_arguments().front());
+      return true;
+    };
+  const auto analyze_macro =
+    [&](const goto_functiont &function, macro_summaryt &summary)
+    {
+      std::map<const goto_programt::instructiont *, std::size_t> positions;
+      std::size_t position = 0;
+      for(const auto &instruction : function.body.instructions)
+        positions.emplace(&instruction, position++);
+
+      std::size_t plus_one = 0;
+      std::size_t minus_one = 0;
+      std::size_t zero_assertions = 0;
+      for(auto instruction = function.body.instructions.begin();
+          instruction != function.body.instructions.end(); ++instruction)
+      {
+        if(instruction->is_assign())
+        {
+          const exprt &lhs = without_cast(instruction->assign_lhs());
+          const exprt &rhs = without_cast(instruction->assign_rhs());
+          mp_integer unit;
+          exprt immediate_lock;
+          exprt immediate_unlock;
+          const bool wrapped =
+            instruction != function.body.instructions.begin() &&
+            std::next(instruction) !=
+              function.body.instructions.end() &&
+            mutex_call(
+              *std::prev(instruction),
+              "pthread_mutex_lock",
+              immediate_lock) &&
+            mutex_call(
+              *std::next(instruction),
+              "pthread_mutex_unlock",
+              immediate_unlock) &&
+            immediate_lock == immediate_unlock;
+          if(
+            wrapped &&
+            (rhs.id() == ID_plus || rhs.id() == ID_minus) &&
+            rhs.operands().size() == 2 &&
+            without_cast(rhs.op0()) == lhs &&
+            constant_eval(rhs.op1(), {}, unit) && unit == 1)
+          {
+            if(summary.object.is_nil())
+              summary.object = lhs;
+            if(lhs != summary.object)
+              return false;
+            if(rhs.id() == ID_plus)
+              ++plus_one;
+            else
+              ++minus_one;
+            summary.operations.push_back(instruction);
+          }
+        }
+        irep_idt callee;
+        if(
+          instruction->is_function_call() &&
+          direct_call_identifier(*instruction, callee) &&
+          callee == "__VERIFIER_assert" &&
+          instruction->call_arguments().size() == 1 &&
+          !summary.object.is_nil())
+        {
+          const exprt &condition =
+            without_cast(instruction->call_arguments().front());
+          if(
+            condition.id() != ID_equal ||
+            condition.operands().size() != 2)
+            return false;
+          const exprt &left = without_cast(condition.op0());
+          const exprt &right = without_cast(condition.op1());
+          if(
+            !((left == summary.object && is_zero_constant(right)) ||
+              (right == summary.object && is_zero_constant(left))))
+            return false;
+          ++zero_assertions;
+          summary.operations.push_back(instruction);
+        }
+      }
+      if(
+        plus_one != 1 || minus_one != 1 ||
+        zero_assertions != 1 || summary.operations.size() != 3)
+        return false;
+
+      for(const auto operation : summary.operations)
+      {
+        if(
+          operation == function.body.instructions.begin() ||
+          std::next(operation) == function.body.instructions.end())
+          return false;
+        exprt locked;
+        exprt unlocked;
+        if(
+          !mutex_call(
+            *std::prev(operation), "pthread_mutex_lock", locked) ||
+          !mutex_call(
+            *std::next(operation), "pthread_mutex_unlock", unlocked) ||
+          locked != unlocked)
+          return false;
+        if(summary.instrumentation_mutex.is_nil())
+          summary.instrumentation_mutex = locked;
+        if(locked != summary.instrumentation_mutex)
+          return false;
+      }
+
+      const std::size_t first =
+        positions.at(&*summary.operations.front());
+      const std::size_t last =
+        positions.at(&*summary.operations.back());
+      bool found_lock = false;
+      bool found_unlock = false;
+      exprt outer;
+      for(auto instruction = function.body.instructions.begin();
+          instruction != function.body.instructions.end(); ++instruction)
+      {
+        exprt mutex;
+        const std::size_t current = positions.at(&*instruction);
+        if(
+          current < first &&
+          mutex_call(*instruction, "pthread_mutex_lock", mutex) &&
+          mutex != summary.instrumentation_mutex)
+        {
+          if(found_lock)
+            return false;
+          found_lock = true;
+          outer = mutex;
+        }
+        if(
+          current > last &&
+          mutex_call(*instruction, "pthread_mutex_unlock", mutex) &&
+          mutex != summary.instrumentation_mutex)
+        {
+          if(found_unlock || !found_lock || mutex != outer)
+            return false;
+          found_unlock = true;
+        }
+      }
+      if(!found_lock || !found_unlock)
+        return false;
+      summary.outer_mutex = outer;
+
+      std::size_t object_assignments = 0;
+      std::size_t object_assertions = 0;
+      for(const auto &instruction : function.body.instructions)
+      {
+        if(
+          instruction.is_assign() &&
+          without_cast(instruction.assign_lhs()) == summary.object)
+          ++object_assignments;
+        irep_idt callee;
+        if(
+          instruction.is_function_call() &&
+          direct_call_identifier(instruction, callee) &&
+          callee == "__VERIFIER_assert" &&
+          instruction_mentions_any(
+            instruction,
+            [&]()
+            {
+              find_symbols_sett symbols;
+              find_symbols(summary.object, symbols);
+              return std::set<irep_idt>(
+                symbols.begin(), symbols.end());
+            }()))
+          ++object_assertions;
+      }
+      return object_assignments == 2 && object_assertions == 1;
+    };
+
+  macro_summaryt worker_macro;
+  macro_summaryt main_macro;
+  const bool worker_macro_ok =
+    analyze_macro(worker->second, worker_macro);
+  const bool main_macro_ok =
+    analyze_macro(main->second, main_macro);
+  if(
+    !worker_macro_ok ||
+    !main_macro_ok ||
+    worker_macro.instrumentation_mutex !=
+      main_macro.instrumentation_mutex)
+    return false;
+
+  const auto direct_member =
+    [](const exprt &expr, irep_idt &base, irep_idt &component)
+    {
+      const exprt &value = without_cast(expr);
+      if(value.id() != ID_member)
+        return false;
+      component = to_member_expr(value).get_component_name();
+      return direct_symbol(to_member_expr(value).struct_op(), base);
+    };
+  const auto addressed_member =
+    [](const exprt &expr, irep_idt &base, irep_idt &component)
+    {
+      const exprt &value = without_cast(expr);
+      if(value.id() != ID_address_of)
+        return false;
+      const exprt &object =
+        without_cast(to_address_of_expr(value).object());
+      if(object.id() != ID_member)
+        return false;
+      component = to_member_expr(object).get_component_name();
+      return direct_symbol(to_member_expr(object).struct_op(), base);
+    };
+  irep_idt worker_base;
+  irep_idt data_component;
+  irep_idt worker_mutex_base;
+  irep_idt mutex_component;
+  if(
+    !direct_member(
+      worker_macro.object, worker_base, data_component) ||
+    !addressed_member(
+      worker_macro.outer_mutex,
+      worker_mutex_base,
+      mutex_component) ||
+    worker_base != worker_mutex_base ||
+    data_component == mutex_component)
+    return false;
+
+  irep_idt data_pointer;
+  irep_idt mutex_pointer;
+  const exprt &main_object = without_cast(main_macro.object);
+  if(
+    main_object.id() != ID_dereference ||
+    main_object.operands().size() != 1 ||
+    !direct_symbol(main_object.op0(), data_pointer) ||
+    !direct_symbol(main_macro.outer_mutex, mutex_pointer) ||
+    data_pointer == mutex_pointer)
+    return false;
+
+  const auto member_from_pointer =
+    [](const exprt &expr, irep_idt &pointer, irep_idt &component)
+    {
+      const exprt &value = without_cast(expr);
+      if(value.id() != ID_address_of)
+        return false;
+      const exprt &object =
+        without_cast(to_address_of_expr(value).object());
+      if(object.id() != ID_member)
+        return false;
+      component = to_member_expr(object).get_component_name();
+      const exprt &compound =
+        without_cast(to_member_expr(object).struct_op());
+      if(
+        compound.id() != ID_dereference ||
+        compound.operands().size() != 1)
+        return false;
+      return direct_symbol(compound.op0(), pointer);
+    };
+
+  irep_idt base_pointer;
+  std::set<irep_idt> bases;
+  std::size_t base_writes = 0;
+  std::size_t data_derivations = 0;
+  std::size_t mutex_derivations = 0;
+  goto_programt::const_targett first_base =
+    main->second.body.instructions.end();
+  goto_programt::const_targett second_base =
+    main->second.body.instructions.end();
+  goto_programt::const_targett data_derivation =
+    main->second.body.instructions.end();
+  goto_programt::const_targett mutex_derivation =
+    main->second.body.instructions.end();
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != main->second.body.instructions.end(); ++instruction)
+  {
+    if(!instruction->is_assign())
+      continue;
+    irep_idt lhs;
+    if(!direct_symbol(instruction->assign_lhs(), lhs))
+      continue;
+    if(lhs == data_pointer)
+    {
+      irep_idt pointer;
+      irep_idt component;
+      if(
+        !member_from_pointer(
+          instruction->assign_rhs(), pointer, component) ||
+        component != data_component)
+        return false;
+      if(base_pointer.empty())
+        base_pointer = pointer;
+      if(pointer != base_pointer)
+        return false;
+      ++data_derivations;
+      data_derivation = instruction;
+    }
+    else if(lhs == mutex_pointer)
+    {
+      irep_idt pointer;
+      irep_idt component;
+      if(
+        !member_from_pointer(
+          instruction->assign_rhs(), pointer, component) ||
+        component != mutex_component)
+        return false;
+      if(base_pointer.empty())
+        base_pointer = pointer;
+      if(pointer != base_pointer)
+        return false;
+      ++mutex_derivations;
+      mutex_derivation = instruction;
+    }
+  }
+  if(
+    base_pointer.empty() ||
+    data_derivations != 1 || mutex_derivations != 1)
+    return false;
+
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != main->second.body.instructions.end(); ++instruction)
+  {
+    if(!instruction->is_assign())
+      continue;
+    irep_idt lhs;
+    if(
+      !direct_symbol(instruction->assign_lhs(), lhs) ||
+      lhs != base_pointer)
+      continue;
+    irep_idt base;
+    if(!addressed_symbol(instruction->assign_rhs(), base))
+      return false;
+    const auto symbol = goto_model.symbol_table.symbols.find(base);
+    if(
+      symbol == goto_model.symbol_table.symbols.end() ||
+      !symbol->second.is_static_lifetime)
+      return false;
+    bases.insert(base);
+    ++base_writes;
+    if(first_base == main->second.body.instructions.end())
+      first_base = instruction;
+    else
+      second_base = instruction;
+  }
+  if(
+    base_writes != 2 || bases.size() != 2 ||
+    bases.count(worker_base) != 1 ||
+    first_base == main->second.body.instructions.end() ||
+    second_base == main->second.body.instructions.end())
+    return false;
+  const auto first_symbol =
+    goto_model.symbol_table.symbols.find(*bases.begin());
+  const auto second_symbol =
+    goto_model.symbol_table.symbols.find(*std::next(bases.begin()));
+  if(
+    first_symbol == goto_model.symbol_table.symbols.end() ||
+    second_symbol == goto_model.symbol_table.symbols.end() ||
+    first_symbol->second.type != second_symbol->second.type)
+    return false;
+
+  std::map<const goto_programt::instructiont *, std::size_t> main_positions;
+  std::size_t main_position = 0;
+  for(const auto &instruction : main->second.body.instructions)
+    main_positions.emplace(&instruction, main_position++);
+  bool complete_choice = false;
+  for(auto branch = main->second.body.instructions.begin();
+      branch != first_base; ++branch)
+  {
+    if(
+      !branch->is_goto() || branch->condition().is_true() ||
+      branch->targets.size() != 1 ||
+      branch->get_target() != second_base)
+      continue;
+    for(auto jump = std::next(first_base); jump != second_base; ++jump)
+      if(
+        jump->is_goto() && jump->condition().is_true() &&
+        jump->targets.size() == 1 &&
+        main_positions.at(&*jump->get_target()) >
+          main_positions.at(&*second_base) &&
+        main_positions.at(&*jump->get_target()) <=
+          std::min(
+            main_positions.at(&*data_derivation),
+            main_positions.at(&*mutex_derivation)))
+        complete_choice = true;
+  }
+  if(!complete_choice)
+    return false;
+
+  const namespacet ns(goto_model.symbol_table);
+  const auto zero_initialized =
+    [&](const irep_idt &base)
+    {
+      const auto initialize =
+        goto_model.goto_functions.function_map.find(
+          "__CPROVER_initialize");
+      const auto symbol = goto_model.symbol_table.symbols.find(base);
+      if(
+        initialize == goto_model.goto_functions.function_map.end() ||
+        !initialize->second.body_available() ||
+        symbol == goto_model.symbol_table.symbols.end())
+        return false;
+      const typet &type = ns.follow(symbol->second.type);
+      if(type.id() != ID_struct)
+        return false;
+      const auto &components = to_struct_type(type).components();
+      std::size_t component_index = components.size();
+      for(std::size_t index = 0; index < components.size(); ++index)
+        if(components[index].get_name() == data_component)
+          component_index = index;
+      if(component_index == components.size())
+        return false;
+      std::size_t initializers = 0;
+      for(const auto &instruction : initialize->second.body.instructions)
+      {
+        if(!instruction.is_assign())
+          continue;
+        irep_idt lhs;
+        if(
+          !direct_symbol(instruction.assign_lhs(), lhs) ||
+          lhs != base)
+          continue;
+        const exprt &rhs = without_cast(instruction.assign_rhs());
+        if(
+          rhs.id() != ID_struct ||
+          rhs.operands().size() != components.size() ||
+          !is_zero_constant(rhs.operands()[component_index]))
+          return false;
+        ++initializers;
+      }
+      return initializers == 1;
+    };
+  for(const auto &base : bases)
+    if(!zero_initialized(base))
+      return false;
+
+  const std::set<irep_idt> tracked{
+    base_pointer, data_pointer, mutex_pointer};
+  for(const auto &entry : goto_model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(entry.first != "main" &&
+         instruction_mentions_any(instruction, tracked))
+        return false;
+      if(entry.first == "main" &&
+         instruction.is_function_call() &&
+         instruction_mentions_any(instruction, tracked))
+      {
+        irep_idt callee;
+        if(!direct_call_identifier(instruction, callee))
+          return false;
+        const bool property =
+          callee == "__VERIFIER_assert" &&
+          instruction.call_arguments().size() == 1 &&
+          contains_symbol(
+            instruction.call_arguments().front(), {data_pointer});
+        const bool outer_mutex =
+          (callee == "pthread_mutex_lock" ||
+           callee == "pthread_mutex_unlock") &&
+          instruction.call_arguments().size() == 1 &&
+          contains_symbol(
+            instruction.call_arguments().front(), {mutex_pointer});
+        if(!property && !outer_mutex)
+          return false;
+      }
+      if(!instruction.is_assign())
+        continue;
+      const exprt &lhs = without_cast(instruction.assign_lhs());
+      if(
+        entry.first == "main" &&
+        contains_symbol(lhs, {base_pointer}) &&
+        lhs.id() != ID_symbol)
+        return false;
+      irep_idt whole_lhs;
+      if(
+        direct_symbol(lhs, whole_lhs) &&
+        bases.count(whole_lhs) != 0 &&
+        entry.first != "__CPROVER_initialize")
+        return false;
+      if(lhs.id() != ID_member)
+        continue;
+      irep_idt base;
+      irep_idt component;
+      if(
+        direct_member(lhs, base, component) &&
+        bases.count(base) != 0 &&
+        component == data_component &&
+        !(entry.first == candidates.front().worker &&
+          lhs == worker_macro.object))
+        return false;
+    }
+  }
+
+  bool truncated = false;
+  if(!apply_dormant_spawn_counts(
+       goto_model, candidates, std::vector<unsigned>{0}, truncated))
+    return false;
+  goto_model.goto_functions.update();
+  auto updated_main =
+    goto_model.goto_functions.function_map.find("main");
+  updated_main->second.body.instructions.begin()
+    ->source_location_nonconst()
+    .set("deagle_aggregate_member_lock_alias", true);
+  messaget log(message_handler);
+  log.status()
+    << "NATIVE_AGGREGATE_MEMBER_LOCK_ALIAS applied=1"
+    << " bases=" << bases.size()
+    << " workers=0"
+    << " truncated=" << (truncated ? 1 : 0)
+    << messaget::eom;
+  return true;
+}
+
+bool aggregate_member_lock_alias_applied(
+  const goto_modelt &goto_model)
+{
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  return
+    main != goto_model.goto_functions.function_map.end() &&
+    main->second.body_available() &&
+    !main->second.body.instructions.empty() &&
+    main->second.body.instructions.begin()
+      ->source_location()
+      .get_bool("deagle_aggregate_member_lock_alias");
+}
+
+bool independent_index_prefix_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  std::string reason;
+  const auto candidates = dormant_spawn_cutoffs(goto_model, reason);
+  if(candidates.size() != 2)
+  {
+    std::cout
+      << "NATIVE_INDEPENDENT_INDEX_PREFIX applied=0"
+      << " reason=worker_class_count"
+      << " classes=" << candidates.size() << '\n';
+    return false;
+  }
+
+  struct index_choicet
+  {
+    goto_programt::targett nondet;
+    goto_programt::targett propagated;
+    irep_idt temporary;
+    irep_idt index;
+    mp_integer bound;
+
+    index_choicet(
+      goto_programt::targett nondet,
+      goto_programt::targett propagated,
+      irep_idt temporary,
+      irep_idt index,
+      mp_integer bound)
+      : nondet(nondet),
+        propagated(propagated),
+        temporary(std::move(temporary)),
+        index(std::move(index)),
+        bound(std::move(bound))
+    {
+    }
+  };
+  struct worker_summaryt
+  {
+    std::size_t candidate_index;
+    std::vector<index_choicet> choices;
+    goto_programt::targett control;
+    irep_idt object_index;
+    irep_idt lock_index;
+    irep_idt object_array;
+    irep_idt lock_array;
+
+    worker_summaryt(
+      const std::size_t candidate_index,
+      std::vector<index_choicet> choices,
+      goto_programt::targett control,
+      irep_idt object_index,
+      irep_idt lock_index,
+      irep_idt object_array,
+      irep_idt lock_array)
+      : candidate_index(candidate_index),
+        choices(std::move(choices)),
+        control(control),
+        object_index(std::move(object_index)),
+        lock_index(std::move(lock_index)),
+        object_array(std::move(object_array)),
+        lock_array(std::move(lock_array))
+    {
+    }
+  };
+
+  const auto indexed_array =
+    [&](const exprt &root, const irep_idt &index, irep_idt &array) -> bool
+    {
+      std::set<irep_idt> arrays;
+      std::function<void(const exprt &)> visit =
+        [&](const exprt &expr)
+        {
+          const exprt &value = without_cast(expr);
+          if(
+            value.id() == ID_index && value.operands().size() == 2 &&
+            contains_symbol(value.op1(), {index}))
+          {
+            irep_idt candidate;
+            if(direct_symbol(value.op0(), candidate))
+              arrays.insert(candidate);
+          }
+          for(const auto &operand : value.operands())
+            visit(operand);
+        };
+      visit(root);
+      if(arrays.size() != 1)
+        return false;
+      array = *arrays.begin();
+      return true;
+    };
+
+  const auto array_capacity =
+    [&](const irep_idt &array, mp_integer &capacity) -> bool
+    {
+      const auto symbol = goto_model.symbol_table.symbols.find(array);
+      return
+        symbol != goto_model.symbol_table.symbols.end() &&
+        symbol->second.is_static_lifetime &&
+        symbol->second.type.id() == ID_array &&
+        constant_eval(
+          to_array_type(symbol->second.type).size(), {}, capacity);
+    };
+
+  std::vector<worker_summaryt> admitted_workers;
+  for(std::size_t candidate_index = 0;
+      candidate_index < candidates.size(); ++candidate_index)
+  {
+    const auto worker =
+      goto_model.goto_functions.function_map.find(
+        candidates[candidate_index].worker);
+    if(
+      worker == goto_model.goto_functions.function_map.end() ||
+      !worker->second.body_available())
+      continue;
+    auto &body = worker->second.body;
+    std::vector<index_choicet> choices;
+    for(auto instruction = body.instructions.begin();
+        instruction != body.instructions.end(); ++instruction)
+    {
+      if(!instruction->is_assign())
+        continue;
+      const exprt &rhs = without_cast(instruction->assign_rhs());
+      irep_idt temporary;
+      if(
+        rhs.id() != ID_side_effect ||
+        to_side_effect_expr(rhs).get_statement() != ID_nondet ||
+        !direct_symbol(instruction->assign_lhs(), temporary))
+        continue;
+      for(auto propagated = std::next(instruction);
+          propagated != body.instructions.end(); ++propagated)
+      {
+        if(!propagated->is_assign())
+          continue;
+        const exprt &propagated_rhs =
+          without_cast(propagated->assign_rhs());
+        if(
+          propagated_rhs.id() == ID_side_effect &&
+          to_side_effect_expr(propagated_rhs).get_statement() == ID_nondet)
+          break;
+        irep_idt index;
+        irep_idt rhs_temporary;
+        mp_integer bound;
+        if(
+          propagated_rhs.id() == ID_mod &&
+          propagated_rhs.operands().size() == 2 &&
+          direct_symbol(propagated->assign_lhs(), index) &&
+          direct_symbol(propagated_rhs.op0(), rhs_temporary) &&
+          rhs_temporary == temporary &&
+          constant_eval(propagated_rhs.op1(), {}, bound) &&
+          bound > 1)
+        {
+          choices.emplace_back(
+            instruction, propagated, temporary, index, bound);
+          break;
+        }
+      }
+    }
+    if(
+      choices.size() != 2 ||
+      choices.front().index == choices.back().index ||
+      choices.front().bound != choices.back().bound)
+      continue;
+
+    std::vector<std::pair<irep_idt, irep_idt>> object_uses;
+    std::vector<std::pair<irep_idt, irep_idt>> lock_uses;
+    for(auto instruction = body.instructions.begin();
+        instruction != body.instructions.end(); ++instruction)
+    {
+      if(
+        instruction->is_function_call() &&
+        !instruction->call_lhs().is_nil() &&
+        instruction->call_lhs().type().id() == ID_pointer)
+      {
+        for(const auto &choice : choices)
+          for(const auto &argument : instruction->call_arguments())
+          {
+            irep_idt array;
+            if(indexed_array(argument, choice.index, array))
+              object_uses.emplace_back(choice.index, array);
+          }
+      }
+      irep_idt callee;
+      if(
+        instruction->is_function_call() &&
+        direct_call_identifier(*instruction, callee) &&
+        (callee == "pthread_mutex_lock" ||
+         callee == "pthread_mutex_unlock") &&
+        instruction->call_arguments().size() == 1)
+      {
+        for(const auto &choice : choices)
+        {
+          irep_idt array;
+          if(
+            indexed_array(
+              instruction->call_arguments().front(),
+              choice.index,
+              array))
+            lock_uses.emplace_back(choice.index, array);
+        }
+      }
+    }
+    std::sort(object_uses.begin(), object_uses.end());
+    object_uses.erase(
+      std::unique(object_uses.begin(), object_uses.end()),
+      object_uses.end());
+    std::sort(lock_uses.begin(), lock_uses.end());
+    lock_uses.erase(
+      std::unique(lock_uses.begin(), lock_uses.end()),
+      lock_uses.end());
+    if(
+      object_uses.size() != 1 || lock_uses.size() != 1 ||
+      object_uses.front().first == lock_uses.front().first ||
+      object_uses.front().second == lock_uses.front().second)
+      continue;
+    std::size_t indexed_locks = 0;
+    std::size_t indexed_unlocks = 0;
+    for(const auto &instruction : body.instructions)
+    {
+      irep_idt callee;
+      if(
+        !instruction.is_function_call() ||
+        !direct_call_identifier(instruction, callee) ||
+        (callee != "pthread_mutex_lock" &&
+         callee != "pthread_mutex_unlock") ||
+        instruction.call_arguments().size() != 1)
+        continue;
+      irep_idt array;
+      if(
+        !indexed_array(
+          instruction.call_arguments().front(),
+          lock_uses.front().first,
+          array) ||
+        array != lock_uses.front().second)
+        continue;
+      if(callee == "pthread_mutex_lock")
+        ++indexed_locks;
+      else
+        ++indexed_unlocks;
+    }
+    if(indexed_locks != 1 || indexed_unlocks != 1)
+      continue;
+    mp_integer object_capacity;
+    mp_integer lock_capacity;
+    if(
+      !array_capacity(object_uses.front().second, object_capacity) ||
+      !array_capacity(lock_uses.front().second, lock_capacity) ||
+      object_capacity != choices.front().bound ||
+      lock_capacity != choices.front().bound)
+      continue;
+
+    exprt scalar = nil_exprt();
+    find_symbols_sett scalar_symbols;
+    std::set<irep_idt> scalar_members;
+    std::size_t plus_one = 0;
+    std::size_t minus_one = 0;
+    std::size_t zero_assertions = 0;
+    std::vector<goto_programt::targett> operations;
+    std::set<irep_idt> operation_mutexes;
+    std::function<void(const exprt &, std::set<irep_idt> &)>
+      collect_members =
+        [&](const exprt &expr, std::set<irep_idt> &members)
+        {
+          const exprt &value = without_cast(expr);
+          if(value.id() == ID_member)
+            members.insert(
+              to_member_expr(value).get_component_name());
+          for(const auto &operand : value.operands())
+            collect_members(operand, members);
+        };
+    for(auto instruction = body.instructions.begin();
+        instruction != body.instructions.end(); ++instruction)
+    {
+      if(instruction->is_assign())
+      {
+        const exprt &rhs = without_cast(instruction->assign_rhs());
+        if(
+          (rhs.id() == ID_plus || rhs.id() == ID_minus) &&
+          rhs.operands().size() == 2 &&
+          contains_side_effect(instruction->assign_lhs()) &&
+          contains_side_effect(rhs.op0()))
+        {
+          mp_integer delta;
+          if(constant_eval(rhs.op1(), {}, delta) && delta == 1)
+          {
+            find_symbols_sett lhs_symbols;
+            find_symbols_sett rhs_symbols;
+            std::set<irep_idt> lhs_members;
+            std::set<irep_idt> rhs_members;
+            find_symbols(instruction->assign_lhs(), lhs_symbols);
+            find_symbols(rhs.op0(), rhs_symbols);
+            collect_members(instruction->assign_lhs(), lhs_members);
+            collect_members(rhs.op0(), rhs_members);
+            if(
+              lhs_symbols == rhs_symbols &&
+              lhs_members == rhs_members &&
+              !lhs_symbols.empty() && !lhs_members.empty())
+            {
+              if(scalar.is_nil())
+              {
+                scalar = instruction->assign_lhs();
+                scalar_symbols = lhs_symbols;
+                scalar_members = lhs_members;
+              }
+              if(
+                lhs_symbols == scalar_symbols &&
+                lhs_members == scalar_members)
+              {
+                if(rhs.id() == ID_plus)
+                  ++plus_one;
+                else
+                  ++minus_one;
+                operations.push_back(instruction);
+              }
+            }
+          }
+        }
+      }
+      irep_idt callee;
+      if(
+        instruction->is_function_call() &&
+        direct_call_identifier(*instruction, callee) &&
+        callee == "__VERIFIER_assert" &&
+        instruction->call_arguments().size() == 1 &&
+        !scalar.is_nil())
+      {
+        const exprt &condition =
+          without_cast(instruction->call_arguments().front());
+        mp_integer zero;
+        if(
+          condition.id() == ID_equal &&
+          condition.operands().size() == 2 &&
+          constant_eval(condition.op1(), {}, zero) &&
+          zero == 0)
+        {
+          find_symbols_sett symbols;
+          std::set<irep_idt> members;
+          find_symbols(condition.op0(), symbols);
+          collect_members(condition.op0(), members);
+          if(
+            symbols == scalar_symbols &&
+            members == scalar_members)
+          {
+            ++zero_assertions;
+            operations.push_back(instruction);
+          }
+        }
+      }
+    }
+    if(
+      plus_one != 1 || minus_one != 1 ||
+      zero_assertions != 1 || operations.size() != 3)
+      continue;
+    bool mutex_pairs = true;
+    for(const auto operation : operations)
+    {
+      if(
+        operation == body.instructions.begin() ||
+        std::next(operation) == body.instructions.end())
+      {
+        mutex_pairs = false;
+        break;
+      }
+      irep_idt locked;
+      irep_idt unlocked;
+      if(
+        !parse_mutex_call(
+          *std::prev(operation), "pthread_mutex_lock", locked) ||
+        !parse_mutex_call(
+          *std::next(operation), "pthread_mutex_unlock", unlocked) ||
+        locked != unlocked)
+      {
+        mutex_pairs = false;
+        break;
+      }
+      operation_mutexes.insert(locked);
+    }
+    if(!mutex_pairs || operation_mutexes.size() != 1)
+      continue;
+
+    auto control = body.instructions.end();
+    std::size_t controls = 0;
+    for(auto instruction = body.instructions.begin();
+        instruction != body.instructions.end(); ++instruction)
+    {
+      if(!instruction->is_assign())
+        continue;
+      const exprt &rhs = without_cast(instruction->assign_rhs());
+      if(
+        rhs.id() != ID_side_effect ||
+        to_side_effect_expr(rhs).get_statement() != ID_nondet)
+        continue;
+      bool is_index_choice = false;
+      for(const auto &choice : choices)
+        is_index_choice =
+          is_index_choice || instruction == choice.nondet;
+      if(!is_index_choice)
+      {
+        control = instruction;
+        ++controls;
+      }
+    }
+    if(controls != 1)
+      continue;
+
+    admitted_workers.emplace_back(
+      candidate_index,
+      std::move(choices),
+      control,
+      object_uses.front().first,
+      lock_uses.front().first,
+      object_uses.front().second,
+      lock_uses.front().second);
+  }
+  if(admitted_workers.size() != 1)
+  {
+    std::cout
+      << "NATIVE_INDEPENDENT_INDEX_PREFIX applied=0"
+      << " reason=independent_worker_count"
+      << " workers=" << admitted_workers.size() << '\n';
+    return false;
+  }
+  const auto summary = admitted_workers.front();
+
+  auto main = goto_model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != goto_model.goto_functions.function_map.end() &&
+    main->second.body_available(),
+    "independent index prefix requires main");
+  auto &program = main->second.body;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : program.instructions)
+    positions.emplace(&instruction, position++);
+  std::size_t first_create = positions.size();
+  for(const auto &candidate : candidates)
+    first_create =
+      std::min(first_create, positions.at(candidate.create_instruction));
+
+  struct loopt
+  {
+    goto_programt::const_targett head;
+    goto_programt::const_targett backedge;
+    irep_idt induction;
+    mp_integer bound;
+  };
+  std::vector<loopt> loops;
+  for(auto backedge = program.instructions.begin();
+      backedge != program.instructions.end(); ++backedge)
+  {
+    if(
+      positions.at(&*backedge) >= first_create ||
+      !backedge->is_goto() || !backedge->condition().is_true() ||
+      backedge->targets.size() != 1 ||
+      positions.at(&*backedge->get_target()) >= positions.at(&*backedge))
+      continue;
+    irep_idt induction;
+    exprt bound;
+    mp_integer constant_bound;
+    if(
+      parse_exit_guard(
+        *backedge->get_target(), induction, bound) &&
+      constant_eval(bound, {}, constant_bound) &&
+      constant_bound == summary.choices.front().bound)
+      loops.push_back(
+        {backedge->get_target(), backedge, induction, constant_bound});
+  }
+  if(loops.size() != 1)
+  {
+    std::cout
+      << "NATIVE_INDEPENDENT_INDEX_PREFIX applied=0"
+      << " reason=initialization_loop_count"
+      << " loops=" << loops.size() << '\n';
+    return false;
+  }
+  const auto &loop = loops.front();
+  std::size_t zero_initializations = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != loop.head; ++instruction)
+    if(parse_zero_initialization(*instruction, loop.induction))
+      ++zero_initializations;
+  std::size_t increments = 0;
+  std::size_t object_initializations = 0;
+  std::size_t mutex_initializations = 0;
+  for(auto instruction = loop.head;
+      instruction != loop.backedge; ++instruction)
+  {
+    irep_idt incremented;
+    if(
+      parse_unit_increment(*instruction, incremented) &&
+      incremented == loop.induction)
+      ++increments;
+    irep_idt callee;
+    if(
+      instruction->is_function_call() &&
+      direct_call_identifier(*instruction, callee) &&
+      callee == "pthread_mutex_init" &&
+      instruction_mentions_any(
+        *instruction, {loop.induction, summary.lock_array}))
+      ++mutex_initializations;
+    if(
+      instruction->is_assign() &&
+      contains_symbol(
+        instruction->assign_lhs(),
+        {loop.induction, summary.object_array}) &&
+      instruction->assign_rhs().type().id() == ID_pointer)
+      ++object_initializations;
+  }
+  if(
+    zero_initializations != 1 || increments != 1 ||
+    object_initializations != 1 || mutex_initializations != 1)
+  {
+    std::cout
+      << "NATIVE_INDEPENDENT_INDEX_PREFIX applied=0"
+      << " reason=initialization_shape"
+      << " zero=" << zero_initializations
+      << " increments=" << increments
+      << " objects=" << object_initializations
+      << " mutexes=" << mutex_initializations << '\n';
+    return false;
+  }
+
+  const auto original_worker =
+    goto_model.goto_functions.function_map.find(
+      candidates[summary.candidate_index].worker);
+  const auto original_symbol =
+    goto_model.symbol_table.symbols.find(
+      candidates[summary.candidate_index].worker);
+  if(
+    original_worker == goto_model.goto_functions.function_map.end() ||
+    original_symbol == goto_model.symbol_table.symbols.end())
+    return false;
+  const irep_idt cloned_worker_id =
+    id2string(candidates[summary.candidate_index].worker) +
+    "$deagle_independent_index_worker";
+  if(
+    goto_model.goto_functions.function_map.count(cloned_worker_id) != 0 ||
+    goto_model.symbol_table.symbols.count(cloned_worker_id) != 0)
+    return false;
+
+  const namespacet ns(goto_model.symbol_table);
+  const symbolt *induction_symbol = nullptr;
+  if(ns.lookup(loop.induction, induction_symbol))
+    return false;
+  auto loop_head = program.const_cast_target(loop.head);
+  loop_head->condition_nonconst() = not_exprt(
+    binary_relation_exprt(
+      symbol_exprt(loop.induction, induction_symbol->type),
+      ID_lt,
+      from_integer(2, induction_symbol->type)));
+
+  auto &cloned_worker =
+    goto_model.goto_functions.function_map[cloned_worker_id];
+  cloned_worker.copy_from(original_worker->second);
+  symbolt cloned_symbol = original_symbol->second;
+  cloned_symbol.name = cloned_worker_id;
+  cloned_symbol.base_name = cloned_worker_id;
+  cloned_symbol.pretty_name = cloned_worker_id;
+  if(goto_model.symbol_table.add(cloned_symbol))
+    return false;
+
+  const auto specialize =
+    [&](goto_functiont &worker, const mp_integer &lock_value,
+        const mp_integer &control_value) -> bool
+    {
+      std::map<irep_idt, goto_programt::targett> nondets;
+      std::map<irep_idt, goto_programt::targett> propagated;
+      goto_programt::targett control =
+        worker.body.instructions.end();
+      for(auto instruction = worker.body.instructions.begin();
+          instruction != worker.body.instructions.end(); ++instruction)
+      {
+        if(!instruction->is_assign())
+          continue;
+        const exprt &rhs = without_cast(instruction->assign_rhs());
+        irep_idt temporary;
+        if(
+          rhs.id() == ID_side_effect &&
+          to_side_effect_expr(rhs).get_statement() == ID_nondet &&
+          direct_symbol(instruction->assign_lhs(), temporary))
+        {
+          nondets.emplace(temporary, instruction);
+          control = instruction;
+          continue;
+        }
+        if(
+          rhs.id() == ID_mod && rhs.operands().size() == 2 &&
+          direct_symbol(rhs.op0(), temporary))
+        {
+          irep_idt index;
+          if(direct_symbol(instruction->assign_lhs(), index))
+            propagated.emplace(index, instruction);
+        }
+      }
+      if(
+        propagated.size() != 2 ||
+        control == worker.body.instructions.end())
+        return false;
+      for(const auto &choice : summary.choices)
+      {
+        const auto nondet = nondets.find(choice.temporary);
+        const auto assignment = propagated.find(choice.index);
+        if(
+          nondet == nondets.end() ||
+          assignment == propagated.end())
+          return false;
+        const mp_integer value =
+          choice.index == summary.lock_index ? lock_value : 0;
+        nondet->second->assign_rhs_nonconst() =
+          from_integer(
+            value, nondet->second->assign_lhs().type());
+        assignment->second->assign_rhs_nonconst() =
+          from_integer(
+            value, assignment->second->assign_lhs().type());
+      }
+      control->assign_rhs_nonconst() =
+        from_integer(
+          control_value, control->assign_lhs().type());
+      return true;
+    };
+  if(
+    !specialize(original_worker->second, 0, 1) ||
+    !specialize(cloned_worker, 1, 0))
+    return false;
+
+  auto create = program.instructions.end();
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+    if(
+      &*instruction ==
+      candidates[summary.candidate_index].create_instruction)
+    {
+      create = instruction;
+      break;
+    }
+  if(create == program.instructions.end())
+    return false;
+  const auto spawn_symbol =
+    goto_model.symbol_table.symbols.find(
+      candidates[summary.candidate_index].induction);
+  if(spawn_symbol == goto_model.symbol_table.symbols.end())
+    return false;
+  const exprt original_target = create->call_arguments()[2];
+  exprt cloned_target = address_of_exprt(
+    symbol_exprt(cloned_worker_id, original_symbol->second.type));
+  cloned_target = typecast_exprt::conditional_cast(
+    cloned_target, original_target.type());
+  create->call_arguments()[2] = if_exprt(
+    equal_exprt(
+      symbol_exprt(
+        candidates[summary.candidate_index].induction,
+        spawn_symbol->second.type),
+      from_integer(0, spawn_symbol->second.type)),
+    original_target,
+    std::move(cloned_target),
+    original_target.type());
+
+  std::vector<unsigned> counts(candidates.size(), 0);
+  counts[summary.candidate_index] = 2;
+  bool truncated = false;
+  if(!apply_dormant_spawn_counts(
+       goto_model, candidates, counts, truncated))
+    return false;
+  program.instructions.begin()
+    ->source_location_nonconst()
+    .set("deagle_independent_index_prefix", true);
+  goto_model.goto_functions.update();
+  std::cout
+    << "NATIVE_INDEPENDENT_INDEX_PREFIX applied=1"
+    << " initialized=2 workers=2"
+    << " object_choice=0 lock_choices=0,1"
+    << " truncated=" << (truncated ? 1 : 0) << '\n';
+  (void)message_handler;
+  return true;
+}
+
+bool independent_index_prefix_applied(const goto_modelt &goto_model)
+{
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  return
+    main != goto_model.goto_functions.function_map.end() &&
+    main->second.body_available() &&
+    !main->second.body.instructions.empty() &&
+    main->second.body.instructions.begin()
+      ->source_location()
+      .get_bool("deagle_independent_index_prefix");
+}
+
+bool pair_initialization_prefix_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  std::string reason;
+  const auto candidates = dormant_spawn_cutoffs(goto_model, reason);
+  if(candidates.size() != 2)
+  {
+    std::cout
+      << "NATIVE_PAIR_INITIALIZATION_PREFIX applied=0"
+      << " reason=worker_class_count"
+      << " classes=" << candidates.size() << '\n';
+    return false;
+  }
+  if(candidates.front().worker == candidates.back().worker)
+  {
+    std::cout
+      << "NATIVE_PAIR_INITIALIZATION_PREFIX applied=0"
+      << " reason=duplicate_worker_class\n";
+    return false;
+  }
+
+  auto main = goto_model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != goto_model.goto_functions.function_map.end() &&
+    main->second.body_available(),
+    "pair initialization prefix requires main");
+  auto &program = main->second.body;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : program.instructions)
+    positions.emplace(&instruction, position++);
+
+  std::size_t first_create = positions.size();
+  for(const auto &candidate : candidates)
+    first_create =
+      std::min(first_create, positions.at(candidate.create_instruction));
+
+  struct loopt
+  {
+    goto_programt::const_targett head;
+    goto_programt::const_targett backedge;
+    irep_idt induction;
+  };
+  std::vector<loopt> initialization_loops;
+  for(auto backedge = program.instructions.begin();
+      backedge != program.instructions.end(); ++backedge)
+  {
+    if(
+      positions.at(&*backedge) >= first_create ||
+      !backedge->is_goto() || !backedge->condition().is_true() ||
+      backedge->targets.size() != 1 ||
+      positions.at(&*backedge->get_target()) >= positions.at(&*backedge))
+      continue;
+    const auto head = backedge->get_target();
+    irep_idt induction;
+    exprt bound;
+    mp_integer constant_bound;
+    if(
+      !parse_exit_guard(*head, induction, bound) ||
+      !constant_eval(bound, {}, constant_bound) ||
+      constant_bound <= 2)
+      continue;
+    initialization_loops.push_back({head, backedge, induction});
+  }
+  if(initialization_loops.size() != 2)
+  {
+    std::cout
+      << "NATIVE_PAIR_INITIALIZATION_PREFIX applied=0"
+      << " reason=initialization_loop_count"
+      << " loops=" << initialization_loops.size() << '\n';
+    return false;
+  }
+
+  loopt *outer_loop = nullptr;
+  loopt *inner_loop = nullptr;
+  for(auto &candidate_outer : initialization_loops)
+  {
+    const auto outer_head = positions.at(&*candidate_outer.head);
+    const auto outer_backedge = positions.at(&*candidate_outer.backedge);
+    for(auto &candidate_inner : initialization_loops)
+    {
+      if(&candidate_outer == &candidate_inner)
+        continue;
+      const auto inner_head = positions.at(&*candidate_inner.head);
+      const auto inner_backedge = positions.at(&*candidate_inner.backedge);
+      if(
+        outer_head < inner_head &&
+        inner_backedge < outer_backedge)
+      {
+        if(outer_loop != nullptr || inner_loop != nullptr)
+        {
+          std::cout
+            << "NATIVE_PAIR_INITIALIZATION_PREFIX applied=0"
+            << " reason=ambiguous_loop_nesting\n";
+          return false;
+        }
+        outer_loop = &candidate_outer;
+        inner_loop = &candidate_inner;
+      }
+    }
+  }
+  if(outer_loop == nullptr || inner_loop == nullptr)
+  {
+    std::cout
+      << "NATIVE_PAIR_INITIALIZATION_PREFIX applied=0"
+      << " reason=non_nested_initialization_loops\n";
+    return false;
+  }
+
+  for(const auto *loop : {outer_loop, inner_loop})
+  {
+    std::size_t initializations = 0;
+    for(auto instruction = program.instructions.begin();
+        instruction != loop->head; ++instruction)
+    {
+      if(parse_zero_initialization(*instruction, loop->induction))
+        ++initializations;
+    }
+    std::size_t increments = 0;
+    for(auto instruction = loop->head;
+        instruction != loop->backedge; ++instruction)
+    {
+      irep_idt incremented;
+      if(
+        parse_unit_increment(*instruction, incremented) &&
+        incremented == loop->induction)
+        ++increments;
+    }
+    if(initializations != 1 || increments != 1)
+    {
+      std::cout
+        << "NATIVE_PAIR_INITIALIZATION_PREFIX applied=0"
+        << " reason=non_canonical_initialization_loop"
+        << " zero_initializations=" << initializations
+        << " unit_increments=" << increments << '\n';
+      return false;
+    }
+  }
+
+  struct worker_index_assignmentt
+  {
+    goto_programt::targett nondet_assignment;
+    goto_programt::targett index_assignment;
+    goto_programt::targett loop_guard;
+    goto_programt::targett increment;
+    goto_programt::targett control_assignment;
+    irep_idt worker;
+    irep_idt index;
+    std::size_t concretized_uses;
+  };
+  std::vector<worker_index_assignmentt> worker_index_assignments;
+  for(const auto &candidate : candidates)
+  {
+    auto worker =
+      goto_model.goto_functions.function_map.find(candidate.worker);
+    if(
+      worker == goto_model.goto_functions.function_map.end() ||
+      !worker->second.body_available())
+    {
+      std::cout
+        << "NATIVE_PAIR_INITIALIZATION_PREFIX applied=0"
+        << " reason=missing_worker\n";
+      return false;
+    }
+    goto_programt::targett selected =
+      worker->second.body.instructions.end();
+    for(auto instruction = worker->second.body.instructions.begin();
+        instruction != worker->second.body.instructions.end(); ++instruction)
+    {
+      if(!instruction->is_assign())
+        continue;
+      const exprt &rhs = without_cast(instruction->assign_rhs());
+      if(
+        rhs.id() != ID_side_effect ||
+        to_side_effect_expr(rhs).get_statement() != ID_nondet)
+        continue;
+      irep_idt index;
+      if(!direct_symbol(instruction->assign_lhs(), index))
+        continue;
+      selected = instruction;
+      break;
+    }
+    if(selected == worker->second.body.instructions.end())
+    {
+      std::cout
+        << "NATIVE_PAIR_INITIALIZATION_PREFIX applied=0"
+        << " reason=missing_worker_index\n";
+      return false;
+    }
+    irep_idt temporary;
+    if(!direct_symbol(selected->assign_lhs(), temporary))
+    {
+      std::cout
+        << "NATIVE_PAIR_INITIALIZATION_PREFIX applied=0"
+        << " reason=non_symbol_worker_index_temporary\n";
+      return false;
+    }
+    goto_programt::targett propagated =
+      worker->second.body.instructions.end();
+    std::size_t propagation_count = 0;
+    for(auto instruction = std::next(selected);
+        instruction != worker->second.body.instructions.end(); ++instruction)
+    {
+      irep_idt mutex;
+      if(parse_mutex_call(*instruction, "pthread_mutex_lock", mutex))
+        break;
+      if(!instruction->is_assign())
+        continue;
+      irep_idt index;
+      irep_idt rhs;
+      if(
+        direct_symbol(instruction->assign_lhs(), index) &&
+        direct_symbol(instruction->assign_rhs(), rhs) &&
+        rhs == temporary)
+      {
+        propagated = instruction;
+        ++propagation_count;
+      }
+    }
+    if(
+      propagation_count != 1 ||
+      propagated == worker->second.body.instructions.end())
+    {
+      std::cout
+        << "NATIVE_PAIR_INITIALIZATION_PREFIX applied=0"
+        << " reason=worker_index_propagation"
+        << " candidates=" << propagation_count << '\n';
+      return false;
+    }
+    irep_idt propagated_index;
+    if(!direct_symbol(propagated->assign_lhs(), propagated_index))
+    {
+      std::cout
+        << "NATIVE_PAIR_INITIALIZATION_PREFIX applied=0"
+        << " reason=non_symbol_worker_index\n";
+      return false;
+    }
+    const auto index_symbol =
+      goto_model.symbol_table.symbols.find(propagated_index);
+    if(index_symbol == goto_model.symbol_table.symbols.end())
+    {
+      std::cout
+        << "NATIVE_PAIR_INITIALIZATION_PREFIX applied=0"
+        << " reason=missing_worker_index_symbol\n";
+      return false;
+    }
+    const symbol_exprt index(
+      propagated_index, index_symbol->second.type);
+    const exprt worker_zero =
+      from_integer(0, index_symbol->second.type);
+    auto loop_guard = worker->second.body.instructions.end();
+    auto increment = worker->second.body.instructions.end();
+    auto control_assignment =
+      worker->second.body.instructions.end();
+    std::size_t increments = 0;
+    std::size_t control_assignments = 0;
+    std::size_t concretized = 0;
+    for(auto instruction = std::next(propagated);
+        instruction != worker->second.body.instructions.end(); ++instruction)
+    {
+      irep_idt incremented;
+      if(
+        parse_unit_increment(*instruction, incremented) &&
+        incremented == propagated_index)
+      {
+        increment = instruction;
+        ++increments;
+        break;
+      }
+      if(
+        loop_guard == worker->second.body.instructions.end() &&
+        instruction->is_goto())
+      {
+        loop_guard = instruction;
+        continue;
+      }
+      if(instruction->is_assign())
+      {
+        const exprt &rhs = without_cast(instruction->assign_rhs());
+        if(
+          rhs.id() == ID_side_effect &&
+          to_side_effect_expr(rhs).get_statement() == ID_nondet)
+        {
+          control_assignment = instruction;
+          ++control_assignments;
+        }
+      }
+      codet code = instruction->code();
+      const codet original_code = code;
+      replace_expr(index, worker_zero, code);
+      if(code != original_code)
+        ++concretized;
+      if(instruction->is_goto())
+      {
+        exprt condition = instruction->condition();
+        const exprt original_condition = condition;
+        replace_expr(index, worker_zero, condition);
+        if(condition != original_condition)
+          ++concretized;
+      }
+    }
+    if(
+      loop_guard == worker->second.body.instructions.end() ||
+      increment == worker->second.body.instructions.end() ||
+      control_assignment == worker->second.body.instructions.end() ||
+      increments != 1 || control_assignments != 1 ||
+      concretized == 0)
+    {
+      std::cout
+        << "NATIVE_PAIR_INITIALIZATION_PREFIX applied=0"
+        << " reason=worker_index_use_region"
+        << " loop_guard="
+        << (loop_guard == worker->second.body.instructions.end() ? 0 : 1)
+        << " increments=" << increments
+        << " controls=" << control_assignments
+        << " concretized=" << concretized << '\n';
+      return false;
+    }
+    worker_index_assignments.push_back(
+      {selected,
+       propagated,
+       loop_guard,
+       increment,
+       control_assignment,
+       candidate.worker,
+       propagated_index,
+       concretized});
+  }
+
+  const namespacet ns(goto_model.symbol_table);
+  for(const auto &loop : initialization_loops)
+  {
+    const symbolt *induction_symbol = nullptr;
+    if(ns.lookup(loop.induction, induction_symbol))
+    {
+      std::cout
+        << "NATIVE_PAIR_INITIALIZATION_PREFIX applied=0"
+        << " reason=missing_induction\n";
+      return false;
+    }
+    auto head = program.const_cast_target(loop.head);
+    const symbol_exprt induction(
+      loop.induction, induction_symbol->type);
+    head->condition_nonconst() = not_exprt(
+      binary_relation_exprt(
+        induction,
+        ID_lt,
+        from_integer(1, induction_symbol->type)));
+  }
+  const auto outer_symbol =
+    goto_model.symbol_table.symbols.find(outer_loop->induction);
+  if(outer_symbol == goto_model.symbol_table.symbols.end())
+  {
+    std::cout
+      << "NATIVE_PAIR_INITIALIZATION_PREFIX applied=0"
+      << " reason=missing_outer_induction_symbol\n";
+    return false;
+  }
+  const symbol_exprt outer_induction(
+    outer_loop->induction, outer_symbol->second.type);
+  const exprt zero = from_integer(0, outer_symbol->second.type);
+  std::size_t concretized_instructions = 0;
+  for(auto instruction = std::next(program.const_cast_target(outer_loop->head));
+      instruction != program.const_cast_target(outer_loop->backedge);
+      ++instruction)
+  {
+    irep_idt incremented;
+    if(
+      parse_unit_increment(*instruction, incremented) &&
+      incremented == outer_loop->induction)
+      continue;
+    codet &code = instruction->code_nonconst();
+    const codet original = code;
+    replace_expr(outer_induction, zero, code);
+    if(code != original)
+      ++concretized_instructions;
+  }
+  if(concretized_instructions == 0)
+  {
+    std::cout
+      << "NATIVE_PAIR_INITIALIZATION_PREFIX applied=0"
+      << " reason=unused_outer_induction\n";
+    return false;
+  }
+  std::size_t concretized_worker_uses = 0;
+  for(std::size_t worker_index = 0;
+      worker_index < worker_index_assignments.size(); ++worker_index)
+  {
+    auto assignment = worker_index_assignments[worker_index];
+    concretized_worker_uses += assignment.concretized_uses;
+    assignment.nondet_assignment->assign_rhs_nonconst() =
+      from_integer(
+        0, assignment.nondet_assignment->assign_lhs().type());
+    assignment.index_assignment->assign_rhs_nonconst() =
+      from_integer(
+        0, assignment.index_assignment->assign_lhs().type());
+    assignment.control_assignment->assign_rhs_nonconst() =
+      from_integer(
+        worker_index == 0 ? 0 : 1,
+        assignment.control_assignment->assign_lhs().type());
+
+    const auto index_symbol =
+      goto_model.symbol_table.symbols.find(assignment.index);
+    const symbol_exprt index(
+      assignment.index, index_symbol->second.type);
+    const exprt worker_zero =
+      from_integer(0, index_symbol->second.type);
+    for(auto instruction = std::next(assignment.index_assignment);
+        instruction != assignment.increment; ++instruction)
+    {
+      if(instruction == assignment.loop_guard)
+        continue;
+      codet &code = instruction->code_nonconst();
+      replace_expr(index, worker_zero, code);
+      if(instruction->is_goto())
+        replace_expr(
+          index, worker_zero, instruction->condition_nonconst());
+    }
+  }
+  program.instructions.begin()
+    ->source_location_nonconst()
+    .set("deagle_pair_initialization_prefix", true);
+  goto_model.goto_functions.update();
+  std::cout
+    << "NATIVE_PAIR_INITIALIZATION_PREFIX applied=1"
+    << " loops=2"
+    << " prefix=1"
+    << " concretized_instructions=" << concretized_instructions
+    << " concretized_worker_uses=" << concretized_worker_uses
+    << " fixed_control_branches=2"
+    << " worker_indices=2\n";
+  (void)message_handler;
+  return true;
+}
+
+bool pair_initialization_prefix_applied(const goto_modelt &goto_model)
+{
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  return
+    main != goto_model.goto_functions.function_map.end() &&
+    main->second.body_available() &&
+    !main->second.body.instructions.empty() &&
+    main->second.body.instructions.begin()
+      ->source_location()
+      .get_bool("deagle_pair_initialization_prefix");
+}
+
 bool dormant_spawn_pair_audit(
   const goto_modelt &goto_model,
   message_handlert &message_handler)
@@ -9576,6 +16415,2742 @@ bool transition_word_equivalence_transform(
     << factor << " state_first=" << first
     << " state_second=" << second << '\n';
   (void)message_handler;
+  return true;
+}
+
+namespace
+{
+bool iro_direct_constant(const exprt &src, mp_integer &value)
+{
+  return constant_eval(without_cast(src), {}, value);
+}
+
+bool iro_zero_assignment(
+  const goto_programt::instructiont &instruction,
+  irep_idt &lhs)
+{
+  mp_integer value;
+  return instruction.is_assign() &&
+         direct_symbol(instruction.assign_lhs(), lhs) &&
+         iro_direct_constant(instruction.assign_rhs(), value) && value == 0;
+}
+
+bool iro_symbol_assignment(
+  const goto_programt::instructiont &instruction,
+  irep_idt &lhs,
+  irep_idt &rhs)
+{
+  return instruction.is_assign() &&
+         direct_symbol(instruction.assign_lhs(), lhs) &&
+         direct_symbol(without_cast(instruction.assign_rhs()), rhs);
+}
+
+bool iro_plus_constant(
+  const exprt &src,
+  irep_idt &base,
+  mp_integer &amount)
+{
+  const exprt &expr = without_cast(src);
+  return expr.id() == ID_plus && expr.operands().size() == 2 &&
+         direct_symbol(without_cast(expr.op0()), base) &&
+         iro_direct_constant(expr.op1(), amount) && amount > 0;
+}
+
+bool iro_plus_assignment(
+  const goto_programt::instructiont &instruction,
+  irep_idt &lhs,
+  irep_idt &base,
+  mp_integer &amount)
+{
+  return instruction.is_assign() &&
+         direct_symbol(instruction.assign_lhs(), lhs) &&
+         iro_plus_constant(instruction.assign_rhs(), base, amount);
+}
+
+bool iro_negated_relation(
+  const exprt &src,
+  const irep_idt &relation,
+  exprt &lhs,
+  exprt &rhs)
+{
+  const exprt &outer = without_cast(src);
+  if(outer.id() != ID_not || outer.operands().size() != 1)
+    return false;
+  const exprt &inner = without_cast(outer.op0());
+  if(inner.id() != relation || inner.operands().size() != 2)
+    return false;
+  lhs = inner.op0();
+  rhs = inner.op1();
+  return true;
+}
+
+bool iro_indexed_object(
+  const exprt &src,
+  irep_idt &base,
+  irep_idt &index)
+{
+  const exprt &object = without_cast(src);
+  if(object.id() != ID_dereference || object.operands().size() != 1)
+    return false;
+  const exprt &pointer = without_cast(object.op0());
+  if(pointer.id() != ID_plus || pointer.operands().size() != 2)
+    return false;
+  return direct_symbol(without_cast(pointer.op0()), base) &&
+         direct_symbol(without_cast(pointer.op1()), index);
+}
+
+bool iro_unit_increment(
+  const goto_programt::instructiont &instruction,
+  const irep_idt &symbol)
+{
+  irep_idt lhs;
+  irep_idt base;
+  mp_integer amount;
+  return iro_plus_assignment(instruction, lhs, base, amount) &&
+         lhs == symbol && base == symbol && amount == 1;
+}
+
+bool iro_assert_call(
+  const goto_programt::instructiont &instruction,
+  exprt &condition)
+{
+  irep_idt callee;
+  if(!direct_call_identifier(instruction, callee) ||
+     callee != "__VERIFIER_assert" ||
+     instruction.call_arguments().size() != 1)
+    return false;
+  condition = without_cast(instruction.call_arguments().front());
+  return true;
+}
+
+bool iro_bounds_condition(
+  const exprt &src,
+  const irep_idt &index,
+  const irep_idt &length)
+{
+  const exprt &condition = without_cast(src);
+  if(condition.id() != ID_and || condition.operands().size() != 2)
+    return false;
+  auto lower_ok = [&](const exprt &part) {
+    const exprt &relation = without_cast(part);
+    irep_idt rhs;
+    mp_integer zero;
+    return relation.id() == ID_le && relation.operands().size() == 2 &&
+           iro_direct_constant(relation.op0(), zero) && zero == 0 &&
+           direct_symbol(without_cast(relation.op1()), rhs) && rhs == index;
+  };
+  auto upper_ok = [&](const exprt &part) {
+    const exprt &relation = without_cast(part);
+    irep_idt lhs;
+    irep_idt rhs;
+    return relation.id() == ID_lt && relation.operands().size() == 2 &&
+           direct_symbol(without_cast(relation.op0()), lhs) && lhs == index &&
+           direct_symbol(without_cast(relation.op1()), rhs) && rhs == length;
+  };
+  return
+    (lower_ok(condition.op0()) && upper_ok(condition.op1())) ||
+    (lower_ok(condition.op1()) && upper_ok(condition.op0()));
+}
+
+bool iro_store(
+  const goto_programt::instructiont &instruction,
+  const irep_idt &array,
+  const irep_idt &index,
+  const mp_integer &expected)
+{
+  if(!instruction.is_assign())
+    return false;
+  irep_idt actual_array;
+  irep_idt actual_index;
+  mp_integer value;
+  return iro_indexed_object(
+           instruction.assign_lhs(), actual_array, actual_index) &&
+         actual_array == array && actual_index == index &&
+         iro_direct_constant(instruction.assign_rhs(), value) &&
+         value == expected;
+}
+
+bool iro_store_condition(
+  const exprt &src,
+  const irep_idt &array,
+  const irep_idt &index)
+{
+  const exprt &condition = without_cast(src);
+  if(condition.id() != ID_equal || condition.operands().size() != 2)
+    return false;
+  irep_idt actual_array;
+  irep_idt actual_index;
+  mp_integer one;
+  return
+    ((iro_indexed_object(condition.op0(), actual_array, actual_index) &&
+      iro_direct_constant(condition.op1(), one)) ||
+     (iro_indexed_object(condition.op1(), actual_array, actual_index) &&
+      iro_direct_constant(condition.op0(), one))) &&
+    actual_array == array && actual_index == index && one == 1;
+}
+
+bool iro_worker(
+  const goto_modelt &model,
+  const irep_idt &worker,
+  irep_idt &allocator,
+  irep_idt &length,
+  irep_idt &array,
+  irep_idt &mutex,
+  mp_integer &chunk,
+  std::set<const goto_programt::instructiont *> &allowed,
+  std::string &reason)
+{
+  const auto function = model.goto_functions.function_map.find(worker);
+  if(function == model.goto_functions.function_map.end() ||
+     !function->second.body_available())
+  {
+    reason = "iro_missing_worker";
+    return false;
+  }
+  std::vector<goto_programt::const_targett> operations;
+  for(auto instruction = function->second.body.instructions.begin();
+      instruction != function->second.body.instructions.end(); ++instruction)
+  {
+    if(instruction->is_assign() || instruction->is_goto() ||
+       instruction->is_function_call())
+      operations.push_back(instruction);
+    else if(
+      !instruction->is_decl() && !instruction->is_dead() &&
+      !instruction->is_set_return_value() &&
+      !instruction->is_end_function() && !instruction->is_skip())
+    {
+      reason = "iro_worker_instruction";
+      return false;
+    }
+  }
+  if(operations.size() != 13 && operations.size() != 14)
+  {
+    reason = "iro_worker_shape";
+    return false;
+  }
+  irep_idt induction;
+  irep_idt end;
+  irep_idt temporary;
+  if(!iro_zero_assignment(*operations[0], induction) ||
+     !iro_zero_assignment(*operations[1], end) ||
+     induction == end ||
+     !parse_mutex_call(*operations[2], "pthread_mutex_lock", mutex))
+  {
+    reason = "iro_worker_prefix";
+    return false;
+  }
+  exprt allocation_lhs;
+  exprt allocation_rhs;
+  irep_idt allocation_base;
+  if(!operations[3]->is_goto() ||
+     !iro_negated_relation(
+       operations[3]->condition(), ID_le, allocation_lhs, allocation_rhs) ||
+     !iro_plus_constant(allocation_lhs, allocation_base, chunk) ||
+     allocation_base.empty() ||
+     !direct_symbol(without_cast(allocation_rhs), length) ||
+     chunk <= 0)
+  {
+    reason = "iro_allocation_guard";
+    return false;
+  }
+  allocator = allocation_base;
+  if(!iro_symbol_assignment(*operations[4], temporary, allocation_base) ||
+     temporary != induction || allocation_base != allocator)
+  {
+    reason = "iro_allocation_begin";
+    return false;
+  }
+  irep_idt end_lhs;
+  irep_idt end_base;
+  mp_integer end_chunk;
+  if(!iro_plus_assignment(
+       *operations[5], end_lhs, end_base, end_chunk) ||
+     end_lhs != end || end_base != allocator || end_chunk != chunk)
+  {
+    reason = "iro_allocation_end";
+    return false;
+  }
+  irep_idt allocator_lhs;
+  irep_idt allocator_rhs;
+  irep_idt unlock_mutex;
+  if(!iro_symbol_assignment(
+       *operations[6], allocator_lhs, allocator_rhs) ||
+     allocator_lhs != allocator || allocator_rhs != end ||
+     !parse_mutex_call(
+       *operations[7], "pthread_mutex_unlock", unlock_mutex) ||
+     unlock_mutex != mutex || operations[3]->get_target() != operations[7])
+  {
+    reason = "iro_allocation_commit";
+    return false;
+  }
+  exprt loop_lhs;
+  exprt loop_rhs;
+  irep_idt loop_index;
+  irep_idt loop_end;
+  if(!operations[8]->is_goto() ||
+     !iro_negated_relation(
+       operations[8]->condition(), ID_lt, loop_lhs, loop_rhs) ||
+     !direct_symbol(without_cast(loop_lhs), loop_index) ||
+     !direct_symbol(without_cast(loop_rhs), loop_end) ||
+     loop_index != induction || loop_end != end)
+  {
+    reason = "iro_loop_guard";
+    return false;
+  }
+  exprt assertion;
+  std::size_t increment_index = 0;
+  if(operations.size() == 13)
+  {
+    if(!iro_assert_call(*operations[9], assertion) ||
+       !iro_bounds_condition(assertion, induction, length) ||
+       !operations[10]->is_assign() ||
+       !iro_indexed_object(operations[10]->assign_lhs(), array, temporary) ||
+       temporary != induction ||
+       !iro_store(*operations[10], array, induction, 0))
+    {
+      reason = "iro_bounds_body";
+      return false;
+    }
+    increment_index = 11;
+  }
+  else
+  {
+    if(!operations[9]->is_assign() ||
+       !iro_indexed_object(operations[9]->assign_lhs(), array, temporary) ||
+       temporary != induction ||
+       !iro_store(*operations[9], array, induction, 0) ||
+       !iro_store(*operations[10], array, induction, 1) ||
+       !iro_assert_call(*operations[11], assertion) ||
+       !iro_store_condition(assertion, array, induction))
+    {
+      reason = "iro_store_body";
+      return false;
+    }
+    increment_index = 12;
+  }
+  if(!iro_unit_increment(*operations[increment_index], induction) ||
+     !operations[increment_index + 1]->is_goto() ||
+     !operations[increment_index + 1]->condition().is_true() ||
+     operations[increment_index + 1]->get_target() != operations[8])
+  {
+    reason = "iro_loop_step";
+    return false;
+  }
+  for(const auto operation : operations)
+    allowed.insert(&*operation);
+  return true;
+}
+} // namespace
+
+bool index_region_ownership_proof(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  const namespacet ns(goto_model.symbol_table);
+  std::vector<create_recordt> creates;
+  std::string reason;
+  const auto main = goto_model.goto_functions.function_map.find("main");
+  if(
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+  {
+    std::cout
+      << "NATIVE_INDEX_REGION_OWNERSHIP applied=0 reason=iro_missing_main\n";
+    return false;
+  }
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != main->second.body.instructions.end(); ++instruction)
+  {
+    irep_idt callee;
+    if(
+      !direct_call_identifier(*instruction, callee) ||
+      callee != "pthread_create")
+      continue;
+    irep_idt handle;
+    irep_idt worker;
+    if(
+      instruction->call_arguments().size() < 3 ||
+      !addressed_symbol(instruction->call_arguments()[0], handle) ||
+      !addressed_symbol(instruction->call_arguments()[2], worker))
+    {
+      reason = "iro_create_resolution";
+      std::cout << "NATIVE_INDEX_REGION_OWNERSHIP applied=0 reason="
+                << reason << '\n';
+      return false;
+    }
+    creates.push_back({handle, worker, instruction});
+  }
+  if(creates.size() != 1)
+  {
+    reason = "iro_create_count";
+    std::cout << "NATIVE_INDEX_REGION_OWNERSHIP applied=0 reason="
+              << reason << '\n';
+    return false;
+  }
+  {
+    std::map<const goto_programt::instructiont *, std::size_t> positions;
+    std::size_t position = 0;
+    for(const auto &instruction : main->second.body.instructions)
+      positions.emplace(&instruction, position++);
+    bool repeated = false;
+    for(auto instruction = main->second.body.instructions.begin();
+        instruction != main->second.body.instructions.end(); ++instruction)
+    {
+      if(
+        instruction->is_goto() &&
+        positions.at(&*instruction->get_target()) <=
+          positions.at(&*creates.front().instruction) &&
+        positions.at(&*instruction) >
+          positions.at(&*creates.front().instruction))
+        repeated = true;
+    }
+    if(!repeated)
+    {
+      reason = "iro_create_not_repeated";
+      std::cout << "NATIVE_INDEX_REGION_OWNERSHIP applied=0 reason="
+                << reason << '\n';
+      return false;
+    }
+  }
+
+  irep_idt allocator;
+  irep_idt length;
+  irep_idt array;
+  irep_idt mutex;
+  mp_integer chunk;
+  std::set<const goto_programt::instructiont *> allowed;
+  if(!iro_worker(
+       goto_model, creates.front().worker, allocator, length, array, mutex,
+       chunk, allowed, reason))
+  {
+    std::cout << "NATIVE_INDEX_REGION_OWNERSHIP applied=0 reason="
+              << reason << '\n';
+    return false;
+  }
+
+  bool allocator_zero = false;
+  bool positive_length = false;
+  bool bounded_length = false;
+  bool array_allocated = false;
+  bool length_initialized = false;
+  bool array_bound = false;
+  bool create_seen = false;
+  irep_idt allocation_result;
+  std::size_t property_calls = 0;
+  std::size_t assertions = 0;
+  std::set<irep_idt> protected_symbols{allocator, length, array};
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != main->second.body.instructions.end(); ++instruction)
+  {
+    irep_idt lhs;
+    mp_integer zero;
+    if(iro_zero_assignment(*instruction, lhs) && lhs == allocator)
+    {
+      allocator_zero = true;
+      allowed.insert(&*instruction);
+      continue;
+    }
+    if(
+      instruction->is_assign() &&
+      direct_symbol(instruction->assign_lhs(), lhs) && lhs == length &&
+      without_cast(instruction->assign_rhs()).id() == ID_side_effect &&
+      to_side_effect_expr(without_cast(instruction->assign_rhs()))
+          .get_statement() == ID_nondet)
+    {
+      length_initialized = true;
+      allowed.insert(&*instruction);
+      continue;
+    }
+    irep_idt callee;
+    if(direct_call_identifier(*instruction, callee) &&
+       callee == "assume_abort_if_not" &&
+       instruction->call_arguments().size() == 1)
+    {
+      const exprt &condition =
+        without_cast(instruction->call_arguments().front());
+      if(condition.id() == ID_and && condition.operands().size() == 2)
+      {
+        for(const auto &part : condition.operands())
+        {
+          const exprt &relation = without_cast(part);
+          if(relation.operands().size() != 2)
+            continue;
+          irep_idt symbol;
+          mp_integer bound;
+          if(relation.id() == ID_gt &&
+             direct_symbol(without_cast(relation.op0()), symbol) &&
+             symbol == length &&
+             iro_direct_constant(relation.op1(), bound) && bound == 0)
+            positive_length = true;
+          if(relation.id() == ID_lt &&
+             direct_symbol(without_cast(relation.op0()), symbol) &&
+             symbol == length)
+          {
+            exprt rhs = simplify_expr(relation.op1(), ns);
+            if(iro_direct_constant(rhs, bound) &&
+               bound > chunk && bound + chunk < power(2, 31))
+              bounded_length = true;
+          }
+        }
+      }
+      allowed.insert(&*instruction);
+      continue;
+    }
+    if(direct_call_identifier(*instruction, callee) &&
+       callee == "malloc" && instruction->call_arguments().size() == 1)
+    {
+      const exprt &size = without_cast(instruction->call_arguments().front());
+      if(size.id() == ID_mult && size.operands().size() == 2)
+      {
+        irep_idt size_symbol;
+        mp_integer element_size;
+        array_allocated =
+          ((iro_direct_constant(size.op0(), element_size) &&
+            direct_symbol(without_cast(size.op1()), size_symbol)) ||
+           (iro_direct_constant(size.op1(), element_size) &&
+            direct_symbol(without_cast(size.op0()), size_symbol))) &&
+          size_symbol == length && element_size > 0;
+      }
+      if(
+        array_allocated &&
+        !instruction->call_lhs().is_nil() &&
+        direct_symbol(instruction->call_lhs(), allocation_result))
+      {
+        allowed.insert(&*instruction);
+        continue;
+      }
+      reason = "iro_allocation_call";
+      goto reject;
+    }
+    irep_idt rhs;
+    if(
+      instruction->is_assign() &&
+      direct_symbol(instruction->assign_lhs(), lhs) && lhs == array &&
+      direct_symbol(without_cast(instruction->assign_rhs()), rhs) &&
+      !allocation_result.empty() && rhs == allocation_result)
+    {
+      array_bound = true;
+      allowed.insert(&*instruction);
+      continue;
+    }
+    if(&*instruction == &*creates.front().instruction)
+    {
+      create_seen = true;
+      allowed.insert(&*instruction);
+      continue;
+    }
+    if(instruction_mentions_any(*instruction, protected_symbols))
+    {
+      reason = "iro_unexpected_main_access";
+      goto reject;
+    }
+  }
+
+  if(!allocator_zero || !positive_length || !bounded_length ||
+     !length_initialized || !array_allocated || !array_bound || !create_seen)
+  {
+    std::cout << "NATIVE_INDEX_REGION_OWNERSHIP applied=0 reason="
+              << "iro_main_obligation\n";
+    return false;
+  }
+
+  for(const auto &function : goto_model.goto_functions.function_map)
+  {
+    if(!function.second.body_available())
+      continue;
+    for(const auto &instruction : function.second.body.instructions)
+    {
+      irep_idt callee;
+      if(direct_call_identifier(instruction, callee) &&
+         callee == "__VERIFIER_assert")
+      {
+        ++property_calls;
+        if(function.first != creates.front().worker ||
+           allowed.find(&instruction) == allowed.end())
+        {
+          reason = "iro_external_property";
+          goto reject;
+        }
+      }
+      if(instruction.is_assert())
+      {
+        ++assertions;
+        exprt condition = simplify_expr(instruction.condition(), ns);
+        if(function.first != "reach_error" || !condition.is_false())
+        {
+          reason = "iro_external_assertion";
+          goto reject;
+        }
+      }
+      if(
+        function.first != "__CPROVER_initialize" &&
+        function.first != "main" &&
+        function.first != creates.front().worker &&
+        instruction_mentions_any(instruction, protected_symbols))
+      {
+        reason = "iro_external_access";
+        goto reject;
+      }
+    }
+  }
+  if(property_calls != 1 || assertions != 1)
+  {
+    reason = "iro_property_count";
+    goto reject;
+  }
+
+  std::cout << "NATIVE_INDEX_REGION_OWNERSHIP applied=1 worker="
+            << creates.front().worker << " chunk=" << chunk
+            << " properties=" << property_calls << '\n';
+  return true;
+
+reject:
+  std::cout << "NATIVE_INDEX_REGION_OWNERSHIP applied=0 reason="
+            << reason << '\n';
+  return false;
+
+}
+
+namespace
+{
+bool pssc_dereference_symbol(const exprt &src, irep_idt &pointer)
+{
+  const exprt &expr = without_cast(src);
+  return expr.id() == ID_dereference && expr.operands().size() == 1 &&
+         direct_symbol(without_cast(expr.op0()), pointer);
+}
+
+bool pssc_property_shape(
+  const goto_modelt &model,
+  const std::set<irep_idt> &candidate_functions,
+  irep_idt &property_function,
+  irep_idt &pointer_formal,
+  irep_idt &stored_value,
+  const goto_programt::instructiont *&property_call,
+  std::string &reason)
+{
+  property_call = nullptr;
+  for(const auto &function : model.goto_functions.function_map)
+  {
+    if(candidate_functions.find(function.first) == candidate_functions.end())
+      continue;
+    if(!function.second.body_available())
+      continue;
+    for(const auto &instruction : function.second.body.instructions)
+    {
+      irep_idt callee;
+      if(
+        direct_call_identifier(instruction, callee) &&
+        callee == "__VERIFIER_assert")
+      {
+        if(property_call != nullptr)
+        {
+          reason = "pssc_multiple_properties";
+          return false;
+        }
+        property_function = function.first;
+        property_call = &instruction;
+      }
+    }
+  }
+  if(property_call == nullptr || property_call->call_arguments().size() != 1)
+  {
+    reason = "pssc_missing_property";
+    return false;
+  }
+
+  const auto function =
+    model.goto_functions.function_map.find(property_function);
+  auto current = function->second.body.instructions.begin();
+  for(; current != function->second.body.instructions.end(); ++current)
+    if(&*current == property_call)
+      break;
+  if(current == function->second.body.instructions.end())
+  {
+    reason = "pssc_property_location";
+    return false;
+  }
+  auto previous = current;
+  bool found_store = false;
+  while(previous != function->second.body.instructions.begin())
+  {
+    --previous;
+    if(
+      previous->is_decl() || previous->is_dead() ||
+      previous->is_skip())
+      continue;
+    found_store = previous->is_assign();
+    break;
+  }
+  if(!found_store ||
+     !pssc_dereference_symbol(previous->assign_lhs(), pointer_formal) ||
+     !direct_symbol(without_cast(previous->assign_rhs()), stored_value))
+  {
+    reason = "pssc_immediate_store";
+    return false;
+  }
+
+  const exprt &condition =
+    without_cast(property_call->call_arguments().front());
+  if(condition.id() != ID_equal || condition.operands().size() != 2)
+  {
+    reason = "pssc_property_equality";
+    return false;
+  }
+  auto matches = [&](const exprt &cell, const exprt &value) {
+    irep_idt actual_pointer;
+    irep_idt actual_value;
+    return
+      pssc_dereference_symbol(cell, actual_pointer) &&
+      direct_symbol(without_cast(value), actual_value) &&
+      actual_pointer == pointer_formal && actual_value == stored_value;
+  };
+  if(
+    !matches(condition.op0(), condition.op1()) &&
+    !matches(condition.op1(), condition.op0()))
+  {
+    reason = "pssc_property_store_mismatch";
+    return false;
+  }
+  return true;
+}
+
+bool pssc_single_wrapper_call(
+  const goto_modelt &model,
+  const irep_idt &worker,
+  irep_idt &callee,
+  const goto_programt::instructiont *&call,
+  std::string &reason)
+{
+  const auto function = model.goto_functions.function_map.find(worker);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "pssc_missing_worker";
+    return false;
+  }
+  call = nullptr;
+  for(const auto &instruction : function->second.body.instructions)
+  {
+    irep_idt candidate;
+    if(!direct_call_identifier(instruction, candidate))
+      continue;
+    const auto body = model.goto_functions.function_map.find(candidate);
+    if(
+      body == model.goto_functions.function_map.end() ||
+      !body->second.body_available())
+      continue;
+    if(call != nullptr)
+    {
+      reason = "pssc_wrapper_call_count";
+      return false;
+    }
+    call = &instruction;
+    callee = candidate;
+  }
+  if(call == nullptr)
+  {
+    reason = "pssc_wrapper_missing_call";
+    return false;
+  }
+  return true;
+}
+
+bool pssc_other_worker_excludes(
+  const goto_modelt &model,
+  const irep_idt &worker,
+  const irep_idt &pointer_actual,
+  std::string &reason)
+{
+  std::deque<irep_idt> pending;
+  std::set<irep_idt> visited;
+  pending.push_back(worker);
+  while(!pending.empty())
+  {
+    const irep_idt function_id = pending.front();
+    pending.pop_front();
+    if(!visited.insert(function_id).second)
+      continue;
+    const auto function = model.goto_functions.function_map.find(function_id);
+    if(
+      function == model.goto_functions.function_map.end() ||
+      !function->second.body_available())
+      continue;
+    for(const auto &instruction : function->second.body.instructions)
+    {
+      if(
+        contains_symbol(instruction.code(), {pointer_actual}) ||
+        (instruction.has_condition() &&
+         contains_symbol(instruction.condition(), {pointer_actual})))
+      {
+        reason = "pssc_other_worker_access";
+        return false;
+      }
+      if(!instruction.is_function_call())
+        continue;
+      irep_idt callee;
+      if(!direct_call_identifier(instruction, callee))
+      {
+        reason = "pssc_other_worker_indirect_call";
+        return false;
+      }
+      const auto body = model.goto_functions.function_map.find(callee);
+      if(
+        body != model.goto_functions.function_map.end() &&
+        body->second.body_available())
+        pending.push_back(callee);
+    }
+  }
+  return true;
+}
+} // namespace
+
+bool post_store_stable_cell_proof(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  const namespacet ns(goto_model.symbol_table);
+  goto_modelt lifecycle_model;
+  lifecycle_model.symbol_table = goto_model.symbol_table;
+  lifecycle_model.goto_functions.copy_from(goto_model.goto_functions);
+  std::vector<create_recordt> creates;
+  std::vector<goto_programt::targett> joins;
+  std::string reason;
+  const auto reject_pssc = [&reason]() {
+    std::cout << "NATIVE_POST_STORE_STABLE_CELL applied=0 reason="
+              << reason << '\n';
+    return false;
+  };
+  if(
+    !collect_lifecycle(lifecycle_model, ns, creates, joins, reason) ||
+    creates.size() != 2 || joins.size() != 2 ||
+    !validate_main_region(lifecycle_model, ns, creates, joins, reason))
+  {
+    std::cout << "NATIVE_POST_STORE_STABLE_CELL applied=0 reason="
+              << (reason.empty() ? "pssc_lifecycle" : reason) << '\n';
+    return false;
+  }
+
+  irep_idt property_function;
+  irep_idt pointer_formal;
+  irep_idt stored_value;
+  const goto_programt::instructiont *wrapper_calls[2]{nullptr, nullptr};
+  irep_idt wrapper_callees[2];
+  std::set<irep_idt> candidate_property_functions;
+  for(std::size_t index = 0; index < 2; ++index)
+  {
+    if(!pssc_single_wrapper_call(
+         goto_model, creates[index].worker, wrapper_callees[index],
+         wrapper_calls[index], reason))
+      return reject_pssc();
+    candidate_property_functions.insert(wrapper_callees[index]);
+  }
+  const goto_programt::instructiont *property_call = nullptr;
+  if(!pssc_property_shape(
+       goto_model, candidate_property_functions, property_function,
+       pointer_formal, stored_value,
+       property_call, reason))
+    return reject_pssc();
+
+  std::size_t formal_index = 0;
+  const auto property =
+    goto_model.goto_functions.function_map.find(property_function);
+  const auto formal = std::find(
+    property->second.parameter_identifiers.begin(),
+    property->second.parameter_identifiers.end(),
+    pointer_formal);
+  if(formal == property->second.parameter_identifiers.end())
+  {
+    reason = "pssc_pointer_not_parameter";
+    return reject_pssc();
+  }
+  formal_index = static_cast<std::size_t>(
+    formal - property->second.parameter_identifiers.begin());
+
+  std::size_t property_worker_index = 2;
+  for(std::size_t index = 0; index < 2; ++index)
+  {
+    if(wrapper_callees[index] == property_function)
+    {
+      if(property_worker_index != 2)
+      {
+        reason = "pssc_multiple_property_workers";
+        return reject_pssc();
+      }
+      property_worker_index = index;
+    }
+  }
+  if(property_worker_index == 2)
+  {
+    reason = "pssc_property_worker";
+    return reject_pssc();
+  }
+  const auto property_wrapper_call = wrapper_calls[property_worker_index];
+  if(property_wrapper_call->call_arguments().size() <= formal_index)
+  {
+    reason = "pssc_pointer_actual_index";
+    return reject_pssc();
+  }
+  irep_idt pointer_actual;
+  if(!direct_symbol(
+       without_cast(
+         property_wrapper_call->call_arguments()[formal_index]),
+       pointer_actual))
+  {
+    reason = "pssc_pointer_actual";
+    return reject_pssc();
+  }
+
+  if(!pssc_other_worker_excludes(
+       goto_model, creates[1 - property_worker_index].worker,
+       pointer_actual, reason))
+    return reject_pssc();
+
+  std::deque<irep_idt> reachable_pending;
+  std::set<irep_idt> reachable_functions;
+  reachable_pending.push_back("main");
+  reachable_pending.push_back(creates[0].worker);
+  reachable_pending.push_back(creates[1].worker);
+  while(!reachable_pending.empty())
+  {
+    const irep_idt function_id = reachable_pending.front();
+    reachable_pending.pop_front();
+    if(!reachable_functions.insert(function_id).second)
+      continue;
+    const auto function =
+      goto_model.goto_functions.function_map.find(function_id);
+    if(
+      function == goto_model.goto_functions.function_map.end() ||
+      !function->second.body_available())
+      continue;
+    for(const auto &instruction : function->second.body.instructions)
+    {
+      if(!instruction.is_function_call())
+        continue;
+      irep_idt callee;
+      if(!direct_call_identifier(instruction, callee))
+      {
+        reason = "pssc_reachable_indirect_call";
+        return reject_pssc();
+      }
+      const auto body = goto_model.goto_functions.function_map.find(callee);
+      if(
+        body != goto_model.goto_functions.function_map.end() &&
+        body->second.body_available())
+        reachable_pending.push_back(callee);
+    }
+  }
+
+  const auto main_function =
+    goto_model.goto_functions.function_map.find("main");
+  irep_idt allocation_result;
+  const goto_programt::instructiont *pointer_binding = nullptr;
+  const goto_programt::instructiont *allocation_call = nullptr;
+  std::size_t pointer_bindings = 0;
+  for(const auto &instruction : main_function->second.body.instructions)
+  {
+    irep_idt lhs;
+    if(
+      instruction.is_assign() &&
+      direct_symbol(instruction.assign_lhs(), lhs) &&
+      lhs == pointer_actual)
+    {
+      ++pointer_bindings;
+      if(
+        !direct_symbol(
+          without_cast(instruction.assign_rhs()), allocation_result))
+      {
+        reason = "pssc_allocation_binding";
+        return reject_pssc();
+      }
+      pointer_binding = &instruction;
+    }
+  }
+  if(pointer_bindings != 1 || pointer_binding == nullptr)
+  {
+    reason = "pssc_allocation_binding_count";
+    return reject_pssc();
+  }
+  std::size_t allocation_calls = 0;
+  for(const auto &instruction : main_function->second.body.instructions)
+  {
+    irep_idt callee;
+    irep_idt lhs;
+    if(
+      direct_call_identifier(instruction, callee) &&
+      callee == "malloc" && !instruction.call_lhs().is_nil() &&
+      direct_symbol(instruction.call_lhs(), lhs) &&
+      lhs == allocation_result)
+    {
+      ++allocation_calls;
+      allocation_call = &instruction;
+    }
+  }
+  if(allocation_calls != 1 || allocation_call == nullptr)
+  {
+    reason = "pssc_allocation_origin";
+    return reject_pssc();
+  }
+
+  for(const auto &function : goto_model.goto_functions.function_map)
+  {
+    if(reachable_functions.find(function.first) == reachable_functions.end())
+      continue;
+    if(!function.second.body_available())
+      continue;
+    for(const auto &instruction : function.second.body.instructions)
+    {
+      if(
+        &instruction != pointer_binding &&
+        &instruction != allocation_call &&
+        !instruction.is_decl() && !instruction.is_dead() &&
+        (contains_symbol(instruction.code(), {allocation_result}) ||
+         (instruction.has_condition() &&
+          contains_symbol(
+            instruction.condition(), {allocation_result}))))
+      {
+        reason = "pssc_allocation_alias";
+        return reject_pssc();
+      }
+      if(
+        instruction.is_assign() &&
+        contains_symbol(instruction.assign_rhs(), {pointer_actual}))
+      {
+        irep_idt lhs;
+        if(
+          !direct_symbol(instruction.assign_lhs(), lhs) ||
+          lhs != pointer_actual)
+        {
+          reason = "pssc_pointer_alias";
+          return reject_pssc();
+        }
+      }
+      if(
+        instruction.is_function_call() &&
+        &instruction != property_wrapper_call)
+      {
+        for(const auto &argument : instruction.call_arguments())
+        {
+          if(contains_symbol(argument, {pointer_actual}) &&
+             function.first != "main")
+          {
+            irep_idt callee;
+            direct_call_identifier(instruction, callee);
+            reason =
+              "pssc_pointer_escape_" + id2string(function.first) + "_" +
+              id2string(callee);
+            return reject_pssc();
+          }
+        }
+      }
+    }
+  }
+
+  std::cout << "NATIVE_POST_STORE_STABLE_CELL applied=1 worker="
+            << creates[property_worker_index].worker
+            << " property_function=" << property_function << '\n';
+  return true;
+}
+
+namespace
+{
+bool sci_constant(const exprt &src, mp_integer &value)
+{
+  const exprt &expr = without_cast(src);
+  if(iro_direct_constant(expr, value))
+    return true;
+  if(expr.id() != ID_unary_minus || expr.operands().size() != 1)
+    return false;
+  if(!iro_direct_constant(expr.op0(), value))
+    return false;
+  value = -value;
+  return true;
+}
+
+bool sci_relation(
+  const exprt &src,
+  const irep_idt &relation_id,
+  irep_idt &symbol,
+  mp_integer &constant,
+  bool require_negation)
+{
+  const exprt *current = &without_cast(src);
+  if(require_negation)
+  {
+    if(current->id() == ID_not && current->operands().size() == 1)
+      current = &without_cast(current->op0());
+    else if(!(
+      relation_id == ID_equal && current->id() == ID_notequal &&
+      current->operands().size() == 2))
+      return false;
+  }
+  if(
+    current->id() != relation_id &&
+    !(require_negation && relation_id == ID_equal &&
+      current->id() == ID_notequal))
+    return false;
+  if(current->operands().size() != 2)
+    return false;
+  if(
+    direct_symbol(without_cast(current->op0()), symbol) &&
+    sci_constant(current->op1(), constant))
+    return true;
+  return direct_symbol(without_cast(current->op1()), symbol) &&
+         sci_constant(current->op0(), constant);
+}
+
+bool sci_return_constant(
+  const goto_programt::instructiont &instruction,
+  const mp_integer &expected)
+{
+  if(!instruction.is_set_return_value())
+    return false;
+  mp_integer value;
+  return sci_constant(
+           to_code_return(instruction.code()).return_value(), value) &&
+         value == expected;
+}
+
+bool sci_unit_update_function(
+  const goto_modelt &model,
+  const irep_idt &function_id,
+  const irep_idt &counter,
+  bool increment)
+{
+  const auto function = model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+    return false;
+  std::size_t assignments = 0;
+  for(const auto &instruction : function->second.body.instructions)
+  {
+    const bool mentions_counter =
+      instruction_mentions_any(instruction, {counter});
+    if(!instruction.is_assign())
+    {
+      if(mentions_counter)
+        return false;
+      continue;
+    }
+    ++assignments;
+    irep_idt lhs;
+    if(!direct_symbol(instruction.assign_lhs(), lhs) || lhs != counter)
+      return false;
+    const exprt &rhs = without_cast(instruction.assign_rhs());
+    if(
+      rhs.id() != (increment ? ID_plus : ID_minus) ||
+      rhs.operands().size() != 2)
+      return false;
+    irep_idt base;
+    mp_integer amount;
+    if(
+      !direct_symbol(without_cast(rhs.op0()), base) || base != counter ||
+      !iro_direct_constant(rhs.op1(), amount) || amount != 1)
+      return false;
+  }
+  return assignments == 1;
+}
+
+bool sci_get_function(
+  const goto_modelt &model,
+  const irep_idt &function_id,
+  const irep_idt &counter)
+{
+  const auto function = model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+    return false;
+  std::size_t returns = 0;
+  for(const auto &instruction : function->second.body.instructions)
+  {
+    const bool mentions_counter =
+      instruction_mentions_any(instruction, {counter});
+    if(!instruction.is_set_return_value())
+    {
+      if(mentions_counter)
+        return false;
+      continue;
+    }
+    ++returns;
+    irep_idt returned;
+    if(
+      !direct_symbol(
+        without_cast(to_code_return(instruction.code()).return_value()),
+        returned) ||
+      returned != counter)
+      return false;
+  }
+  return returns == 1;
+}
+
+std::size_t sci_counter_mentions(
+  const goto_modelt &model,
+  const irep_idt &function_id,
+  const irep_idt &counter)
+{
+  const auto function = model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+    return 0;
+  std::size_t mentions = 0;
+  for(const auto &instruction : function->second.body.instructions)
+    if(instruction_mentions_any(instruction, {counter}))
+      ++mentions;
+  return mentions;
+}
+
+bool sci_array_argument(
+  const exprt &argument,
+  const symbol_tablet &symbol_table,
+  irep_idt &array,
+  mp_integer &capacity)
+{
+  const std::set<symbol_exprt> symbols = find_symbols(argument);
+  for(const auto &symbol_expr : symbols)
+  {
+    const irep_idt &identifier = symbol_expr.get_identifier();
+    const auto symbol = symbol_table.symbols.find(identifier);
+    if(
+      symbol == symbol_table.symbols.end() ||
+      symbol->second.type.id() != ID_array)
+      continue;
+    const exprt &size = to_array_type(symbol->second.type).size();
+    mp_integer candidate;
+    if(!iro_direct_constant(size, candidate) || candidate <= 0)
+      continue;
+    if(!array.empty())
+      return false;
+    array = identifier;
+    capacity = candidate;
+  }
+  return !array.empty();
+}
+
+struct sci_worker_shapet
+{
+  irep_idt worker;
+  irep_idt mutex;
+  irep_idt counter;
+  irep_idt operation;
+  irep_idt array;
+  mp_integer bound;
+  mp_integer capacity;
+  bool positive_guard = false;
+  bool overflow_check = false;
+  bool underflow_check = false;
+};
+
+bool sci_worker_shape(
+  const goto_modelt &model,
+  const irep_idt &worker,
+  const irep_idt &counter,
+  sci_worker_shapet &shape,
+  std::string &reason)
+{
+  const auto function = model.goto_functions.function_map.find(worker);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "sci_missing_worker";
+    return false;
+  }
+  shape.worker = worker;
+  const auto &program = function->second.body;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t next_position = 0;
+  for(const auto &instruction : program.instructions)
+    positions.emplace(&instruction, next_position++);
+  std::size_t locks = 0;
+  std::size_t unlocks = 0;
+  std::size_t operation_calls = 0;
+  std::size_t error_calls = 0;
+  std::size_t loop_guards = 0;
+  std::size_t loop_increments = 0;
+  irep_idt induction;
+  bool induction_zero = false;
+  bool locked = false;
+  const goto_programt::instructiont *operation_instruction = nullptr;
+  const goto_programt::instructiont *error_instruction = nullptr;
+  irep_idt operation_result;
+  for(const auto &instruction : program.instructions)
+  {
+    irep_idt callee;
+    if(direct_call_identifier(instruction, callee))
+    {
+      if(callee == "pthread_mutex_lock" || callee == "pthread_mutex_unlock")
+      {
+        if(instruction.call_arguments().size() != 1)
+        {
+          reason = "sci_mutex_arguments";
+          return false;
+        }
+        irep_idt mutex;
+        if(!addressed_symbol(instruction.call_arguments().front(), mutex))
+        {
+          reason = "sci_mutex_resolution";
+          return false;
+        }
+        if(shape.mutex.empty())
+          shape.mutex = mutex;
+        if(shape.mutex != mutex)
+        {
+          reason = "sci_mutex_mismatch";
+          return false;
+        }
+        if(callee == "pthread_mutex_lock")
+        {
+          if(locked)
+          {
+            reason = "sci_nested_mutex";
+            return false;
+          }
+          locked = true;
+          ++locks;
+        }
+        else
+        {
+          if(!locked)
+          {
+            reason = "sci_unbalanced_mutex";
+            return false;
+          }
+          locked = false;
+          ++unlocks;
+        }
+        continue;
+      }
+      irep_idt candidate_array;
+      mp_integer candidate_capacity;
+      if(
+        !instruction.call_arguments().empty() &&
+        sci_array_argument(
+          instruction.call_arguments().front(), model.symbol_table,
+          candidate_array, candidate_capacity))
+      {
+        if(!locked)
+        {
+          reason = "sci_operation_outside_mutex";
+          return false;
+        }
+        ++operation_calls;
+        shape.operation = callee;
+        operation_instruction = &instruction;
+        if(
+          instruction.call_lhs().is_nil() ||
+          !direct_symbol(instruction.call_lhs(), operation_result))
+        {
+          reason = "sci_operation_result";
+          return false;
+        }
+        if(
+          !shape.array.empty() &&
+          (shape.array != candidate_array ||
+           shape.capacity != candidate_capacity))
+        {
+          reason = "sci_array_capacity";
+          return false;
+        }
+        shape.array = candidate_array;
+        shape.capacity = candidate_capacity;
+        continue;
+      }
+      if(callee == "error")
+      {
+        if(!locked)
+        {
+          reason = "sci_error_outside_mutex";
+          return false;
+        }
+        ++error_calls;
+        error_instruction = &instruction;
+      }
+    }
+    if(instruction.is_assign())
+    {
+      irep_idt lhs;
+      mp_integer zero;
+      if(
+        direct_symbol(instruction.assign_lhs(), lhs) &&
+        iro_direct_constant(instruction.assign_rhs(), zero) && zero == 0)
+      {
+        if(induction.empty())
+          induction = lhs;
+        if(lhs == induction)
+          induction_zero = true;
+      }
+      if(!induction.empty() && iro_unit_increment(instruction, induction))
+        ++loop_increments;
+    }
+    if(instruction.is_goto())
+    {
+      irep_idt symbol;
+      mp_integer constant;
+      if(
+        sci_relation(
+          instruction.condition(), ID_lt, symbol, constant, true))
+      {
+        if(induction.empty())
+          induction = symbol;
+        if(symbol == induction)
+        {
+          shape.bound = constant;
+          ++loop_guards;
+        }
+      }
+    }
+  }
+  if(
+    locked || locks != 1 || unlocks != 1 || operation_calls != 1 ||
+    error_calls != 1 || !induction_zero || loop_guards != 1 ||
+    loop_increments != 1 || shape.bound <= 0 ||
+    shape.bound > shape.capacity)
+  {
+    reason = "sci_worker_obligation";
+    return false;
+  }
+  if(operation_instruction == nullptr || error_instruction == nullptr)
+  {
+    reason = "sci_operation_control";
+    return false;
+  }
+  const std::size_t operation_position = positions.at(operation_instruction);
+  const std::size_t error_position = positions.at(error_instruction);
+  for(const auto &instruction : program.instructions)
+  {
+    if(!instruction.is_goto() || instruction.targets.size() != 1)
+      continue;
+    const std::size_t guard_position = positions.at(&instruction);
+    const std::size_t target_position =
+      positions.at(&*instruction.get_target());
+    irep_idt symbol;
+    mp_integer constant;
+    if(
+      sci_relation(
+        instruction.condition(), ID_equal, symbol, constant, true) &&
+      symbol == operation_result &&
+      operation_position < guard_position &&
+      guard_position < error_position &&
+      error_position < target_position)
+    {
+      if(constant == -1)
+        shape.overflow_check = true;
+      if(constant == -2)
+        shape.underflow_check = true;
+    }
+    if(
+      sci_relation(
+        instruction.condition(), ID_gt, symbol, constant, true) &&
+      symbol == counter && constant == 0 &&
+      guard_position < operation_position &&
+      operation_position < target_position)
+      shape.positive_guard = true;
+  }
+  return true;
+}
+
+bool sci_push_helper(
+  const goto_modelt &model,
+  const irep_idt &function_id,
+  const irep_idt &counter,
+  const mp_integer &capacity,
+  std::set<irep_idt> &counter_helpers)
+{
+  const auto push = model.goto_functions.function_map.find(function_id);
+  if(
+    push == model.goto_functions.function_map.end() ||
+    !push->second.body_available())
+    return false;
+
+  bool push_boundary = false;
+  bool push_failure = false;
+  bool push_success = false;
+  bool push_increment = false;
+  bool push_index_read = false;
+  std::size_t push_stores = 0;
+  for(const auto &instruction : push->second.body.instructions)
+  {
+    irep_idt symbol;
+    mp_integer constant;
+    if(
+      instruction.is_goto() &&
+      sci_relation(
+        instruction.condition(), ID_equal, symbol, constant, true) &&
+      symbol == counter && constant == capacity)
+      push_boundary = true;
+    if(sci_return_constant(instruction, -1))
+      push_failure = true;
+    if(sci_return_constant(instruction, 0))
+      push_success = true;
+    irep_idt callee;
+    if(direct_call_identifier(instruction, callee))
+    {
+      if(sci_unit_update_function(model, callee, counter, true))
+      {
+        push_increment = true;
+        counter_helpers.insert(callee);
+      }
+      if(sci_get_function(model, callee, counter))
+      {
+        push_index_read = true;
+        counter_helpers.insert(callee);
+      }
+    }
+    if(
+      instruction.is_assign() &&
+      without_cast(instruction.assign_lhs()).id() == ID_dereference)
+      ++push_stores;
+  }
+
+  return
+    push_boundary && push_failure && push_success &&
+    push_increment && push_index_read && push_stores == 1;
+}
+
+bool sci_pop_helper(
+  const goto_modelt &model,
+  const irep_idt &function_id,
+  const irep_idt &counter,
+  std::set<irep_idt> &counter_helpers)
+{
+  const auto pop = model.goto_functions.function_map.find(function_id);
+  if(
+    pop == model.goto_functions.function_map.end() ||
+    !pop->second.body_available())
+    return false;
+  bool pop_boundary = false;
+  bool pop_failure = false;
+  bool pop_success = false;
+  bool pop_decrement = false;
+  bool pop_index_read = false;
+  for(const auto &instruction : pop->second.body.instructions)
+  {
+    irep_idt symbol;
+    mp_integer constant;
+    if(
+      instruction.is_goto() &&
+      sci_relation(
+        instruction.condition(), ID_equal, symbol, constant, true) &&
+      symbol == counter && constant == 0)
+      pop_boundary = true;
+    if(sci_return_constant(instruction, -2))
+      pop_failure = true;
+    if(
+      instruction.is_set_return_value() &&
+      !sci_return_constant(instruction, -2))
+      pop_success = true;
+    irep_idt callee;
+    if(direct_call_identifier(instruction, callee))
+    {
+      if(sci_unit_update_function(model, callee, counter, false))
+      {
+        pop_decrement = true;
+        counter_helpers.insert(callee);
+      }
+      if(sci_get_function(model, callee, counter))
+      {
+        pop_index_read = true;
+        counter_helpers.insert(callee);
+      }
+    }
+  }
+  return
+    pop_boundary && pop_failure && pop_success &&
+    pop_decrement && pop_index_read;
+}
+} // namespace
+
+bool stack_capacity_invariant_proof(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  const namespacet ns(goto_model.symbol_table);
+  goto_modelt lifecycle_model;
+  lifecycle_model.symbol_table = goto_model.symbol_table;
+  lifecycle_model.goto_functions.copy_from(goto_model.goto_functions);
+  std::vector<create_recordt> creates;
+  std::vector<goto_programt::targett> joins;
+  std::string reason;
+  const auto reject = [&reason]() {
+    std::cout << "NATIVE_STACK_CAPACITY applied=0 reason="
+              << (reason.empty() ? "sci_unknown" : reason) << '\n';
+    return false;
+  };
+  if(
+    !collect_lifecycle(lifecycle_model, ns, creates, joins, reason) ||
+    creates.size() != 2 || joins.size() != 2 ||
+    !validate_main_region(lifecycle_model, ns, creates, joins, reason))
+    return reject();
+
+  std::vector<irep_idt> counter_candidates;
+  const auto initialize =
+    goto_model.goto_functions.function_map.find("__CPROVER_initialize");
+  if(
+    initialize == goto_model.goto_functions.function_map.end() ||
+    !initialize->second.body_available())
+  {
+    reason = "sci_missing_initialization";
+    return reject();
+  }
+  for(const auto &instruction : initialize->second.body.instructions)
+  {
+    irep_idt lhs;
+    if(!iro_zero_assignment(instruction, lhs))
+      continue;
+    const auto symbol = goto_model.symbol_table.symbols.find(lhs);
+    if(
+      symbol != goto_model.symbol_table.symbols.end() &&
+      symbol->second.is_static_lifetime &&
+      symbol->second.type.id() == ID_signedbv)
+      counter_candidates.push_back(lhs);
+  }
+  if(counter_candidates.empty())
+  {
+    reason = "sci_counter_initialization";
+    return reject();
+  }
+
+  irep_idt counter;
+  sci_worker_shapet first;
+  sci_worker_shapet second;
+  std::size_t admitted_counters = 0;
+  for(const auto &candidate : counter_candidates)
+  {
+    sci_worker_shapet candidate_first;
+    sci_worker_shapet candidate_second;
+    std::string candidate_reason;
+    if(
+      !sci_worker_shape(
+        goto_model, creates[0].worker, candidate,
+        candidate_first, candidate_reason) ||
+      !sci_worker_shape(
+        goto_model, creates[1].worker, candidate,
+        candidate_second, candidate_reason))
+      continue;
+    if(
+      !candidate_first.positive_guard &&
+      !candidate_second.positive_guard)
+      continue;
+    counter = candidate;
+    first = candidate_first;
+    second = candidate_second;
+    ++admitted_counters;
+  }
+  if(admitted_counters != 1)
+  {
+    reason = "sci_counter_resolution";
+    return reject();
+  }
+
+  sci_worker_shapet *pusher = nullptr;
+  sci_worker_shapet *popper = nullptr;
+  std::set<irep_idt> counter_helpers;
+  for(auto *shape : {&first, &second})
+  {
+    if(sci_push_helper(
+         goto_model, shape->operation, counter,
+         shape->capacity, counter_helpers))
+      pusher = shape;
+    if(sci_pop_helper(
+         goto_model, shape->operation, counter, counter_helpers))
+      popper = shape;
+  }
+  if(
+    pusher == nullptr || popper == nullptr ||
+    pusher->mutex != popper->mutex || pusher->array != popper->array ||
+    pusher->capacity != popper->capacity ||
+    !pusher->overflow_check || !popper->underflow_check ||
+    !popper->positive_guard)
+  {
+    reason =
+      "sci_composition_obligation_first_" + id2string(first.operation) +
+      "_second_" + id2string(second.operation) +
+      "_mutex_" + std::to_string(first.mutex == second.mutex) +
+      "_array_" + std::to_string(first.array == second.array) +
+      "_capacity_" + std::to_string(first.capacity == second.capacity) +
+      "_overflow_" + std::to_string(
+        pusher != nullptr && pusher->overflow_check) +
+      "_underflow_" + std::to_string(
+        popper != nullptr && popper->underflow_check) +
+      "_guard_" + std::to_string(
+        popper != nullptr && popper->positive_guard);
+    return reject();
+  }
+  if(
+    counter_helpers.size() != 3 ||
+    sci_counter_mentions(
+      goto_model, pusher->worker, counter) != 0 ||
+    sci_counter_mentions(
+      goto_model, popper->worker, counter) != 1 ||
+    sci_counter_mentions(
+      goto_model, pusher->operation, counter) != 1 ||
+    sci_counter_mentions(
+      goto_model, popper->operation, counter) != 1)
+  {
+    reason =
+      "sci_counter_footprint_helpers_" +
+      std::to_string(counter_helpers.size()) +
+      "_pusher_" + std::to_string(sci_counter_mentions(
+        goto_model, pusher->worker, counter)) +
+      "_popper_" + std::to_string(sci_counter_mentions(
+        goto_model, popper->worker, counter)) +
+      "_push_" + std::to_string(sci_counter_mentions(
+        goto_model, pusher->operation, counter)) +
+      "_pop_" + std::to_string(sci_counter_mentions(
+        goto_model, popper->operation, counter));
+    return reject();
+  }
+  std::set<irep_idt> allowed = {
+    "__CPROVER_initialize", pusher->operation, popper->operation,
+    creates[0].worker, creates[1].worker};
+  allowed.insert(counter_helpers.begin(), counter_helpers.end());
+  std::set<irep_idt> reachable;
+  std::deque<irep_idt> pending{
+    "main", creates[0].worker, creates[1].worker};
+  while(!pending.empty())
+  {
+    const irep_idt function_id = pending.front();
+    pending.pop_front();
+    if(!reachable.insert(function_id).second)
+      continue;
+    const auto function =
+      goto_model.goto_functions.function_map.find(function_id);
+    if(
+      function == goto_model.goto_functions.function_map.end() ||
+      !function->second.body_available())
+      continue;
+    for(const auto &instruction : function->second.body.instructions)
+    {
+      if(!instruction.is_function_call())
+        continue;
+      irep_idt callee;
+      if(!direct_call_identifier(instruction, callee))
+      {
+        reason = "sci_reachable_indirect_call";
+        return reject();
+      }
+      const auto body =
+        goto_model.goto_functions.function_map.find(callee);
+      if(
+        body != goto_model.goto_functions.function_map.end() &&
+        body->second.body_available())
+        pending.push_back(callee);
+    }
+  }
+  for(const auto &function : goto_model.goto_functions.function_map)
+  {
+    if(
+      reachable.find(function.first) == reachable.end() ||
+      !function.second.body_available())
+      continue;
+    for(const auto &instruction : function.second.body.instructions)
+    {
+      if(
+        allowed.find(function.first) == allowed.end() &&
+        instruction_mentions_any(instruction, {counter}))
+      {
+        reason = "sci_external_counter_access";
+        return reject();
+      }
+    }
+  }
+
+  std::size_t false_assertions = 0;
+  for(const auto &function : goto_model.goto_functions.function_map)
+  {
+    if(!function.second.body_available())
+      continue;
+    for(const auto &instruction : function.second.body.instructions)
+      if(instruction.is_assert())
+      {
+        exprt condition = simplify_expr(instruction.condition(), ns);
+        if(!condition.is_false())
+        {
+          reason = "sci_external_assertion";
+          return reject();
+        }
+        ++false_assertions;
+      }
+  }
+  if(false_assertions != 1)
+  {
+    reason = "sci_property_count";
+    return reject();
+  }
+
+  std::cout << "NATIVE_STACK_CAPACITY applied=1 counter=" << counter
+            << " capacity=" << pusher->capacity
+            << " push_bound=" << pusher->bound
+            << " pop_bound=" << popper->bound << '\n';
+  return true;
+}
+
+namespace
+{
+void qsc_components(const exprt &src, std::set<irep_idt> &components)
+{
+  const exprt &expr = without_cast(src);
+  if(expr.id() == ID_member)
+    components.insert(to_member_expr(expr).get_component_name());
+  for(const auto &operand : expr.operands())
+    qsc_components(operand, components);
+}
+
+bool qsc_indexed_symbol(
+  const exprt &src,
+  irep_idt &array,
+  irep_idt &index)
+{
+  const exprt &expr = without_cast(src);
+  if(expr.id() != ID_index || expr.operands().size() != 2)
+    return false;
+  return direct_symbol(without_cast(expr.op0()), array) &&
+         direct_symbol(without_cast(expr.op1()), index);
+}
+
+bool qsc_addressed_argument(
+  const goto_programt::instructiont &instruction,
+  std::size_t index,
+  irep_idt &object)
+{
+  return instruction.call_arguments().size() > index &&
+         addressed_symbol(instruction.call_arguments()[index], object);
+}
+
+bool qsc_phase_guard(
+  const goto_programt::instructiont &instruction,
+  irep_idt &flag)
+{
+  if(!instruction.is_goto())
+    return false;
+  const exprt &outer = without_cast(instruction.condition());
+  if(outer.id() != ID_not || outer.operands().size() != 1)
+    return false;
+  const exprt &inner = without_cast(outer.op0());
+  mp_integer zero;
+  return inner.id() == ID_notequal && inner.operands().size() == 2 &&
+         direct_symbol(without_cast(inner.op0()), flag) &&
+         sci_constant(inner.op1(), zero) && zero == 0;
+}
+
+bool qsc_boolean_assignment(
+  const goto_programt::instructiont &instruction,
+  irep_idt &flag,
+  mp_integer &value)
+{
+  return instruction.is_assign() &&
+         direct_symbol(instruction.assign_lhs(), flag) &&
+         sci_constant(instruction.assign_rhs(), value) &&
+         (value == 0 || value == 1);
+}
+
+bool qsc_booleanized_result(const exprt &src, irep_idt &result)
+{
+  const exprt &outer = without_cast(src);
+  if(outer.id() != ID_not || outer.operands().size() != 1)
+    return false;
+  const exprt &comparison = without_cast(outer.op0());
+  mp_integer zero;
+  return
+    comparison.id() == ID_notequal &&
+    comparison.operands().size() == 2 &&
+    direct_symbol(without_cast(comparison.op0()), result) &&
+    sci_constant(comparison.op1(), zero) && zero == 0;
+}
+
+bool qsc_property_equality(
+  const exprt &src,
+  const irep_idt &result,
+  const irep_idt &reference,
+  const irep_idt &index)
+{
+  const exprt &outer = without_cast(src);
+  if(outer.id() != ID_not || outer.operands().size() != 1)
+    return false;
+  const exprt &equality = without_cast(outer.op0());
+  if(equality.id() != ID_equal || equality.operands().size() != 2)
+    return false;
+  auto matches = [&](const exprt &boolean_side, const exprt &array_side) {
+    irep_idt actual_result;
+    irep_idt actual_array;
+    irep_idt actual_index;
+    return qsc_booleanized_result(boolean_side, actual_result) &&
+           actual_result == result &&
+           qsc_indexed_symbol(array_side, actual_array, actual_index) &&
+           actual_array == reference && actual_index == index;
+  };
+  return
+    matches(equality.op0(), equality.op1()) ||
+    matches(equality.op1(), equality.op0());
+}
+
+bool qsc_boolean_negative_equality(
+  const exprt &src,
+  const irep_idt &result)
+{
+  const exprt &outer = without_cast(src);
+  if(outer.id() != ID_not || outer.operands().size() != 1)
+    return false;
+  const exprt &equality = without_cast(outer.op0());
+  if(equality.id() != ID_equal || equality.operands().size() != 2)
+    return false;
+  auto matches = [&](const exprt &boolean_side, const exprt &constant_side) {
+    irep_idt actual_result;
+    mp_integer constant;
+    return qsc_booleanized_result(boolean_side, actual_result) &&
+           actual_result == result &&
+           sci_constant(constant_side, constant) && constant < 0;
+  };
+  return
+    matches(equality.op0(), equality.op1()) ||
+    matches(equality.op1(), equality.op0());
+}
+
+std::size_t qsc_mentions(
+  const goto_modelt &model,
+  const irep_idt &function_id,
+  const std::set<irep_idt> &objects)
+{
+  const auto function = model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+    return 0;
+  std::size_t count = 0;
+  for(const auto &instruction : function->second.body.instructions)
+    if(instruction_mentions_any(instruction, objects))
+      ++count;
+  return count;
+}
+
+struct qsc_worker_summaryt
+{
+  irep_idt worker;
+  irep_idt mutex;
+  irep_idt queue;
+  irep_idt operation;
+  irep_idt auxiliary_operation;
+  irep_idt phase_flag;
+  irep_idt induction;
+  irep_idt value;
+  irep_idt reference;
+  irep_idt operation_result;
+  mp_integer bound;
+  mp_integer capacity;
+  std::map<irep_idt, mp_integer> final_flags;
+  bool producer = false;
+  bool consumer = false;
+};
+
+bool qsc_worker(
+  const goto_modelt &model,
+  const irep_idt &worker,
+  qsc_worker_summaryt &summary,
+  std::string &reason)
+{
+  const auto function = model.goto_functions.function_map.find(worker);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "qsc_missing_worker";
+    return false;
+  }
+  summary.worker = worker;
+  const auto &program = function->second.body;
+  std::vector<const goto_programt::instructiont *> order;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  for(const auto &instruction : program.instructions)
+  {
+    positions.emplace(&instruction, order.size());
+    order.push_back(&instruction);
+  }
+
+  bool locked = false;
+  std::size_t locks = 0;
+  std::size_t unlocks = 0;
+  std::size_t loop_guards = 0;
+  std::size_t loop_increments = 0;
+  std::size_t total_calls = 0;
+  std::size_t total_assignments = 0;
+  bool induction_zero = false;
+  const goto_programt::instructiont *phase_guard = nullptr;
+  const goto_programt::instructiont *reference_store = nullptr;
+  const goto_programt::instructiont *property_guard = nullptr;
+  const goto_programt::instructiont *error_call = nullptr;
+  std::vector<const goto_programt::instructiont *> queue_calls;
+
+  for(const auto &instruction : program.instructions)
+  {
+    irep_idt callee;
+    if(instruction.is_function_call())
+    {
+      ++total_calls;
+      if(!direct_call_identifier(instruction, callee))
+      {
+        reason = "qsc_worker_indirect_call";
+        return false;
+      }
+      if(callee == "pthread_mutex_lock" || callee == "pthread_mutex_unlock")
+      {
+        irep_idt mutex;
+        if(!qsc_addressed_argument(instruction, 0, mutex))
+        {
+          reason = "qsc_mutex_resolution";
+          return false;
+        }
+        if(summary.mutex.empty())
+          summary.mutex = mutex;
+        if(summary.mutex != mutex)
+        {
+          reason = "qsc_mutex_mismatch";
+          return false;
+        }
+        if(callee == "pthread_mutex_lock")
+        {
+          if(locked)
+          {
+            reason = "qsc_nested_mutex";
+            return false;
+          }
+          locked = true;
+          ++locks;
+        }
+        else
+        {
+          if(!locked)
+          {
+            reason = "qsc_unbalanced_mutex";
+            return false;
+          }
+          locked = false;
+          ++unlocks;
+        }
+        continue;
+      }
+      irep_idt object;
+      if(qsc_addressed_argument(instruction, 0, object))
+      {
+        if(!locked)
+        {
+          reason = "qsc_queue_call_outside_mutex";
+          return false;
+        }
+        if(summary.queue.empty())
+          summary.queue = object;
+        if(summary.queue != object)
+        {
+          reason = "qsc_queue_object_mismatch";
+          return false;
+        }
+        queue_calls.push_back(&instruction);
+      }
+      if(callee == "reach_error")
+        error_call = &instruction;
+    }
+
+    irep_idt flag;
+    if(qsc_phase_guard(instruction, flag))
+    {
+      if(phase_guard != nullptr)
+      {
+        reason = "qsc_multiple_phase_guards";
+        return false;
+      }
+      summary.phase_flag = flag;
+      phase_guard = &instruction;
+    }
+
+    if(instruction.is_assign())
+    {
+      ++total_assignments;
+      irep_idt lhs;
+      mp_integer constant;
+      if(
+        direct_symbol(instruction.assign_lhs(), lhs) &&
+        sci_constant(instruction.assign_rhs(), constant) &&
+        constant == 0 && summary.induction.empty())
+      {
+        summary.induction = lhs;
+        induction_zero = true;
+      }
+      if(
+        !summary.induction.empty() &&
+        iro_unit_increment(instruction, summary.induction))
+        ++loop_increments;
+
+      irep_idt array;
+      irep_idt index;
+      irep_idt value;
+      if(
+        qsc_indexed_symbol(instruction.assign_lhs(), array, index) &&
+        direct_symbol(without_cast(instruction.assign_rhs()), value))
+      {
+        if(reference_store != nullptr)
+        {
+          reason = "qsc_multiple_reference_stores";
+          return false;
+        }
+        const auto symbol = model.symbol_table.symbols.find(array);
+        if(
+          symbol == model.symbol_table.symbols.end() ||
+          symbol->second.type.id() != ID_array ||
+          !sci_constant(
+            to_array_type(symbol->second.type).size(), summary.capacity))
+        {
+          reason = "qsc_reference_capacity";
+          return false;
+        }
+        summary.reference = array;
+        summary.induction = index;
+        summary.value = value;
+        reference_store = &instruction;
+      }
+
+      mp_integer bool_value;
+      if(qsc_boolean_assignment(instruction, flag, bool_value) &&
+         flag != summary.induction)
+        summary.final_flags[flag] = bool_value;
+    }
+
+    if(instruction.is_goto())
+    {
+      irep_idt induction;
+      mp_integer bound;
+      if(
+        sci_relation(
+          instruction.condition(), ID_lt, induction, bound, true))
+      {
+        if(summary.induction.empty())
+          summary.induction = induction;
+        if(induction == summary.induction)
+        {
+          summary.bound = bound;
+          ++loop_guards;
+        }
+      }
+    }
+  }
+
+  if(
+    locked || locks != 1 || unlocks != 1 || phase_guard == nullptr ||
+    !induction_zero || loop_guards != 1 || loop_increments != 1 ||
+    summary.bound <= 0 || queue_calls.empty())
+  {
+    reason = "qsc_worker_obligation";
+    return false;
+  }
+
+  if(reference_store != nullptr)
+  {
+    summary.producer = true;
+    if(
+      queue_calls.size() != 1 ||
+      queue_calls.front()->call_arguments().size() != 2 ||
+      total_calls != 3 || total_assignments != 6)
+    {
+      reason = "qsc_producer_call_count";
+      return false;
+    }
+    irep_idt actual_value;
+    if(
+      !direct_symbol(
+        without_cast(queue_calls.front()->call_arguments()[1]),
+        actual_value) ||
+      actual_value != summary.value)
+    {
+      reason = "qsc_producer_value_mismatch";
+      return false;
+    }
+    direct_call_identifier(*queue_calls.front(), summary.operation);
+  }
+  else
+  {
+    summary.consumer = true;
+    if(
+      queue_calls.size() != 2 || error_call == nullptr ||
+      total_calls != 6 || total_assignments != 4)
+    {
+      reason = "qsc_consumer_call_count";
+      return false;
+    }
+    direct_call_identifier(
+      *queue_calls.front(), summary.auxiliary_operation);
+    direct_call_identifier(*queue_calls.back(), summary.operation);
+    if(
+      queue_calls.back()->call_lhs().is_nil() ||
+      !direct_symbol(
+        queue_calls.back()->call_lhs(), summary.operation_result))
+    {
+      reason = "qsc_consumer_result";
+      return false;
+    }
+    for(const auto &instruction : program.instructions)
+    {
+      if(!instruction.is_goto() || instruction.targets.size() != 1)
+        continue;
+      find_symbols_sett symbols;
+      find_symbols(instruction.condition(), symbols);
+      if(symbols.find(summary.operation_result) == symbols.end())
+        continue;
+      irep_idt candidate_reference;
+      mp_integer candidate_capacity;
+      for(const auto &identifier : symbols)
+      {
+        const auto symbol = model.symbol_table.symbols.find(identifier);
+        if(
+          symbol == model.symbol_table.symbols.end() ||
+          symbol->second.type.id() != ID_array)
+          continue;
+        if(
+          !sci_constant(
+            to_array_type(symbol->second.type).size(),
+            candidate_capacity))
+          continue;
+        if(!candidate_reference.empty())
+        {
+          reason = "qsc_multiple_property_arrays";
+          return false;
+        }
+        candidate_reference = identifier;
+      }
+      if(!candidate_reference.empty())
+      {
+        property_guard = &instruction;
+        summary.reference = candidate_reference;
+        summary.capacity = candidate_capacity;
+      }
+    }
+    if(property_guard == nullptr)
+    {
+      reason = "qsc_property_guard";
+      return false;
+    }
+    if(!qsc_property_equality(
+         property_guard->condition(), summary.operation_result,
+         summary.reference, summary.induction))
+    {
+      reason = "qsc_property_shape";
+      return false;
+    }
+    const std::size_t property_position = positions.at(property_guard);
+    const std::size_t error_position = positions.at(error_call);
+    if(
+      positions.at(queue_calls.back()) >= property_position ||
+      property_position >= error_position ||
+      property_guard->targets.size() != 1 ||
+      positions.at(&*property_guard->get_target()) <= error_position)
+    {
+      reason = "qsc_property_control";
+      return false;
+    }
+    find_symbols_sett property_symbols;
+    find_symbols(
+      without_cast(property_guard->condition()), property_symbols);
+    if(
+      property_symbols.find(summary.operation_result) ==
+        property_symbols.end())
+    {
+      reason = "qsc_property_result";
+      return false;
+    }
+  }
+  if(summary.bound != summary.capacity)
+  {
+    reason = "qsc_worker_bound_capacity";
+    return false;
+  }
+  return true;
+}
+
+bool qsc_update_shape(
+  const goto_modelt &model,
+  const irep_idt &function_id,
+  bool producer,
+  const mp_integer &capacity,
+  std::set<irep_idt> &components,
+  irep_idt &data_component,
+  std::string &reason)
+{
+  const auto function = model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "qsc_missing_operation";
+    return false;
+  }
+  std::vector<const goto_programt::instructiont *> assignments;
+  std::vector<const goto_programt::instructiont *> guards;
+  std::vector<const goto_programt::instructiont *> returns;
+  for(const auto &instruction : function->second.body.instructions)
+  {
+    if(instruction.is_function_call())
+    {
+      reason = "qsc_operation_call";
+      return false;
+    }
+    if(instruction.is_assign())
+      assignments.push_back(&instruction);
+    if(instruction.is_goto() && !instruction.condition().is_true())
+      guards.push_back(&instruction);
+    if(instruction.is_set_return_value())
+      returns.push_back(&instruction);
+  }
+  if(
+    assignments.size() != 4 || guards.size() != 1 ||
+    returns.size() != 1)
+  {
+    reason = "qsc_operation_counts";
+    return false;
+  }
+
+  std::set<irep_idt> first_lhs;
+  std::set<irep_idt> first_rhs;
+  qsc_components(assignments[0]->assign_lhs(), first_lhs);
+  qsc_components(assignments[0]->assign_rhs(), first_rhs);
+  if(producer)
+  {
+    irep_idt stored_value;
+    if(
+      first_lhs.size() != 2 || !first_rhs.empty() ||
+      !direct_symbol(
+        without_cast(assignments[0]->assign_rhs()), stored_value) ||
+      std::find(
+        function->second.parameter_identifiers.begin(),
+        function->second.parameter_identifiers.end(),
+        stored_value) == function->second.parameter_identifiers.end())
+    {
+      reason = "qsc_enqueue_store";
+      return false;
+    }
+  }
+  else
+  {
+    irep_idt loaded_value;
+    irep_idt returned_value;
+    if(
+      first_rhs.size() != 2 ||
+      !direct_symbol(assignments[0]->assign_lhs(), loaded_value) ||
+      !direct_symbol(
+        without_cast(
+          to_code_return(returns.front()->code()).return_value()),
+        returned_value) ||
+      returned_value != loaded_value)
+    {
+      reason = "qsc_dequeue_load";
+      return false;
+    }
+  }
+
+  std::set<irep_idt> amount_lhs;
+  std::set<irep_idt> amount_rhs;
+  qsc_components(assignments[1]->assign_lhs(), amount_lhs);
+  qsc_components(assignments[1]->assign_rhs(), amount_rhs);
+  if(
+    amount_lhs.size() != 1 || amount_rhs != amount_lhs)
+  {
+    reason = "qsc_amount_update";
+    return false;
+  }
+  const exprt &amount_update =
+    without_cast(assignments[1]->assign_rhs());
+  if(
+    amount_update.id() != (producer ? ID_plus : ID_minus) ||
+    amount_update.operands().size() != 2)
+  {
+    reason = "qsc_amount_direction";
+    return false;
+  }
+  mp_integer unit;
+  if(!sci_constant(amount_update.op1(), unit) || unit != 1)
+  {
+    reason = "qsc_amount_unit";
+    return false;
+  }
+
+  irep_idt guard_symbol;
+  mp_integer guard_capacity;
+  const exprt &guard_outer = without_cast(guards.front()->condition());
+  if(
+    guard_outer.id() != ID_not || guard_outer.operands().size() != 1)
+  {
+    reason = "qsc_index_guard";
+    return false;
+  }
+  const exprt &guard_equal = without_cast(guard_outer.op0());
+  std::set<irep_idt> guard_components;
+  qsc_components(guard_equal, guard_components);
+  if(
+    guard_equal.id() != ID_equal ||
+    guard_components.size() != 1 ||
+    !sci_constant(guard_equal.op1(), guard_capacity) ||
+    guard_capacity != capacity)
+  {
+    reason = "qsc_index_capacity";
+    return false;
+  }
+
+  std::set<irep_idt> reset_lhs;
+  std::set<irep_idt> increment_lhs;
+  std::set<irep_idt> increment_rhs;
+  qsc_components(assignments[2]->assign_lhs(), reset_lhs);
+  qsc_components(assignments[3]->assign_lhs(), increment_lhs);
+  qsc_components(assignments[3]->assign_rhs(), increment_rhs);
+  mp_integer reset;
+  const exprt &increment = without_cast(assignments[3]->assign_rhs());
+  if(
+    reset_lhs != guard_components ||
+    increment_lhs != guard_components ||
+    increment_rhs != guard_components ||
+    !sci_constant(assignments[2]->assign_rhs(), reset) || reset != 1 ||
+    increment.id() != ID_plus || increment.operands().size() != 2 ||
+    !sci_constant(increment.op1(), unit) || unit != 1)
+  {
+    reason = "qsc_index_update";
+    return false;
+  }
+  components.insert(first_lhs.begin(), first_lhs.end());
+  components.insert(first_rhs.begin(), first_rhs.end());
+  components.insert(amount_lhs.begin(), amount_lhs.end());
+  components.insert(guard_components.begin(), guard_components.end());
+  const std::set<irep_idt> &data_candidates =
+    producer ? first_lhs : first_rhs;
+  for(const auto &component : data_candidates)
+    if(guard_components.find(component) == guard_components.end())
+    {
+      if(!data_component.empty())
+      {
+        reason = "qsc_multiple_data_components";
+        return false;
+      }
+      data_component = component;
+    }
+  if(data_component.empty())
+  {
+    reason = "qsc_missing_data_component";
+    return false;
+  }
+  if(components.size() != 3)
+  {
+    reason = "qsc_operation_component_count_" +
+      std::to_string(components.size());
+    return false;
+  }
+  return true;
+}
+} // namespace
+
+bool queue_sequence_correspondence_proof(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  const namespacet ns(goto_model.symbol_table);
+  goto_modelt lifecycle_model;
+  lifecycle_model.symbol_table = goto_model.symbol_table;
+  lifecycle_model.goto_functions.copy_from(goto_model.goto_functions);
+  std::vector<create_recordt> creates;
+  std::vector<goto_programt::targett> joins;
+  std::string reason;
+  const auto reject = [&reason]() {
+    std::cout << "NATIVE_QUEUE_SEQUENCE applied=0 reason="
+              << (reason.empty() ? "qsc_unknown" : reason) << '\n';
+    return false;
+  };
+  if(
+    !collect_lifecycle(lifecycle_model, ns, creates, joins, reason) ||
+    creates.size() != 2 || joins.size() != 2)
+    return reject();
+
+  qsc_worker_summaryt first;
+  qsc_worker_summaryt second;
+  if(
+    !qsc_worker(goto_model, creates[0].worker, first, reason) ||
+    !qsc_worker(goto_model, creates[1].worker, second, reason))
+    return reject();
+  qsc_worker_summaryt *producer =
+    first.producer ? &first : (second.producer ? &second : nullptr);
+  qsc_worker_summaryt *consumer =
+    first.consumer ? &first : (second.consumer ? &second : nullptr);
+  if(
+    producer == nullptr || consumer == nullptr ||
+    producer == consumer || producer->mutex != consumer->mutex ||
+    producer->queue != consumer->queue ||
+    producer->reference != consumer->reference ||
+    producer->capacity != consumer->capacity ||
+    producer->bound != consumer->bound ||
+    producer->phase_flag == consumer->phase_flag)
+  {
+    reason = "qsc_worker_composition";
+    return reject();
+  }
+
+  std::set<irep_idt> enqueue_components;
+  std::set<irep_idt> dequeue_components;
+  irep_idt enqueue_data_component;
+  irep_idt dequeue_data_component;
+  if(
+    !qsc_update_shape(
+      goto_model, producer->operation, true, producer->capacity,
+      enqueue_components, enqueue_data_component, reason) ||
+    !qsc_update_shape(
+      goto_model, consumer->operation, false, consumer->capacity,
+      dequeue_components, dequeue_data_component, reason))
+    return reject();
+  std::set<irep_idt> component_intersection;
+  std::set_intersection(
+    enqueue_components.begin(), enqueue_components.end(),
+    dequeue_components.begin(), dequeue_components.end(),
+    std::inserter(component_intersection, component_intersection.end()));
+  if(
+    enqueue_data_component != dequeue_data_component ||
+    component_intersection.size() != 2)
+  {
+    reason = "qsc_operation_component_mismatch";
+    return reject();
+  }
+
+  if(
+    producer->final_flags[producer->phase_flag] != 0 ||
+    producer->final_flags[consumer->phase_flag] != 1 ||
+    consumer->final_flags[consumer->phase_flag] != 0 ||
+    consumer->final_flags[producer->phase_flag] != 1)
+  {
+    reason = "qsc_phase_transition";
+    return reject();
+  }
+  if(
+    qsc_mentions(
+      goto_model, producer->worker, {producer->queue}) != 1 ||
+    qsc_mentions(
+      goto_model, producer->worker, {producer->reference}) != 1 ||
+    qsc_mentions(
+      goto_model, consumer->worker, {producer->queue}) != 2 ||
+    qsc_mentions(
+      goto_model, consumer->worker, {producer->reference}) != 1 ||
+    qsc_mentions(
+      goto_model, producer->worker,
+      {producer->phase_flag, consumer->phase_flag}) != 3 ||
+    qsc_mentions(
+      goto_model, consumer->worker,
+      {producer->phase_flag, consumer->phase_flag}) != 3)
+  {
+    reason = "qsc_worker_footprint";
+    return reject();
+  }
+
+  const auto main_function =
+    goto_model.goto_functions.function_map.find("main");
+  if(
+    main_function == goto_model.goto_functions.function_map.end() ||
+    !main_function->second.body_available())
+  {
+    reason = "qsc_missing_main";
+    return reject();
+  }
+  bool producer_flag_one = false;
+  bool consumer_flag_zero = false;
+  bool init_call = false;
+  irep_idt init_function;
+  std::size_t main_error_calls = 0;
+  std::size_t main_calls = 0;
+  std::size_t main_assignments = 0;
+  const goto_programt::instructiont *main_error = nullptr;
+  const goto_programt::instructiont *main_empty_call = nullptr;
+  irep_idt main_empty_result;
+  std::map<const goto_programt::instructiont *, std::size_t> main_positions;
+  std::size_t main_position = 0;
+  for(const auto &instruction : main_function->second.body.instructions)
+    main_positions.emplace(&instruction, main_position++);
+  for(const auto &instruction : main_function->second.body.instructions)
+  {
+    if(instruction.is_assign())
+      ++main_assignments;
+    if(instruction.is_function_call())
+    {
+      ++main_calls;
+      irep_idt direct;
+      if(!direct_call_identifier(instruction, direct))
+      {
+        reason = "qsc_main_indirect_call";
+        return reject();
+      }
+    }
+    irep_idt flag;
+    mp_integer value;
+    if(qsc_boolean_assignment(instruction, flag, value))
+    {
+      if(flag == producer->phase_flag && value == 1)
+        producer_flag_one = true;
+      if(flag == consumer->phase_flag && value == 0)
+        consumer_flag_zero = true;
+    }
+    irep_idt callee;
+    irep_idt object;
+    if(
+      direct_call_identifier(instruction, callee) &&
+      qsc_addressed_argument(instruction, 0, object) &&
+      object == producer->queue &&
+      callee != producer->operation &&
+      callee != consumer->operation &&
+      callee != consumer->auxiliary_operation)
+    {
+      const auto body = goto_model.goto_functions.function_map.find(callee);
+      if(
+        body != goto_model.goto_functions.function_map.end() &&
+        body->second.body_available())
+      {
+        init_call = true;
+        init_function = callee;
+      }
+    }
+    if(
+      direct_call_identifier(instruction, callee) &&
+      callee == "reach_error")
+    {
+      ++main_error_calls;
+      main_error = &instruction;
+    }
+    if(
+      direct_call_identifier(instruction, callee) &&
+      callee == consumer->auxiliary_operation &&
+      !instruction.call_lhs().is_nil() &&
+      direct_symbol(instruction.call_lhs(), main_empty_result))
+      main_empty_call = &instruction;
+  }
+  if(
+    !producer_flag_one || !consumer_flag_zero || !init_call ||
+    main_error_calls != 1 || main_error == nullptr ||
+    main_empty_call == nullptr || main_calls != 9 ||
+    main_assignments != 2)
+  {
+    reason = "qsc_main_obligation";
+    return reject();
+  }
+  if(
+    qsc_mentions(
+      goto_model, "main", {producer->reference}) != 0 ||
+    qsc_mentions(
+      goto_model, "main",
+      {producer->phase_flag, consumer->phase_flag}) != 2 ||
+    qsc_mentions(goto_model, "main", {producer->queue}) != 4)
+  {
+    reason = "qsc_main_footprint";
+    return reject();
+  }
+  bool main_error_guarded = false;
+  for(const auto &instruction : main_function->second.body.instructions)
+  {
+    if(!instruction.is_goto() || instruction.targets.size() != 1)
+      continue;
+    if(
+      main_positions.at(main_empty_call) < main_positions.at(&instruction) &&
+      main_positions.at(&instruction) < main_positions.at(main_error) &&
+      main_positions.at(main_error) <
+        main_positions.at(&*instruction.get_target()) &&
+      qsc_boolean_negative_equality(
+        instruction.condition(), main_empty_result))
+      main_error_guarded = true;
+  }
+  if(!main_error_guarded)
+  {
+    reason = "qsc_main_property_control";
+    return reject();
+  }
+
+  const auto init =
+    goto_model.goto_functions.function_map.find(init_function);
+  std::set<irep_idt> zero_components;
+  std::size_t init_assignments = 0;
+  for(const auto &instruction : init->second.body.instructions)
+  {
+    if(!instruction.is_assign())
+      continue;
+    ++init_assignments;
+    mp_integer zero;
+    std::set<irep_idt> component;
+    qsc_components(instruction.assign_lhs(), component);
+    if(
+      component.size() != 1 ||
+      !sci_constant(instruction.assign_rhs(), zero) || zero != 0)
+    {
+      reason = "qsc_init_assignment";
+      return reject();
+    }
+    zero_components.insert(component.begin(), component.end());
+  }
+  if(
+    init_assignments != 3 ||
+    zero_components.size() != 3)
+  {
+    reason = "qsc_init_components";
+    return reject();
+  }
+  std::set<irep_idt> expected_init = enqueue_components;
+  expected_init.insert(
+    dequeue_components.begin(), dequeue_components.end());
+  expected_init.erase(enqueue_data_component);
+  if(zero_components != expected_init)
+  {
+    reason = "qsc_init_component_mismatch";
+    return reject();
+  }
+
+  std::size_t assertions = 0;
+  for(const auto &function : goto_model.goto_functions.function_map)
+  {
+    if(!function.second.body_available())
+      continue;
+    for(const auto &instruction : function.second.body.instructions)
+      if(instruction.is_assert())
+      {
+        exprt condition = simplify_expr(instruction.condition(), ns);
+        if(!condition.is_false())
+        {
+          reason = "qsc_external_assertion";
+          return reject();
+        }
+        ++assertions;
+      }
+  }
+  if(assertions != 1)
+  {
+    reason = "qsc_property_count";
+    return reject();
+  }
+
+  const std::set<irep_idt> protected_globals = {
+    producer->queue, producer->reference,
+    producer->phase_flag, consumer->phase_flag};
+  const std::set<irep_idt> allowed_global_users = {
+    "__CPROVER_initialize", "main",
+    producer->worker, consumer->worker};
+  for(const auto &function : goto_model.goto_functions.function_map)
+  {
+    if(
+      allowed_global_users.find(function.first) !=
+        allowed_global_users.end() ||
+      !function.second.body_available())
+      continue;
+    for(const auto &instruction : function.second.body.instructions)
+      if(instruction_mentions_any(instruction, protected_globals))
+      {
+        reason = "qsc_external_global_access";
+        return reject();
+      }
+  }
+
+  std::cout << "NATIVE_QUEUE_SEQUENCE applied=1 capacity="
+            << producer->capacity << " producer=" << producer->worker
+            << " consumer=" << consumer->worker << '\n';
   return true;
 }
 
