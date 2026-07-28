@@ -2,6 +2,7 @@
 
 import sys
 import os
+import pathlib
 import re
 import time
 import atexit
@@ -80,6 +81,12 @@ def get_result(remove = True):
                     "NATIVE_INDEXED_LIFECYCLE_PREFIX "
                 )
                 or line.startswith(
+                    "NATIVE_NESTED_LAST_WRITER "
+                )
+                or line.startswith(
+                    "NATIVE_BOOLEAN_ATOMIC_LOCK_REGION "
+                )
+                or line.startswith(
                     "NATIVE_DORMANT_SPAWN_CUTOFF "
                 )
                 or line.startswith(
@@ -122,7 +129,12 @@ def try_large_limit_native_proof(program_path, flags):
     proof_args = (
         [deagle_exe_path, program_path]
         + shlex.split(flags)
-        + ["--show-properties"]
+        + [
+            "--native-pair-initialization-prefix",
+            "--unwind",
+            "2",
+            "--no-unwinding-assertions",
+        ]
     )
     proof_output = "deagle_tmp_large_limit_native_proof"
     try:
@@ -141,6 +153,14 @@ def try_large_limit_native_proof(program_path, flags):
     with open(proof_output, "r") as output:
         lines = output.readlines()
     accepted_markers = (
+        "NATIVE_BOOLEAN_ATOMIC_LOCK_REGION applied=1 ",
+        "NATIVE_NESTED_LAST_WRITER applied=1 ",
+        "NATIVE_MUTEX_ZERO_FIXEDPOINT applied=1 ",
+        "NATIVE_AGGREGATE_MEMBER_LOCK_ALIAS applied=1 ",
+        "NATIVE_RESOLVED_WORKER_ZERO_SUM applied=1 ",
+        "NATIVE_MONOTONE_CONDITION_WAIT applied=1 ",
+        "NATIVE_GUARDED_COMMON_MUTEX_ZERO_SUM applied=1 ",
+        "NATIVE_COMMON_MUTEX_ZERO_SUM applied=1 ",
         "NATIVE_RELATIONAL_BISIMULATION applied=1 ",
         "NATIVE_LOCK_RELATIONAL_AI applied=1 ",
     )
@@ -159,6 +179,24 @@ def try_large_limit_native_proof(program_path, flags):
     print(marker, end="")
     print("VERIFICATION SUCCESSFUL")
     return True
+
+
+def condition_wait_routing_candidate(program_path):
+    """Cheap routing only; the native implementation makes the proof decision."""
+    try:
+        source = pathlib.Path(program_path).read_text(
+            encoding="utf-8",
+            errors="ignore",
+        )
+    except OSError:
+        return False
+    required_tokens = (
+        "pthread_cond_wait",
+        "pthread_cond_broadcast",
+        "pthread_mutex_lock",
+        "pthread_mutex_unlock",
+    )
+    return all(token in source for token in required_tokens)
 
 
 def get_loop_info(
@@ -243,12 +281,17 @@ def get_loop_info(
 def try_large_unwind_counterexample_rescue(program_path, flags):
     print(
         "Trying unified native counterexample rescue "
-        "(pair 18 s, shallow 3+3 s)!",
+        "(native portfolio, up to 96 s)!",
         flush=True,
     )
+    rescue_flag_args = [
+        arg
+        for arg in shlex.split(flags)
+        if arg != "--refined-pointer-analysis"
+    ]
     rescue_args = (
         [deagle_exe_path, program_path]
-        + shlex.split(flags)
+        + rescue_flag_args
         + [
             "--unwind",
             "3",
@@ -261,7 +304,7 @@ def try_large_unwind_counterexample_rescue(program_path, flags):
                 rescue_args,
                 stdout=rescue_output,
                 stderr=subprocess.STDOUT,
-                timeout=26,
+                timeout=96,
                 check=False,
             )
     except subprocess.TimeoutExpired:
@@ -605,6 +648,13 @@ elif "valid-memsafety.prp" in property_path:
     flags += "--no-assertions --pointer-check --alloc-check --memory-leak-check"
 else:
     print("Unknown property: %s" % property_path)
+    sys.exit(0)
+
+if (
+    "unreach-call.prp" in property_path
+    and condition_wait_routing_candidate(program_path)
+    and try_large_limit_native_proof(program_path, flags)
+):
     sys.exit(0)
 
 cached_loop_info = None
