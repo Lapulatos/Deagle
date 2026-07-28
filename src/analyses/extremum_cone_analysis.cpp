@@ -19912,12 +19912,44 @@ bool relational_comparator_diagnostic(
   return true;
 }
 
+bool relational_comparator_relation_to_zero(
+  const exprt &src,
+  const irep_idt &relation,
+  irep_idt &result)
+{
+  const exprt &expr = strip(src);
+  return
+    expr.id() == relation &&
+    expr.operands().size() == 2 &&
+    symbol_id(expr.op0(), result) &&
+    value_is(expr.op1(), 0);
+}
+
+bool relational_comparator_same_boolean_relation(
+  const exprt &src,
+  const irep_idt &relation,
+  irep_idt &left_result,
+  irep_idt &right_result)
+{
+  const exprt &expr = strip(src);
+  if(
+    expr.id() != ID_equal ||
+    expr.operands().size() != 2)
+    return false;
+  return
+    relational_comparator_relation_to_zero(
+      expr.op0(), relation, left_result) &&
+    relational_comparator_relation_to_zero(
+      expr.op1(), relation, right_result);
+}
+
 bool relational_comparator_transitivity_property(
   const goto_modelt &model,
   const lifecyclet &life,
   const namespacet &ns,
   std::vector<irep_idt> &positive_results,
   irep_idt &nonpositive_result,
+  std::string &rule,
   const goto_programt::instructiont *&property,
   const goto_programt::instructiont *&error,
   std::string &reason)
@@ -19955,41 +19987,104 @@ bool relational_comparator_transitivity_property(
     strip(property->call_arguments().front());
   std::vector<exprt> terms;
   flatten_and(argument, terms);
-  if(terms.size() != 3)
+  bool parsed = false;
+  if(terms.size() == 3)
   {
-    reason = "transitivity_property_arity";
-    return false;
-  }
-  for(const auto &source_term : terms)
-  {
-    const exprt &term = strip(source_term);
-    irep_idt result;
-    if(
-      term.operands().size() != 2 ||
-      !symbol_id(term.op0(), result) ||
-      !value_is(term.op1(), 0))
+    bool valid = true;
+    for(const auto &source_term : terms)
     {
-      reason = "transitivity_property_term";
-      return false;
-    }
-    if(term.id() == ID_gt)
-      positive_results.push_back(result);
-    else if(term.id() == ID_le)
-    {
-      if(!nonpositive_result.empty())
+      const exprt &term = strip(source_term);
+      irep_idt result;
+      if(
+        term.operands().size() != 2 ||
+        !symbol_id(term.op0(), result) ||
+        !value_is(term.op1(), 0))
       {
-        reason = "transitivity_multiple_conclusions";
-        return false;
+        valid = false;
+        break;
       }
-      nonpositive_result = result;
+      if(term.id() == ID_gt)
+        positive_results.push_back(result);
+      else if(term.id() == ID_le)
+      {
+        if(!nonpositive_result.empty())
+        {
+          valid = false;
+          break;
+        }
+        nonpositive_result = result;
+      }
+      else
+      {
+        valid = false;
+        break;
+      }
     }
-    else
+    parsed =
+      valid &&
+      positive_results.size() == 2 &&
+      !nonpositive_result.empty();
+    if(parsed)
+      rule = "strict_transitivity";
+  }
+
+  if(!parsed)
+  {
+    positive_results.clear();
+    nonpositive_result.clear();
+    const exprt &outer = strip(argument);
+    if(
+      outer.id() == ID_not &&
+      outer.operands().size() == 1)
     {
-      reason = "transitivity_property_relation";
-      return false;
+      const exprt &disjunction = strip(outer.op0());
+      if(
+        disjunction.id() == ID_or &&
+        disjunction.operands().size() == 2)
+      {
+        const exprt &negated_equality =
+          strip(disjunction.op0());
+        const exprt &same_sign = strip(disjunction.op1());
+        irep_idt equal_result;
+        irep_idt positive_left;
+        irep_idt positive_right;
+        irep_idt negative_left;
+        irep_idt negative_right;
+        if(
+          negated_equality.id() == ID_not &&
+          negated_equality.operands().size() == 1 &&
+          relational_comparator_relation_to_zero(
+            negated_equality.op0(), ID_equal, equal_result) &&
+          same_sign.id() == ID_and &&
+          same_sign.operands().size() == 2 &&
+          relational_comparator_same_boolean_relation(
+            same_sign.op0(),
+            ID_gt,
+            positive_left,
+            positive_right) &&
+          relational_comparator_same_boolean_relation(
+            same_sign.op1(),
+            ID_lt,
+            negative_left,
+            negative_right) &&
+          positive_left == negative_left &&
+          positive_right == negative_right &&
+          positive_left != positive_right &&
+          equal_result != positive_left &&
+          equal_result != positive_right)
+        {
+          nonpositive_result = equal_result;
+          positive_results = {
+            positive_left, positive_right};
+          rule = "equality_substitution";
+          parsed = true;
+        }
+      }
     }
   }
+
   if(
+    !parsed ||
     positive_results.size() != 2 ||
     nonpositive_result.empty() ||
     positive_results[0] == positive_results[1] ||
@@ -21039,6 +21134,7 @@ bool relational_comparator_transitivity_diagnostic(
   std::size_t &validity_selectors,
   std::size_t &ordered_subtractions,
   std::size_t &missing_key_guards,
+  std::string &rule,
   std::string &reason)
 {
   lifecyclet life;
@@ -21064,6 +21160,7 @@ bool relational_comparator_transitivity_diagnostic(
       ns,
       positive_results,
       nonpositive_result,
+      rule,
       property,
       error,
       reason) ||
@@ -21082,6 +21179,30 @@ bool relational_comparator_transitivity_diagnostic(
       owned_results,
       reason))
     return false;
+  const auto is_positive_result =
+    [&](const irep_idt &result)
+    {
+      return
+        std::find(
+          positive_results.begin(),
+          positive_results.end(),
+          result) != positive_results.end();
+    };
+  const bool result_roles =
+    worker_results.size() == workers.size() &&
+    ((rule == "strict_transitivity" &&
+      is_positive_result(worker_results[0]) &&
+      is_positive_result(worker_results[1]) &&
+      worker_results[2] == nonpositive_result) ||
+     (rule == "equality_substitution" &&
+      worker_results[0] == nonpositive_result &&
+      is_positive_result(worker_results[1]) &&
+      is_positive_result(worker_results[2])));
+  if(!result_roles)
+  {
+    reason = "transitivity_result_role_order";
+    return false;
+  }
 
   std::vector<std::vector<relational_comparator_atomic_regiont>>
     summaries(workers.size());
@@ -21150,38 +21271,62 @@ bool relational_comparator_transitivity_diagnostic(
       return entry == mapping.forward.end() ?
         identifier : entry->second;
     };
-  for(const auto &identifier : reads)
+  const relational_bisimulation_mappingt *left_to_right_mapping =
+    nullptr;
+  for(std::size_t bridge_index = 0;
+      bridge_index < mappings.size(); ++bridge_index)
   {
-    if(writes.count(identifier) != 0)
-      continue;
-    const symbolt *symbol = lookup(identifier, ns);
-    if(symbol == nullptr || !symbol->is_static_lifetime)
-      continue;
-    const irep_idt first = mapped(mappings[0], identifier);
-    const irep_idt second = mapped(mappings[1], identifier);
-    if(second == identifier && first != identifier)
+    const std::size_t endpoint_index = 1 - bridge_index;
+    std::set<irep_idt> candidate_left_inputs;
+    std::set<irep_idt> candidate_right_inputs;
+    for(const auto &identifier : reads)
     {
-      const irep_idt first_middle =
-        mapped(mappings[0], first);
-      const irep_idt second_middle =
-        mapped(mappings[1], first);
+      if(writes.count(identifier) != 0)
+        continue;
+      const symbolt *symbol = lookup(identifier, ns);
       if(
-        first_middle == second_middle &&
-        first_middle != first)
+        symbol == nullptr ||
+        !symbol->is_static_lifetime)
+        continue;
+      const irep_idt bridge =
+        mapped(mappings[bridge_index], identifier);
+      const irep_idt endpoint =
+        mapped(mappings[endpoint_index], identifier);
+      if(endpoint == identifier && bridge != identifier)
       {
-        ++endpoint_input_symbols;
-        left_inputs.insert(identifier);
+        const irep_idt bridge_middle =
+          mapped(mappings[bridge_index], bridge);
+        const irep_idt endpoint_middle =
+          mapped(mappings[endpoint_index], bridge);
+        if(
+          bridge_middle == endpoint_middle &&
+          bridge_middle != bridge)
+          candidate_left_inputs.insert(identifier);
       }
+      else if(
+        bridge == endpoint &&
+        bridge != identifier)
+        candidate_right_inputs.insert(identifier);
     }
-    else if(
-      first == second &&
-      first != identifier)
+    if(
+      !candidate_left_inputs.empty() &&
+      candidate_left_inputs.size() ==
+        candidate_right_inputs.size())
     {
-      ++middle_input_symbols;
-      right_inputs.insert(identifier);
+      if(left_to_right_mapping != nullptr)
+      {
+        reason = "transitivity_ambiguous_input_triangle";
+        return false;
+      }
+      left_inputs = candidate_left_inputs;
+      right_inputs = candidate_right_inputs;
+      left_to_right_mapping = &mappings[bridge_index];
     }
   }
+  endpoint_input_symbols = left_inputs.size();
+  middle_input_symbols = right_inputs.size();
   if(
+    left_to_right_mapping == nullptr ||
     endpoint_input_symbols == 0 ||
     endpoint_input_symbols != middle_input_symbols)
   {
@@ -21196,7 +21341,7 @@ bool relational_comparator_transitivity_diagnostic(
       writes,
       left_inputs,
       right_inputs,
-      mappings[0],
+      *left_to_right_mapping,
       ns,
       unary_selectors,
       reason))
@@ -21208,7 +21353,7 @@ bool relational_comparator_transitivity_diagnostic(
       writes,
       left_inputs,
       right_inputs,
-      mappings[0],
+      *left_to_right_mapping,
       ns,
       validity_selectors,
       missing_key_guards,
@@ -21222,7 +21367,7 @@ bool relational_comparator_transitivity_diagnostic(
       writes,
       left_inputs,
       right_inputs,
-      mappings[0],
+      *left_to_right_mapping,
       ns,
       dominated_selectors,
       ordered_subtractions,
@@ -21355,6 +21500,7 @@ void relational_bisimulation_audit(
   std::size_t transitivity_validity_selectors = 0;
   std::size_t transitivity_ordered_subtractions = 0;
   std::size_t transitivity_missing_key_guards = 0;
+  std::string transitivity_rule;
   reason.clear();
   const bool transitivity =
     relational_comparator_transitivity_diagnostic(
@@ -21375,6 +21521,7 @@ void relational_bisimulation_audit(
       transitivity_validity_selectors,
       transitivity_ordered_subtractions,
       transitivity_missing_key_guards,
+      transitivity_rule,
       reason);
   std::cout
     << "NATIVE_RELATIONAL_TRANSITIVITY_DIAGNOSTIC candidate="
@@ -21400,6 +21547,8 @@ void relational_bisimulation_audit(
     << transitivity_ordered_subtractions
     << " missing_key_guards="
     << transitivity_missing_key_guards;
+  if(transitivity)
+    std::cout << " rule=" << transitivity_rule;
   if(!transitivity)
     std::cout << " reason=" << reason;
   std::cout << '\n';
@@ -21496,6 +21645,7 @@ bool relational_comparator_transitivity_proof(
   std::size_t transitivity_validity_selectors = 0;
   std::size_t transitivity_ordered_subtractions = 0;
   std::size_t transitivity_missing_key_guards = 0;
+  std::string transitivity_rule;
   if(
     relational_comparator_transitivity_diagnostic(
       goto_model,
@@ -21515,6 +21665,7 @@ bool relational_comparator_transitivity_proof(
       transitivity_validity_selectors,
       transitivity_ordered_subtractions,
       transitivity_missing_key_guards,
+      transitivity_rule,
       reason))
   {
     std::cout
@@ -21524,6 +21675,7 @@ bool relational_comparator_transitivity_proof(
       << " selectors=" << transitivity_unary_selectors
       << " validity=" << transitivity_validity_selectors
       << " subtractions=" << transitivity_ordered_subtractions
+      << " rule=" << transitivity_rule
       << '\n';
     return true;
   }
