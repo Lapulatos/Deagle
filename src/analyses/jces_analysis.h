@@ -225,21 +225,6 @@ bool local_loop_acceleration_transform(
   goto_modelt &goto_model,
   message_handlert &message_handler);
 
-/// Collapse exactly one marked pure spin loop to its first exiting
-/// observation. Every omitted iteration must contain one atomic load,
-/// local-only bookkeeping, and no shared effect.
-bool pure_spin_wait_collapse_transform(
-  goto_modelt &goto_model,
-  message_handlert &message_handler,
-  bool &empty_barrier_family,
-  bool &within_proof_budget);
-
-/// Apply the pure-spin transform only to models carrying the exact native
-/// compiler-barrier marker. Unsupported marked models terminate inconclusive.
-bool pure_spin_wait_dispatch(
-  goto_modelt &goto_model,
-  message_handlert &message_handler);
-
 /// Audit whether a joined nested loop of unit additions is equivalent to a
 /// joined loop that adds the runtime inner iteration count once.
 void nested_iteration_homomorphism_audit(
