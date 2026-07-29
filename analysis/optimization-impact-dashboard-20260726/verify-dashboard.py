@@ -838,6 +838,30 @@ assert "no other new wrong results" in v288["description"].lower()
 assert "byte-identical wrapper" in v288["description"].lower()
 assert "task93 remains unknown" in v288["description"].lower()
 
+v289 = next(row for row in DATA["rows"] if row["version"] == 289)
+assert v289["status"] == "failed"
+assert v289["scope"] == "exact725"
+assert v289["contribution_class"] == "native_redo"
+assert v289["metrics"]["correct"] == 703
+assert v289["metrics"]["cpu_s"] == 948.0651588590009
+assert v289["metrics"]["wall_s"] == 984.282939416822
+assert v289["metrics"]["memory_sum_b"] == 25412145152
+assert "not an execution of the original program" in v289["description"]
+assert "not committed or pushed" in v289["description"]
+
+v290 = next(row for row in DATA["rows"] if row["version"] == 290)
+assert v290["status"] == "successful"
+assert v290["scope"] == "exact725"
+assert v290["contribution_class"] == "native_redo"
+assert v290["metrics"]["correct"] == 704
+assert v290["metrics"]["cpu_s"] == 894.0097913300003
+assert v290["metrics"]["wall_s"] == 938.8530091892462
+assert v290["metrics"]["memory_sum_b"] == 26493808640
+assert v290["metrics"]["correct_vs_previous_success"] == 1
+assert "untransformed original goto model" in v290["description"].lower()
+assert "zero v288-correct losses" in v290["description"].lower()
+assert "wrapper is unchanged" in v290["description"].lower()
+
 timing_expected = {
     264: 3.121307483333333,
     265: 6.578901950000001,
@@ -859,6 +883,8 @@ timing_expected = {
     286: 16.789320416666667,
     287: 25.7,
     288: 19.4,
+    289: 41.37385373333333,
+    290: 213.93333333333334,
 }
 for version, duration in timing_expected.items():
     row = next(row for row in DATA["rows"] if row["version"] == version)
@@ -866,6 +892,8 @@ for version, duration in timing_expected.items():
     assert row["timing"]["duration_minutes"] == duration
     assert row["timing"]["start_iso"]
     assert row["timing"]["end_iso"]
+assert v289["timing"]["start_epoch_s"] > v288["timing"]["end_epoch_s"]
+assert v290["timing"]["start_epoch_s"] > v289["timing"]["end_epoch_s"]
 
 
 with sync_playwright() as playwright:
@@ -881,9 +909,9 @@ with sync_playwright() as playwright:
     page.goto(HTML.as_uri())
     page.wait_for_load_state("networkidle")
 
-    assert "V1–V288" in page.title()
-    assert page.locator("#rangeMax").get_attribute("max") == "288"
-    assert page.locator("#rangeMax").input_value() == "288"
+    assert "V1–V290" in page.title()
+    assert page.locator("#rangeMax").get_attribute("max") == "290"
+    assert page.locator("#rangeMax").input_value() == "290"
     for version, correct in (
         (259, 687), (260, 688), (261, 689), (262, 690), (263, 691),
         (266, 692), (267, 694), (268, 695), (270, 696),
@@ -905,6 +933,10 @@ with sync_playwright() as playwright:
     assert "702" in page.locator("#row-287").inner_text()
     assert "成功" in page.locator("#row-288").inner_text()
     assert "703" in page.locator("#row-288").inner_text()
+    assert "失败" in page.locator("#row-289").inner_text()
+    assert "703" in page.locator("#row-289").inner_text()
+    assert "成功" in page.locator("#row-290").inner_text()
+    assert "704" in page.locator("#row-290").inner_text()
     assert page.locator(".point[data-version='258']").count() >= 1
     assert "686" in page.locator("#row-258").inner_text()
     for version in (256, 257):
@@ -912,8 +944,8 @@ with sync_playwright() as playwright:
         assert "685" in page.locator(f"#row-{version}").inner_text()
     assert page.locator(".point[data-version='254']").count() >= 1
     assert page.locator("#chart .point").count() >= 200
-    # One header, Baseline, and V1--V288.
-    assert page.locator("#ledger .ledger-row").count() == 290
+    # One header, Baseline, and V1--V290.
+    assert page.locator("#ledger .ledger-row").count() == 292
     for version, duration_text in (
         (264, "3.12 min"),
         (265, "6.58 min"),
@@ -935,6 +967,8 @@ with sync_playwright() as playwright:
         (286, "16.79 min"),
         (287, "25.7 min"),
         (288, "19.4 min"),
+        (289, "41.37 min"),
+        (290, "213.93 min"),
     ):
         row_text = page.locator(f"#row-{version}").inner_text()
         assert "时间不可确定" not in row_text

@@ -39,8 +39,8 @@ failed, and audit-only versions.
 
 ## Status
 
-**Updated through V287.** The dashboard has 288 embedded data rows (baseline
-plus V1–V287). V256–V257 are successful rows for one
+**Updated through V290.** The dashboard has 291 embedded data rows (baseline
+plus V1–V290). V256–V257 are successful rows for one
 consolidated native redo endpoint: both display adjudicated coverage 685 and
 the shared gain is not accumulated twice. V258–V263 are successful native-redo
 rows with verifier metrics and core chart points; their historical wrapper
@@ -56,6 +56,9 @@ V209 is marked failed because its post-run source audit invalidated the
 declared ablation. V210 repeats the experiment with one audited binary:
 GOTO-only retains both V207 proofs, but reduces predicates on only one task and
 therefore does not reach natural8 or exact725.
+V289 is preserved as a failed native projection attempt; its source was not
+published. V290 records the accepted original-GOTO guided replay and uses
+strictly increasing V288–V290 development windows.
 V211 tests cyclic GOTO seeds, retains one proof with fewer predicates, but
 loses the other proof because an acyclic branch is essential.
 V212 tests assertion-symbol overlap and loses both proofs because the lowered
@@ -121,6 +124,11 @@ verification passed all metric, comparison, duration, tooltip, search,
 row-count, and zero-console-error checks.
 
 ## Errors Encountered
+
+- The V290 isolated worktree does not materialize the local-only
+  `source-records/` archive, so the first dashboard rebuild stopped with
+  `ENOENT` before changing generated output. Rebuild uses a temporary read-only
+  link to the main worktree archive and removes that link after generation.
 
 - After V255 was added without exact725 metrics, the default x-axis sampling
   no longer rendered the literal `V254` tick label even though the V254 point

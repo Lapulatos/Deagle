@@ -701,6 +701,8 @@ const methodOverrides = {
   286: "Single Pointer-Spin Collapse",
   287: "Pointer-Exception Scoped Spin Collapse",
   288: "Single-Worker Initialization Counterexample",
+  289: "Shortened-Trace Projection Attempt",
+  290: "Original-GOTO Guided Replay",
 };
 
 const statusOverrides = {
@@ -921,6 +923,8 @@ const statusOverrides = {
   286: "failed",
   287: "successful",
   288: "successful",
+  289: "failed",
+  290: "successful",
 };
 
 // These versions changed only the Python wrapper and left the production C++
@@ -932,7 +936,7 @@ const wrapperEvidenceVersions = new Set([
 ]);
 const nativeRedoVersions = new Set([
   256, 257, 258, 259, 260, 261, 262, 263, 266, 267, 268, 270, 271,
-  281, 282, 283, 284, 285, 286, 287, 288,
+  281, 282, 283, 284, 285, 286, 287, 288, 289, 290,
 ]);
 const nativeRedoMemorySources = {
   256: "/data3/sujie/experiments/native-redo-v256-v263-20260728/v256/full-v256-native-depth-results/full-v256-native.2026-07-27_17-26-19.results.v255-conserved-sum.Concurrency.xml.bz2",
@@ -956,6 +960,8 @@ const nativeRedoMemorySources = {
   286: "/data3/sujie/experiments/v286-single-pointer-spin-exact725-r1/results/exact725.2026-07-29_12-35-01.results.accepted-native-integration-exact725.Concurrency.xml.bz2",
   287: "/data3/sujie/experiments/v287-pointer-exception-scope-exact725-r1/results/exact725.2026-07-29_12-55-14.results.accepted-native-integration-exact725.Concurrency.xml.bz2",
   288: "/data3/sujie/experiments/v288-native-single-worker-exact725-r1/results/exact725.2026-07-29_13-34-25.results.accepted-native-integration-exact725.Concurrency.xml.bz2",
+  289: "/data3/sujie/experiments/v289-evilcollapse-exact725-r1/results/exact725.2026-07-29_14-32-37.results.accepted-native-integration-exact725.Concurrency.xml.bz2",
+  290: "/data3/sujie/experiments/v290-original-goto-replay-exact725-r2/results/exact725.2026-07-29_18-15-31.results.accepted-native-integration-exact725.Concurrency.xml.bz2",
 };
 const wrapperMetricOverrides = {
   256: {
@@ -1131,6 +1137,8 @@ const exactOverrides = {
   286: { correct: 700, cpu: 871.2369108290002, wall: 915.1920141403098, peak: 3999997952 },
   287: { correct: 701, cpu: 866.534168323, wall: 910.8745472538285, peak: 3999997952 },
   288: { correct: 701, cpu: 865.0478599520001, wall: 908.7999609876424, peak: 3999997952 },
+  289: { correct: 701, cpu: 948.0651588590009, wall: 984.282939416822, peak: 3999641600 },
+  290: { correct: 701, cpu: 894.0097913300003, wall: 938.8530091892462, peak: 3999997952 },
 };
 
 // The public YAML for task82 is mechanically derived from a Goblint UNKNOWN
@@ -1192,6 +1200,8 @@ const adjudicatedCorrectOverrides = {
   286: 701,
   287: 702,
   288: 703,
+  289: 703,
+  290: 704,
 };
 
 // Sum of BenchExec's per-task `memory` column over all 725 tasks. These values
@@ -1321,6 +1331,8 @@ const memorySumOverrides = {
   286: 25666789376,
   287: 25625346048,
   288: 25715208192,
+  289: 25412145152,
+  290: 26493808640,
 };
 
 // Paired-memory reporting used several textual forms that are unsafe to parse
@@ -1374,17 +1386,25 @@ for (const directory of fs.readdirSync(recordsRoot)) {
   const full = path.join(recordsRoot, directory);
   if (!fs.statSync(full).isDirectory()) continue;
   const version = lastVersion(directory);
-  if (version === null || version < 1 || version > 288) continue;
+  if (version === null || version < 1 || version > 290) continue;
   if (!directoriesByVersion.has(version)) directoriesByVersion.set(version, []);
   directoriesByVersion.get(version).push(directory);
 }
-const localExperimentsRoot = path.join(repoRoot, "experiments");
-if (fs.existsSync(localExperimentsRoot)) {
+const localExperimentsRoots = [
+  path.join(repoRoot, "experiments"),
+  process.env.DEAGLE_SUPPLEMENTAL_EXPERIMENTS_ROOT,
+].filter(
+  (directory, index, roots) =>
+    directory &&
+    fs.existsSync(directory) &&
+    roots.indexOf(directory) === index
+);
+for (const localExperimentsRoot of localExperimentsRoots) {
   for (const directory of fs.readdirSync(localExperimentsRoot)) {
     const full = path.join(localExperimentsRoot, directory);
     if (!fs.statSync(full).isDirectory()) continue;
     const version = lastVersion(directory);
-    if (version === null || version < 1 || version > 288) continue;
+    if (version === null || version < 1 || version > 290) continue;
     if (!directoriesByVersion.has(version))
       directoriesByVersion.set(version, []);
     if (!directoriesByVersion.get(version).includes(directory))
@@ -1564,6 +1584,12 @@ directoriesByVersion.set(287, [
 directoriesByVersion.set(288, [
   "native-residual-v288-single-worker-20260729",
 ]);
+directoriesByVersion.set(289, [
+  "native-residual-v289-evilcollapse-20260729",
+]);
+directoriesByVersion.set(290, [
+  "native-witness-v290-20260729",
+]);
 
 const descriptionOverrides = {
   17: "Linear Reason Merge replaced repeated reason-vector unions. The targeted gate regressed CPU to 1.0044x, so the candidate was rejected.",
@@ -1667,9 +1693,33 @@ const descriptionOverrides = {
   286: "Native V286 tested a single-loop pointer-spin collapse in one deagle_exe with an unchanged wrapper. Prior90 remained 90/90 and cnalock changed from unknown to correct true, but accepted-V285 ticketlock regressed from correct true to unknown. Exact725 therefore remains 700 official / 701 adjudicated correct, with one old-correct loss and zero net coverage gain. CPU, summed wall, and summed memory change +1.147%, +1.008%, and +0.084% against V285. V286 fails the no-regression release gate; its source is not committed or pushed.",
   287: "Native V287 scopes the reservation-free pointer exception to exactly one marked spin loop while preserving V285's reservation and stuttering-retry proofs. One deagle_exe performs admission, proof, verdict, and witness generation; the byte-identical wrapper performs bounded routing and argument selection only. Exact725 reaches 701 official / 702 adjudicated correct, changing only libvsync/cnalock from unknown to correct true with zero V285-correct losses and zero new wrong results. Prior90 remains 90/90 and the 3,223-byte witness passes WitnessLint. CPU, summed wall, and summed memory change +0.601%, +0.532%, and -0.077% against V285.",
   288: "Native V288 derives two nested initialization domains and one homogeneous worker class from the GOTO model, retains domains 0 and 1, fully initializes the retained inner domain, and materializes one representative worker fixed to domain 1. One deagle_exe performs admission, counterexample search, verdict, and witness generation; the byte-identical wrapper performs bounded routing and argument selection only. Exact725 changes only expected-true 28-race_reach_91-arrayloop2_racefree from ERROR to false(unreach-call): official correct remains 701, while semantic adjudication rises from 702 to 703 because the source initializes a retained slot-1 node with nonzero datum and the worker's zero assertion is reachable. There are zero V287-correct losses and no other new wrong results; task93 remains unknown. Prior90 is 90/90, six premise-breaking mutations reject, and the 219,691-byte violation witness passes WitnessLint as a format gate. CPU, summed wall, and summed memory change -0.171%, -0.228%, and +0.351% against V287.",
+  289: "Native V289 relaxed one structural admission boundary and changed only task93 from ERROR to false(unreach-call), while Prior90 remained 90/90. The emitted GraphML still used the shortened outer-initialization projection and was not an execution of the original program, so the candidate failed the semantic witness gate. Its four-line source change was not committed or pushed. The displayed interval ends at the contemporaneous V288 control completion; later documentation mtimes are excluded so V290 begins strictly afterward.",
+  290: "Unified native V290 treats the reduced execution only as a guide, then processes and solves the untransformed original GOTO model inside the same deagle_exe. Verdict and GraphML come only from that second solve; replay fails closed on missing choices or property mismatch. Exact725 remains 701 official and rises from 703 to 704 adjudicated correct by changing only task93 from ERROR to false(unreach-call), with zero V288-correct losses and zero new genuine wrong results. Prior90 is 90/90. Aggregate CPU, wall, and summed memory change +3.35%, +3.31%, and +3.03% against V288. The wrapper is unchanged and production code contains no benchmark identifier, expected label, or target source-line condition.",
 };
 
 const timingOverrides = {
+  290: {
+    version: 290,
+    directory: "native-witness-v290-20260729",
+    available: true,
+    start_epoch_s: 1785336492,
+    end_epoch_s: 1785349328,
+    start_iso: "2026-07-29T14:48:12.000Z",
+    end_iso: "2026-07-29T18:22:08.000Z",
+    duration_minutes: 213.93333333333334,
+    evidence_kind: "candidate_worktree_birth_to_accepted_remote_commit",
+  },
+  289: {
+    version: 289,
+    directory: "native-residual-v289-evilcollapse-20260729",
+    available: true,
+    start_epoch_s: 1785333392,
+    end_epoch_s: 1785335874.431224,
+    start_iso: "2026-07-29T13:56:32.000Z",
+    end_iso: "2026-07-29T14:37:54.431Z",
+    duration_minutes: 41.37385373333333,
+    evidence_kind: "candidate_worktree_birth_to_contemporaneous_control_completion",
+  },
   288: {
     version: 288,
     directory: "native-residual-v288-single-worker-20260729",
@@ -2791,7 +2841,7 @@ const rows = [
   },
 ];
 
-for (let version = 1; version <= 288; ++version) {
+for (let version = 1; version <= 290; ++version) {
   const directories = directoriesByVersion.get(version) || [];
   const primary =
     preferredDirectories[version] ||
@@ -2828,16 +2878,19 @@ for (let version = 1; version <= 288; ++version) {
   }
   let conclusion = readIfExists(path.join(recordsRoot, primary, "conclusion.md"));
   let notes = readIfExists(path.join(recordsRoot, primary, "notes.md"));
-  const localCandidates = fs.existsSync(path.join(repoRoot, "experiments"))
-    ? fs
-        .readdirSync(path.join(repoRoot, "experiments"))
-        .filter((directory) => lastVersion(directory) === version)
-    : [];
+  const localCandidates = localExperimentsRoots.flatMap((root) =>
+    fs
+      .readdirSync(root)
+      .filter((directory) => lastVersion(directory) === version)
+  );
   if (localCandidates.length) {
     const localPrimary = localCandidates.includes(primary)
       ? primary
       : localCandidates[0];
-    const local = path.join(repoRoot, "experiments", localPrimary);
+    const localRoot = localExperimentsRoots.find((root) =>
+      fs.existsSync(path.join(root, localPrimary))
+    );
+    const local = path.join(localRoot, localPrimary);
     conclusion = readIfExists(path.join(local, "conclusion.md")) || conclusion;
     notes = readIfExists(path.join(local, "notes.md")) || notes;
   }

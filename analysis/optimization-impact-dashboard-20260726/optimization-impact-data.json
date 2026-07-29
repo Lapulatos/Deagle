@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-29T13:48:51.137Z",
+  "generated_at": "2026-07-29T18:26:27.952Z",
   "comparison_protocol": {
     "tasks": 725,
     "workers": 48,
@@ -14451,7 +14451,7 @@
       },
       "wrapper_metrics": null,
       "extracted_evidence": {
-        "correct": "- Accepted V285 exact result: 700 official / 701 adjudicated correct.",
+        "correct": "- Baseline: accepted V285, 700 official / 701 adjudicated correct.",
         "cpu": null,
         "wall": null,
         "peak_memory": null,
@@ -14498,7 +14498,7 @@
       },
       "wrapper_metrics": null,
       "extracted_evidence": {
-        "correct": "- Accepted baseline: V285, 700 official / 701 adjudicated correct.",
+        "correct": "`libvsync/cnalock.yml`, reaching 701 official / 702 adjudicated correct with",
         "cpu": null,
         "wall": null,
         "peak_memory": null,
@@ -14549,6 +14549,100 @@
         "cpu": null,
         "wall": null,
         "peak_memory": null,
+        "paired_memory": null
+      },
+      "exact_override": true,
+      "wrapper_exact_evidence": false
+    },
+    {
+      "version": 289,
+      "label": "V289",
+      "method": "Shortened-Trace Projection Attempt",
+      "status": "failed",
+      "scope": "exact725",
+      "contribution_class": "native_redo",
+      "description": "Native V289 relaxed one structural admission boundary and changed only task93 from ERROR to false(unreach-call), while Prior90 remained 90/90. The emitted GraphML still used the shortened outer-initialization projection and was not an execution of the original program, so the candidate failed the semantic witness gate. Its four-line source change was not committed or pushed. The displayed interval ends at the contemporaneous V288 control completion; later documentation mtimes are excluded so V290 begins strictly afterward.",
+      "source": "../../experiments/native-residual-v289-evilcollapse-20260729/conclusion.md",
+      "source_notes": "../../experiments/native-residual-v289-evilcollapse-20260729/notes.md",
+      "memory_sum_source": "/data3/sujie/experiments/v289-evilcollapse-exact725-r1/results/exact725.2026-07-29_14-32-37.results.accepted-native-integration-exact725.Concurrency.xml.bz2",
+      "timing": {
+        "version": 289,
+        "directory": "native-residual-v289-evilcollapse-20260729",
+        "available": true,
+        "start_epoch_s": 1785333392,
+        "end_epoch_s": 1785335874.431224,
+        "start_iso": "2026-07-29T13:56:32.000Z",
+        "end_iso": "2026-07-29T14:37:54.431Z",
+        "duration_minutes": 41.37385373333333,
+        "evidence_kind": "candidate_worktree_birth_to_contemporaneous_control_completion"
+      },
+      "metrics": {
+        "correct": 703,
+        "cpu_s": 948.0651588590009,
+        "wall_s": 984.282939416822,
+        "memory_sum_b": 25412145152,
+        "paired_memory_delta_pct": null,
+        "correct_vs_baseline": 259,
+        "cpu_vs_baseline_pct": -92.5567825554672,
+        "wall_vs_baseline_pct": -92.287500908608,
+        "memory_sum_vs_baseline_pct": -62.792801561612336,
+        "correct_vs_previous_success": 0,
+        "cpu_vs_previous_success_pct": 9.596844608298017,
+        "wall_vs_previous_success_pct": 8.305785835108104
+      },
+      "wrapper_metrics": null,
+      "extracted_evidence": {
+        "correct": null,
+        "cpu": null,
+        "wall": null,
+        "peak_memory": null,
+        "paired_memory": null
+      },
+      "exact_override": true,
+      "wrapper_exact_evidence": false
+    },
+    {
+      "version": 290,
+      "label": "V290",
+      "method": "Original-GOTO Guided Replay",
+      "status": "successful",
+      "scope": "exact725",
+      "contribution_class": "native_redo",
+      "description": "Unified native V290 treats the reduced execution only as a guide, then processes and solves the untransformed original GOTO model inside the same deagle_exe. Verdict and GraphML come only from that second solve; replay fails closed on missing choices or property mismatch. Exact725 remains 701 official and rises from 703 to 704 adjudicated correct by changing only task93 from ERROR to false(unreach-call), with zero V288-correct losses and zero new genuine wrong results. Prior90 is 90/90. Aggregate CPU, wall, and summed memory change +3.35%, +3.31%, and +3.03% against V288. The wrapper is unchanged and production code contains no benchmark identifier, expected label, or target source-line condition.",
+      "source": "../../experiments/native-witness-v290-20260729/conclusion.md",
+      "source_notes": "../../experiments/native-witness-v290-20260729/notes.md",
+      "memory_sum_source": "/data3/sujie/experiments/v290-original-goto-replay-exact725-r2/results/exact725.2026-07-29_18-15-31.results.accepted-native-integration-exact725.Concurrency.xml.bz2",
+      "timing": {
+        "version": 290,
+        "directory": "native-witness-v290-20260729",
+        "available": true,
+        "start_epoch_s": 1785336492,
+        "end_epoch_s": 1785349328,
+        "start_iso": "2026-07-29T14:48:12.000Z",
+        "end_iso": "2026-07-29T18:22:08.000Z",
+        "duration_minutes": 213.93333333333334,
+        "evidence_kind": "candidate_worktree_birth_to_accepted_remote_commit"
+      },
+      "metrics": {
+        "correct": 704,
+        "cpu_s": 894.0097913300003,
+        "wall_s": 938.8530091892462,
+        "memory_sum_b": 26493808640,
+        "paired_memory_delta_pct": null,
+        "correct_vs_baseline": 260,
+        "cpu_vs_baseline_pct": -92.98116884453482,
+        "wall_vs_baseline_pct": -92.64347405572946,
+        "memory_sum_vs_baseline_pct": -61.20908370541209,
+        "correct_vs_previous_success": 1,
+        "cpu_vs_previous_success_pct": 3.3480149155686423,
+        "wall_vs_previous_success_pct": 3.3068936500551205
+      },
+      "wrapper_metrics": null,
+      "extracted_evidence": {
+        "correct": null,
+        "cpu": null,
+        "wall": null,
+        "peak_memory": "938.853009189 seconds, and 26,493,808,640 bytes summed peak memory.",
         "paired_memory": null
       },
       "exact_override": true,
