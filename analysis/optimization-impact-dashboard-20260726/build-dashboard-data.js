@@ -698,6 +698,8 @@ const methodOverrides = {
   283: "Relational Comparator Substitution",
   284: "Unified Native Proof Portfolio",
   285: "Native Ticket Retry-Stuttering",
+  286: "Single Pointer-Spin Collapse",
+  287: "Pointer-Exception Scoped Spin Collapse",
 };
 
 const statusOverrides = {
@@ -915,6 +917,8 @@ const statusOverrides = {
   283: "successful",
   284: "successful",
   285: "successful",
+  286: "failed",
+  287: "successful",
 };
 
 // These versions changed only the Python wrapper and left the production C++
@@ -926,7 +930,7 @@ const wrapperEvidenceVersions = new Set([
 ]);
 const nativeRedoVersions = new Set([
   256, 257, 258, 259, 260, 261, 262, 263, 266, 267, 268, 270, 271,
-  281, 282, 283, 284, 285,
+  281, 282, 283, 284, 285, 286, 287,
 ]);
 const nativeRedoMemorySources = {
   256: "/data3/sujie/experiments/native-redo-v256-v263-20260728/v256/full-v256-native-depth-results/full-v256-native.2026-07-27_17-26-19.results.v255-conserved-sum.Concurrency.xml.bz2",
@@ -946,6 +950,9 @@ const nativeRedoMemorySources = {
   282: "../../experiments/relational-comparator-transitivity-v282-20260728/artifacts/full-v282.2026-07-28_15-37-06.results.v282-relational-comparator-transitivity.Concurrency.xml.bz2",
   283: "/data3/sujie/experiments/accepted-optimization-git-integration-20260728/exact725-v283-r40/exact725.2026-07-28_21-25-48.results.accepted-native-integration-exact725.Concurrency.xml.bz2",
   284: "/data3/sujie/experiments/v284-unified-exact725-r5/results/exact725.2026-07-29_06-24-17.results.accepted-native-integration-exact725.Concurrency.xml.bz2",
+  285: "/data3/sujie/experiments/v285-ticket-native-final-exact725-r1/results/exact725.2026-07-29_09-44-02.results.accepted-native-integration-exact725.Concurrency.xml.bz2",
+  286: "/data3/sujie/experiments/v286-single-pointer-spin-exact725-r1/results/exact725.2026-07-29_12-35-01.results.accepted-native-integration-exact725.Concurrency.xml.bz2",
+  287: "/data3/sujie/experiments/v287-pointer-exception-scope-exact725-r1/results/exact725.2026-07-29_12-55-14.results.accepted-native-integration-exact725.Concurrency.xml.bz2",
 };
 const wrapperMetricOverrides = {
   256: {
@@ -1118,6 +1125,8 @@ const exactOverrides = {
   283: { correct: 698, cpu: 919.289765, wall: 953.451938, peak: 3999997952 },
   284: { correct: 699, cpu: 859.041804128, wall: 903.4940643096343, peak: 3999997952 },
   285: { correct: 700, cpu: 861.356850191, wall: 906.056512353, peak: 3999997952 },
+  286: { correct: 700, cpu: 871.2369108290002, wall: 915.1920141403098, peak: 3999997952 },
+  287: { correct: 701, cpu: 866.534168323, wall: 910.8745472538285, peak: 3999997952 },
 };
 
 // The public YAML for task82 is mechanically derived from a Goblint UNKNOWN
@@ -1176,6 +1185,8 @@ const adjudicatedCorrectOverrides = {
   283: 699,
   284: 700,
   285: 701,
+  286: 701,
+  287: 702,
 };
 
 // Sum of BenchExec's per-task `memory` column over all 725 tasks. These values
@@ -1302,6 +1313,8 @@ const memorySumOverrides = {
   283: 25604014080,
   284: 25426169856,
   285: 25645174784,
+  286: 25666789376,
+  287: 25625346048,
 };
 
 // Paired-memory reporting used several textual forms that are unsafe to parse
@@ -1355,7 +1368,7 @@ for (const directory of fs.readdirSync(recordsRoot)) {
   const full = path.join(recordsRoot, directory);
   if (!fs.statSync(full).isDirectory()) continue;
   const version = lastVersion(directory);
-  if (version === null || version < 1 || version > 285) continue;
+  if (version === null || version < 1 || version > 287) continue;
   if (!directoriesByVersion.has(version)) directoriesByVersion.set(version, []);
   directoriesByVersion.get(version).push(directory);
 }
@@ -1365,7 +1378,7 @@ if (fs.existsSync(localExperimentsRoot)) {
     const full = path.join(localExperimentsRoot, directory);
     if (!fs.statSync(full).isDirectory()) continue;
     const version = lastVersion(directory);
-    if (version === null || version < 1 || version > 285) continue;
+    if (version === null || version < 1 || version > 287) continue;
     if (!directoriesByVersion.has(version))
       directoriesByVersion.set(version, []);
     if (!directoriesByVersion.get(version).includes(directory))
@@ -1536,6 +1549,12 @@ directoriesByVersion.set(284, [
 directoriesByVersion.set(285, [
   "native-residual-v285-20260729",
 ]);
+directoriesByVersion.set(286, [
+  "native-residual-v286-pointer-spin-20260729",
+]);
+directoriesByVersion.set(287, [
+  "native-residual-v287-pointer-scope-20260729",
+]);
 
 const descriptionOverrides = {
   17: "Linear Reason Merge replaced repeated reason-vector unions. The targeted gate regressed CPU to 1.0044x, so the candidate was rejected.",
@@ -1636,9 +1655,33 @@ const descriptionOverrides = {
   283: "Native comparator substitution preserves 698 official / 699 adjudicated correct with zero old-correct losses and zero new wrong results. Prior90 remains 90/90 and the native correctness witness passes WitnessLint. The displayed 335.43 minutes is the artifact-backed research-to-acceptance span: the server-side target and release gates are concentrated in 05:13:58–05:27:27, with an approximately 5 hour 20 minute gap after the initial local plan artifact. The final exact725 batch itself took about 99.6 seconds.",
   284: "Unified native V284 uses one deagle_exe and removes all three Python verdict-certificate modules. The wrapper performs bounded structural routing and argument selection only; Deagle performs admission, proof, verdict, and witness generation. Exact725 reaches 699 official / 700 adjudicated correct, adding only arraylock with zero old-correct losses and zero new wrong results. Final prior90 is 90/90 and the 3,227-byte witness passes WitnessLint. The displayed 539.56 minutes is a research-and-acceptance wall-clock span covering 156 experiment directories, solver-cliff root-cause work, native restoration of 33 certificate-dependent tasks, and all release gates; the final exact725 batch itself took 84.08 seconds and final prior90 took 9.52 seconds.",
   285: "Native V285 extends Deagle's pure-spin analysis with caller-path reservation dominance and a fail-closed inlined proof that every retrying iteration is shared-state stuttering. One deagle_exe performs admission, proof, verdict, and witness generation; the wrapper remains limited to bounded routing and argument selection. Exact725 reaches 700 official / 701 adjudicated correct, changing only libvsync/ticketlock from unknown to correct true with zero V284-correct losses and zero new wrong results. Prior90 remains 90/90, ticketlock and arraylock witnesses pass WitnessLint, and aggregate CPU, wall, and summed memory change -0.400%, -0.907%, and +0.947% against the contemporaneous V284 control. The displayed 183.42 minutes is the strictly post-V284 development-to-accepted-commit span; the earlier 08:55 relational-fold run is discarded.",
+  286: "Native V286 tested a single-loop pointer-spin collapse in one deagle_exe with an unchanged wrapper. Prior90 remained 90/90 and cnalock changed from unknown to correct true, but accepted-V285 ticketlock regressed from correct true to unknown. Exact725 therefore remains 700 official / 701 adjudicated correct, with one old-correct loss and zero net coverage gain. CPU, summed wall, and summed memory change +1.147%, +1.008%, and +0.084% against V285. V286 fails the no-regression release gate; its source is not committed or pushed.",
+  287: "Native V287 scopes the reservation-free pointer exception to exactly one marked spin loop while preserving V285's reservation and stuttering-retry proofs. One deagle_exe performs admission, proof, verdict, and witness generation; the byte-identical wrapper performs bounded routing and argument selection only. Exact725 reaches 701 official / 702 adjudicated correct, changing only libvsync/cnalock from unknown to correct true with zero V285-correct losses and zero new wrong results. Prior90 remains 90/90 and the 3,223-byte witness passes WitnessLint. CPU, summed wall, and summed memory change +0.601%, +0.532%, and -0.077% against V285.",
 };
 
 const timingOverrides = {
+  287: {
+    version: 287,
+    directory: "native-residual-v287-pointer-scope-20260729",
+    available: true,
+    start_epoch_s: 1785329142,
+    end_epoch_s: 1785330684,
+    start_iso: "2026-07-29T12:45:42.000Z",
+    end_iso: "2026-07-29T13:11:24.000Z",
+    duration_minutes: 25.7,
+    evidence_kind: "candidate_worktree_birth_to_release_gate_completion",
+  },
+  286: {
+    version: 286,
+    directory: "native-residual-v286-pointer-spin-20260729",
+    available: true,
+    start_epoch_s: 1785327577,
+    end_epoch_s: 1785328584.359225,
+    start_iso: "2026-07-29T12:19:37.000Z",
+    end_iso: "2026-07-29T12:36:24.359Z",
+    duration_minutes: 16.789320416666667,
+    evidence_kind: "candidate_worktree_birth_to_exact725_end",
+  },
   285: {
     version: 285,
     directory: "native-residual-v285-20260729",
@@ -2727,7 +2770,7 @@ const rows = [
   },
 ];
 
-for (let version = 1; version <= 285; ++version) {
+for (let version = 1; version <= 287; ++version) {
   const directories = directoriesByVersion.get(version) || [];
   const primary =
     preferredDirectories[version] ||

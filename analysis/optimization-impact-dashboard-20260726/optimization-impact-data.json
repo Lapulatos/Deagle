@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-29T09:54:06.454Z",
+  "generated_at": "2026-07-29T13:14:40.551Z",
   "comparison_protocol": {
     "tasks": 725,
     "workers": 48,
@@ -14376,6 +14376,7 @@
       "description": "Native V285 extends Deagle's pure-spin analysis with caller-path reservation dominance and a fail-closed inlined proof that every retrying iteration is shared-state stuttering. One deagle_exe performs admission, proof, verdict, and witness generation; the wrapper remains limited to bounded routing and argument selection. Exact725 reaches 700 official / 701 adjudicated correct, changing only libvsync/ticketlock from unknown to correct true with zero V284-correct losses and zero new wrong results. Prior90 remains 90/90, ticketlock and arraylock witnesses pass WitnessLint, and aggregate CPU, wall, and summed memory change -0.400%, -0.907%, and +0.947% against the contemporaneous V284 control. The displayed 183.42 minutes is the strictly post-V284 development-to-accepted-commit span; the earlier 08:55 relational-fold run is discarded.",
       "source": "../../experiments/native-residual-v285-20260729/conclusion.md",
       "source_notes": "../../experiments/native-residual-v285-20260729/notes.md",
+      "memory_sum_source": "/data3/sujie/experiments/v285-ticket-native-final-exact725-r1/results/exact725.2026-07-29_09-44-02.results.accepted-native-integration-exact725.Concurrency.xml.bz2",
       "timing": {
         "version": 285,
         "directory": "native-residual-v285-20260729",
@@ -14404,6 +14405,100 @@
       "wrapper_metrics": null,
       "extracted_evidence": {
         "correct": "700 official / 701 adjudicated correct.",
+        "cpu": null,
+        "wall": null,
+        "peak_memory": null,
+        "paired_memory": null
+      },
+      "exact_override": true,
+      "wrapper_exact_evidence": false
+    },
+    {
+      "version": 286,
+      "label": "V286",
+      "method": "Single Pointer-Spin Collapse",
+      "status": "failed",
+      "scope": "exact725",
+      "contribution_class": "native_redo",
+      "description": "Native V286 tested a single-loop pointer-spin collapse in one deagle_exe with an unchanged wrapper. Prior90 remained 90/90 and cnalock changed from unknown to correct true, but accepted-V285 ticketlock regressed from correct true to unknown. Exact725 therefore remains 700 official / 701 adjudicated correct, with one old-correct loss and zero net coverage gain. CPU, summed wall, and summed memory change +1.147%, +1.008%, and +0.084% against V285. V286 fails the no-regression release gate; its source is not committed or pushed.",
+      "source": "../../experiments/native-residual-v286-pointer-spin-20260729/conclusion.md",
+      "source_notes": "../../experiments/native-residual-v286-pointer-spin-20260729/notes.md",
+      "memory_sum_source": "/data3/sujie/experiments/v286-single-pointer-spin-exact725-r1/results/exact725.2026-07-29_12-35-01.results.accepted-native-integration-exact725.Concurrency.xml.bz2",
+      "timing": {
+        "version": 286,
+        "directory": "native-residual-v286-pointer-spin-20260729",
+        "available": true,
+        "start_epoch_s": 1785327577,
+        "end_epoch_s": 1785328584.359225,
+        "start_iso": "2026-07-29T12:19:37.000Z",
+        "end_iso": "2026-07-29T12:36:24.359Z",
+        "duration_minutes": 16.789320416666666,
+        "evidence_kind": "candidate_worktree_birth_to_exact725_end"
+      },
+      "metrics": {
+        "correct": 701,
+        "cpu_s": 871.2369108290002,
+        "wall_s": 915.1920141403098,
+        "memory_sum_b": 25666789376,
+        "paired_memory_delta_pct": null,
+        "correct_vs_baseline": 257,
+        "cpu_vs_baseline_pct": -93.15995771766597,
+        "wall_vs_baseline_pct": -92.82887339113243,
+        "memory_sum_vs_baseline_pct": -62.419964159776086,
+        "correct_vs_previous_success": 0,
+        "cpu_vs_previous_success_pct": 1.147034546228931,
+        "wall_vs_previous_success_pct": 1.0082706390559526
+      },
+      "wrapper_metrics": null,
+      "extracted_evidence": {
+        "correct": "- Accepted V285 exact result: 700 official / 701 adjudicated correct.",
+        "cpu": null,
+        "wall": null,
+        "peak_memory": null,
+        "paired_memory": null
+      },
+      "exact_override": true,
+      "wrapper_exact_evidence": false
+    },
+    {
+      "version": 287,
+      "label": "V287",
+      "method": "Pointer-Exception Scoped Spin Collapse",
+      "status": "successful",
+      "scope": "exact725",
+      "contribution_class": "native_redo",
+      "description": "Native V287 scopes the reservation-free pointer exception to exactly one marked spin loop while preserving V285's reservation and stuttering-retry proofs. One deagle_exe performs admission, proof, verdict, and witness generation; the byte-identical wrapper performs bounded routing and argument selection only. Exact725 reaches 701 official / 702 adjudicated correct, changing only libvsync/cnalock from unknown to correct true with zero V285-correct losses and zero new wrong results. Prior90 remains 90/90 and the 3,223-byte witness passes WitnessLint. CPU, summed wall, and summed memory change +0.601%, +0.532%, and -0.077% against V285.",
+      "source": "../../experiments/native-residual-v287-pointer-scope-20260729/conclusion.md",
+      "source_notes": "../../experiments/native-residual-v287-pointer-scope-20260729/notes.md",
+      "memory_sum_source": "/data3/sujie/experiments/v287-pointer-exception-scope-exact725-r1/results/exact725.2026-07-29_12-55-14.results.accepted-native-integration-exact725.Concurrency.xml.bz2",
+      "timing": {
+        "version": 287,
+        "directory": "native-residual-v287-pointer-scope-20260729",
+        "available": true,
+        "start_epoch_s": 1785329142,
+        "end_epoch_s": 1785330684,
+        "start_iso": "2026-07-29T12:45:42.000Z",
+        "end_iso": "2026-07-29T13:11:24.000Z",
+        "duration_minutes": 25.7,
+        "evidence_kind": "candidate_worktree_birth_to_release_gate_completion"
+      },
+      "metrics": {
+        "correct": 702,
+        "cpu_s": 866.534168323,
+        "wall_s": 910.8745472538285,
+        "memory_sum_b": 25625346048,
+        "paired_memory_delta_pct": null,
+        "correct_vs_baseline": 258,
+        "cpu_vs_baseline_pct": -93.19687874016186,
+        "wall_vs_baseline_pct": -92.86270356140727,
+        "memory_sum_vs_baseline_pct": -62.48064341843842,
+        "correct_vs_previous_success": 1,
+        "cpu_vs_previous_success_pct": 0.6010654156697104,
+        "wall_vs_previous_success_pct": 0.5317587628520304
+      },
+      "wrapper_metrics": null,
+      "extracted_evidence": {
+        "correct": "- Accepted baseline: V285, 700 official / 701 adjudicated correct.",
         "cpu": null,
         "wall": null,
         "peak_memory": null,

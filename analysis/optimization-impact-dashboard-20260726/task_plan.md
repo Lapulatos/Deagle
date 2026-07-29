@@ -39,8 +39,8 @@ failed, and audit-only versions.
 
 ## Status
 
-**Updated through V268.** The dashboard has 269 embedded data rows (baseline
-plus V1–V268). V256–V257 are successful rows for one
+**Updated through V287.** The dashboard has 288 embedded data rows (baseline
+plus V1–V287). V256–V257 are successful rows for one
 consolidated native redo endpoint: both display adjudicated coverage 685 and
 the shared gain is not accumulated twice. V258–V263 are successful native-redo
 rows with verifier metrics and core chart points; their historical wrapper
@@ -194,3 +194,10 @@ row-count, and zero-console-error checks.
 - V264–V268 now have artifact-backed optimization windows. V265 uses the
   first active experiment artifact rather than the previous evening's
   pre-created directory, so restart idle time is not counted as work duration.
+- V286 records the failed native single-pointer-spin candidate. Exact725 gains
+  `cnalock` but loses accepted-V285 `ticketlock`, so adjudicated coverage
+  remains 701 and the source is not promoted. Its 16.79-minute timing window
+  starts at candidate-worktree birth and ends at the Exact725 XML end time.
+- V287 scopes the pointer exception without changing the V285 paths. It adds
+  only `cnalock`, reaches 701 official / 702 adjudicated correct with zero
+  losses or new wrong results, and passes Prior90 plus WitnessLint.
