@@ -722,6 +722,7 @@ int cbmc_parse_optionst::doit()
     {
       independent_index,
       cross_domain_list,
+      single_initialized,
       initialized_pair,
       main_worker,
       dormant_pair,
@@ -745,6 +746,9 @@ int cbmc_parse_optionst::doit()
     else if(cross_domain_list_prefix_applied(goto_model))
       rescue_variants.push_back(
         {rescue_staget::cross_domain_list, 0, 3});
+    else if(single_worker_initialization_prefix_applied(goto_model))
+      rescue_variants.push_back(
+        {rescue_staget::single_initialized, 0, 3});
     else if(pair_initialization_prefix_applied(goto_model))
       rescue_variants.push_back(
         {rescue_staget::initialized_pair, 0, 2});
@@ -777,6 +781,8 @@ int cbmc_parse_optionst::doit()
         rescue_variant.stage == rescue_staget::independent_index;
       const bool is_cross_domain_list =
         rescue_variant.stage == rescue_staget::cross_domain_list;
+      const bool is_single_initialized =
+        rescue_variant.stage == rescue_staget::single_initialized;
       const bool is_initialized_pair =
         rescue_variant.stage == rescue_staget::initialized_pair;
       const bool is_main_worker =
@@ -789,6 +795,8 @@ int cbmc_parse_optionst::doit()
       const auto child_deadline = is_independent_index
         ? now + std::chrono::seconds(90)
         : is_cross_domain_list
+        ? now + std::chrono::seconds(90)
+        : is_single_initialized
         ? now + std::chrono::seconds(90)
         : is_initialized_pair
         ? now + std::chrono::seconds(90)
@@ -836,6 +844,21 @@ int cbmc_parse_optionst::doit()
           options.set_option("refined-pointer-analysis", false);
           options.set_option("allow-pointer-unsoundness", true);
           options.set_option("unwind", "3");
+        }
+        else if(rescue_variant.stage == rescue_staget::single_initialized)
+        {
+          options.set_option("refined-pointer-analysis", false);
+          options.set_option("allow-pointer-unsoundness", false);
+          options.set_option("object-bits", "10");
+          options.set_option("unwinding-assertions", false);
+          options.set_option("unwind", "3");
+          const std::string initialization_loop =
+            single_worker_initialization_prefix_unwind_loop(
+              goto_model);
+          options.set_option(
+            "unwindset",
+            optionst::value_listt{
+              initialization_loop + ":32"});
         }
         else if(rescue_variant.stage == rescue_staget::initialized_pair)
         {
@@ -1120,6 +1143,12 @@ int cbmc_parse_optionst::doit()
   if(cmdline.isset("native-dormant-spawn-cutoff"))
     native_model_transformed =
       dormant_spawn_cutoff_transform(
+        goto_model, ui_message_handler) ||
+      native_model_transformed;
+
+  if(cmdline.isset("native-single-worker-initialization-prefix"))
+    native_model_transformed =
+      single_worker_initialization_prefix_transform(
         goto_model, ui_message_handler) ||
       native_model_transformed;
 
@@ -1865,6 +1894,8 @@ bool cbmc_parse_optionst::process_goto_program(
         !independent_index_prefix_transform(
           goto_model, log.get_message_handler()) &&
         !cross_domain_list_prefix_transform(
+          goto_model, log.get_message_handler()) &&
+        !single_worker_initialization_prefix_transform(
           goto_model, log.get_message_handler()))
         pair_initialization_prefix_transform(
           goto_model, log.get_message_handler());

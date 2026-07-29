@@ -15034,6 +15034,419 @@ bool independent_index_prefix_applied(const goto_modelt &goto_model)
       .get_bool("deagle_independent_index_prefix");
 }
 
+bool single_worker_initialization_prefix_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  std::string reason;
+  const auto candidates = dormant_spawn_cutoffs(goto_model, reason);
+  if(candidates.size() != 1)
+  {
+    std::cout
+      << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=0"
+      << " reason=worker_class_count"
+      << " classes=" << candidates.size() << '\n';
+    return false;
+  }
+
+  auto main = goto_model.goto_functions.function_map.find("main");
+  if(
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+  {
+    std::cout
+      << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=0"
+      << " reason=missing_main\n";
+    return false;
+  }
+  auto &program = main->second.body;
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : program.instructions)
+    positions.emplace(&instruction, position++);
+  const std::size_t first_create =
+    positions.at(candidates.front().create_instruction);
+
+  struct loopt
+  {
+    goto_programt::const_targett head;
+    goto_programt::const_targett backedge;
+    irep_idt induction;
+    mp_integer bound;
+  };
+  std::vector<loopt> loops;
+  for(auto backedge = program.instructions.begin();
+      backedge != program.instructions.end(); ++backedge)
+  {
+    if(
+      positions.at(&*backedge) >= first_create ||
+      !backedge->is_goto() || !backedge->condition().is_true() ||
+      backedge->targets.size() != 1 ||
+      positions.at(&*backedge->get_target()) >= positions.at(&*backedge))
+      continue;
+    const auto head = backedge->get_target();
+    irep_idt induction;
+    exprt bound;
+    mp_integer constant_bound;
+    if(
+      parse_exit_guard(*head, induction, bound) &&
+      constant_eval(bound, {}, constant_bound) &&
+      constant_bound > 2)
+      loops.push_back({head, backedge, induction, constant_bound});
+  }
+  if(loops.size() != 2)
+  {
+    std::cout
+      << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=0"
+      << " reason=initialization_loop_count"
+      << " loops=" << loops.size() << '\n';
+    return false;
+  }
+
+  loopt *outer = nullptr;
+  loopt *inner = nullptr;
+  for(auto &candidate_outer : loops)
+    for(auto &candidate_inner : loops)
+    {
+      if(&candidate_outer == &candidate_inner)
+        continue;
+      if(
+        positions.at(&*candidate_outer.head) <
+          positions.at(&*candidate_inner.head) &&
+        positions.at(&*candidate_inner.backedge) <
+          positions.at(&*candidate_outer.backedge))
+      {
+        if(outer != nullptr || inner != nullptr)
+        {
+          std::cout
+            << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=0"
+            << " reason=ambiguous_loop_nesting\n";
+          return false;
+        }
+        outer = &candidate_outer;
+        inner = &candidate_inner;
+      }
+    }
+  if(outer == nullptr || inner == nullptr)
+  {
+    std::cout
+      << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=0"
+      << " reason=non_nested_initialization_loops\n";
+    return false;
+  }
+
+  auto after_initialization = std::next(outer->backedge);
+  for(;
+      after_initialization != program.instructions.end() &&
+      &*after_initialization != candidates.front().create_instruction;
+      ++after_initialization)
+  {
+    irep_idt callee;
+    if(
+      direct_call_identifier(*after_initialization, callee) &&
+      callee != "pthread_create")
+    {
+      std::cout
+        << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=0"
+        << " reason=post_initialization_call\n";
+      return false;
+    }
+  }
+  if(after_initialization == program.instructions.end())
+  {
+    std::cout
+      << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=0"
+      << " reason=create_not_after_initialization\n";
+    return false;
+  }
+
+  for(const auto *loop : {outer, inner})
+  {
+    std::size_t zero_initializations = 0;
+    std::size_t direct_writes = 0;
+    for(auto instruction = program.instructions.begin();
+        instruction != program.instructions.end(); ++instruction)
+    {
+      if(
+        contains_address_of_symbol(
+          instruction->code(), {loop->induction}) ||
+        (instruction->has_condition() &&
+         contains_address_of_symbol(
+           instruction->condition(), {loop->induction})))
+      {
+        std::cout
+          << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=0"
+          << " reason=induction_address_escape\n";
+        return false;
+      }
+      if(instruction->is_assign())
+      {
+        irep_idt written;
+        if(
+          contains_symbol(
+            instruction->assign_lhs(), {loop->induction}) &&
+          (!direct_symbol(instruction->assign_lhs(), written) ||
+           written != loop->induction))
+        {
+          std::cout
+            << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=0"
+            << " reason=indirect_induction_write\n";
+          return false;
+        }
+        if(
+          direct_symbol(instruction->assign_lhs(), written) &&
+          written == loop->induction)
+          ++direct_writes;
+      }
+      else if(
+        instruction->is_function_call() &&
+        !instruction->call_lhs().is_nil() &&
+        contains_symbol(
+          instruction->call_lhs(), {loop->induction}))
+      {
+        std::cout
+          << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=0"
+          << " reason=call_induction_write\n";
+        return false;
+      }
+      if(
+        instruction != loop->head &&
+        positions.at(&*instruction) < positions.at(&*loop->head) &&
+        parse_zero_initialization(*instruction, loop->induction))
+        ++zero_initializations;
+    }
+    std::size_t unit_increments = 0;
+    for(auto instruction = loop->head;
+        instruction != loop->backedge; ++instruction)
+    {
+      irep_idt incremented;
+      if(
+        parse_unit_increment(*instruction, incremented) &&
+        incremented == loop->induction)
+        ++unit_increments;
+    }
+    if(
+      zero_initializations != 1 ||
+      unit_increments != 1 ||
+      direct_writes != 2)
+    {
+      std::cout
+        << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=0"
+        << " reason=non_canonical_initialization_loop"
+        << " zero_initializations=" << zero_initializations
+        << " unit_increments=" << unit_increments
+        << " direct_writes=" << direct_writes << '\n';
+      return false;
+    }
+  }
+
+  const namespacet ns(goto_model.symbol_table);
+  const symbolt *outer_induction_symbol = nullptr;
+  if(ns.lookup(outer->induction, outer_induction_symbol))
+    return false;
+  auto outer_head = program.const_cast_target(outer->head);
+
+  const auto worker = goto_model.goto_functions.function_map.find(
+    candidates.front().worker);
+  if(
+    worker == goto_model.goto_functions.function_map.end() ||
+    !worker->second.body_available())
+  {
+    std::cout
+      << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=0"
+      << " reason=worker_body\n";
+    return false;
+  }
+  auto &worker_program = worker->second.body;
+  std::map<const goto_programt::instructiont *, std::size_t>
+    worker_positions;
+  position = 0;
+  for(const auto &instruction : worker_program.instructions)
+    worker_positions.emplace(&instruction, position++);
+  goto_programt::targett worker_head =
+    worker_program.instructions.end();
+  irep_idt worker_induction;
+  for(auto backedge = worker_program.instructions.begin();
+      backedge != worker_program.instructions.end(); ++backedge)
+  {
+    if(
+      !backedge->is_goto() || !backedge->condition().is_true() ||
+      backedge->targets.size() != 1 ||
+      worker_positions.at(&*backedge->get_target()) >=
+        worker_positions.at(&*backedge))
+      continue;
+    const auto head = backedge->get_target();
+    irep_idt induction;
+    exprt bound;
+    mp_integer constant_bound;
+    if(
+      !parse_exit_guard(*head, induction, bound) ||
+      !constant_eval(bound, {}, constant_bound) ||
+      constant_bound != outer->bound)
+      continue;
+    if(worker_head != worker_program.instructions.end())
+    {
+      std::cout
+        << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=0"
+        << " reason=ambiguous_worker_domain\n";
+      return false;
+    }
+    worker_head = worker_program.const_cast_target(head);
+    worker_induction = induction;
+  }
+  if(worker_head == worker_program.instructions.end())
+  {
+    std::cout
+      << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=0"
+      << " reason=worker_domain\n";
+    return false;
+  }
+  const symbolt *worker_induction_symbol = nullptr;
+  if(ns.lookup(worker_induction, worker_induction_symbol))
+  {
+    std::cout
+      << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=0"
+      << " reason=worker_domain_symbol\n";
+    return false;
+  }
+  goto_programt::targett worker_nondet =
+    worker_program.instructions.end();
+  irep_idt worker_nondet_temporary;
+  for(auto instruction = worker_program.instructions.begin();
+      instruction != worker_program.instructions.end(); ++instruction)
+  {
+    if(!instruction->is_assign())
+      continue;
+    irep_idt assigned;
+    irep_idt source;
+    if(
+      direct_symbol(instruction->assign_lhs(), assigned) &&
+      assigned == worker_induction &&
+      direct_symbol(instruction->assign_rhs(), source))
+    {
+      if(worker_nondet != worker_program.instructions.end())
+      {
+        std::cout
+          << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=0"
+          << " reason=ambiguous_worker_selector\n";
+        return false;
+      }
+      worker_nondet = instruction;
+      worker_nondet_temporary = source;
+    }
+  }
+  if(worker_nondet == worker_program.instructions.end())
+  {
+    std::cout
+      << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=0"
+      << " reason=worker_selector\n";
+    return false;
+  }
+  std::size_t nondet_temporary_writes = 0;
+  for(auto instruction = worker_program.instructions.begin();
+      instruction != worker_nondet; ++instruction)
+  {
+    if(!instruction->is_assign())
+      continue;
+    irep_idt assigned;
+    const exprt &rhs = without_cast(instruction->assign_rhs());
+    if(
+      direct_symbol(instruction->assign_lhs(), assigned) &&
+      assigned == worker_nondet_temporary &&
+      rhs.id() == ID_side_effect &&
+      to_side_effect_expr(rhs).get_statement() == ID_nondet)
+      ++nondet_temporary_writes;
+  }
+  if(nondet_temporary_writes != 1)
+  {
+    std::cout
+      << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=0"
+      << " reason=worker_selector_origin"
+      << " writes=" << nondet_temporary_writes << '\n';
+    return false;
+  }
+
+  // Admission must be transactional: do not modify either function until every
+  // structural premise above has been established.  With one candidate and one
+  // count, apply_dormant_spawn_counts cannot reject after it starts modifying
+  // the model.
+  bool truncated = false;
+  if(!apply_dormant_spawn_counts(
+       goto_model, candidates, {1}, truncated))
+  {
+    std::cout
+      << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=0"
+      << " reason=spawn_transform_failed\n";
+    return false;
+  }
+  outer_head->condition_nonconst() = not_exprt(
+    binary_relation_exprt(
+      symbol_exprt(
+        outer->induction, outer_induction_symbol->type),
+      ID_lt,
+      from_integer(2, outer_induction_symbol->type)));
+  worker_program.insert_after(
+    worker_nondet,
+    goto_programt::make_assumption(
+      equal_exprt(
+        symbol_exprt(
+          worker_induction, worker_induction_symbol->type),
+        from_integer(1, worker_induction_symbol->type)),
+      worker_nondet->source_location()));
+  worker_head->condition_nonconst() = not_exprt(
+    binary_relation_exprt(
+      symbol_exprt(
+        worker_induction, worker_induction_symbol->type),
+      ID_lt,
+      from_integer(2, worker_induction_symbol->type)));
+  program.instructions.begin()
+    ->source_location_nonconst()
+    .set("deagle_single_worker_initialization_prefix", true);
+  goto_model.goto_functions.update();
+  program.instructions.begin()
+    ->source_location_nonconst()
+    .set(
+      "deagle_single_worker_initialization_unwind_loop",
+      goto_programt::loop_id("main", *inner->backedge));
+  std::cout
+    << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=1"
+    << " loops=2 outer_prefix=2 inner_complete=1"
+    << " worker_selector=1 worker_domain=2 workers=1"
+    << " truncated=" << (truncated ? 1 : 0) << '\n';
+  (void)message_handler;
+  return true;
+}
+
+bool single_worker_initialization_prefix_applied(
+  const goto_modelt &goto_model)
+{
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  return
+    main != goto_model.goto_functions.function_map.end() &&
+    main->second.body_available() &&
+    !main->second.body.instructions.empty() &&
+    main->second.body.instructions.begin()
+      ->source_location()
+      .get_bool("deagle_single_worker_initialization_prefix");
+}
+
+std::string single_worker_initialization_prefix_unwind_loop(
+  const goto_modelt &goto_model)
+{
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  if(
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available() ||
+    main->second.body.instructions.empty())
+    return "";
+  return id2string(
+    main->second.body.instructions.begin()
+      ->source_location()
+      .get("deagle_single_worker_initialization_unwind_loop"));
+}
+
 bool pair_initialization_prefix_transform(
   goto_modelt &goto_model,
   message_handlert &message_handler)

@@ -72,6 +72,23 @@ bool independent_index_prefix_transform(
 /// Return whether the early independent-index prefix was applied.
 bool independent_index_prefix_applied(const goto_modelt &goto_model);
 
+/// In a disposable counterexample model with one homogeneous worker class,
+/// retain two outer initialization domains, fully initialize each retained
+/// inner domain, and materialize one representative worker fixed to a
+/// retained domain. This is a fail-closed counterexample under-approximation.
+bool single_worker_initialization_prefix_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// Return whether the single-worker initialization prefix was applied.
+bool single_worker_initialization_prefix_applied(
+  const goto_modelt &goto_model);
+
+/// Return the canonical inner-initialization loop that must be fully
+/// unwound after applying the single-worker initialization prefix.
+std::string single_worker_initialization_prefix_unwind_loop(
+  const goto_modelt &goto_model);
+
 // Soundly removes a dormant worker population when every worker performs an
 // exact zero-sum scalar update while holding the same mutex that protects the
 // zero assertion.
