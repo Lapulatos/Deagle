@@ -1,0 +1,628 @@
+{
+  "generated_at": "2026-07-26T16:33:04.541Z",
+  "definition": "Sum of the BenchExec memory column over exactly 725 run rows.",
+  "match_rule": "XML correct/CPU/wall tuple must match the registered exact725 point with total absolute CPU+wall error below 0.01 seconds.",
+  "rows": [
+    {
+      "version": 0,
+      "correct": 444,
+      "cpu_s": 12737.30270241101,
+      "wall_s": 12762.179443030269,
+      "memory_sum_b": 68299001856,
+      "source_xml": "/data3/sujie/experiments/shallow-counterexample-full-v46-20260723/results/control/control.2026-07-22_23-35-48.results.control.Concurrency.xml.bz2",
+      "tuple_distance": 0.0007406192580674542
+    },
+    {
+      "version": 29,
+      "correct": 444,
+      "cpu_s": 12707.902516780994,
+      "wall_s": 12731.129143460712,
+      "memory_sum_b": 67956215808,
+      "source_xml": "/data3/sujie/experiments/cached-clause-minimization-vs-adaptive-full-v29-20260723/results/method/full.2026-07-22_20-50-23.results.Concurrency.Concurrency.xml.bz2",
+      "tuple_distance": 0.0006266797172429506
+    },
+    {
+      "version": 46,
+      "correct": 460,
+      "cpu_s": 11761.157680171997,
+      "wall_s": 11787.863104608376,
+      "memory_sum_b": 68226453504,
+      "source_xml": "/data3/sujie/experiments/shallow-counterexample-full-v46-20260723/results/method/method.2026-07-22_23-41-04.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 0.00042443637903488707
+    },
+    {
+      "version": 56,
+      "correct": 462,
+      "cpu_s": 11174.782599317003,
+      "wall_s": 12039.904187824228,
+      "memory_sum_b": 66480758784,
+      "source_xml": "/data3/sujie/experiments/recursive-worker-vs-v46-full-v56-20260723/results/method/method.2026-07-23_03-02-50.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0005885072241653688
+    },
+    {
+      "version": 59,
+      "correct": 462,
+      "cpu_s": 11639.442793580985,
+      "wall_s": 11668.660920427472,
+      "memory_sum_b": 67978014720,
+      "source_xml": "/data3/sujie/experiments/refined-loop-filter-vs-v56-full-v59-20260723/results/method/method.2026-07-23_03-30-28.results.refined.Concurrency.xml.bz2",
+      "tuple_distance": 0.0002859915421140613
+    },
+    {
+      "version": 69,
+      "correct": 464,
+      "cpu_s": 11547.366625951006,
+      "wall_s": 11576.158658495697,
+      "memory_sum_b": 63791366144,
+      "source_xml": "/data3/sujie/experiments/multi-template-vs-v57-full-v69-20260723/results/method/method.2026-07-23_07-13-54.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0007155532966862665
+    },
+    {
+      "version": 72,
+      "correct": 464,
+      "cpu_s": 11540.239115712991,
+      "wall_s": 11574.963873027358,
+      "memory_sum_b": 63707824128,
+      "source_xml": "/data3/sujie/experiments/adaptive-multi-template-vs-v69-full-v72-20260723/results/method/method.2026-07-23_07-43-45.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0002426856335659977
+    },
+    {
+      "version": 82,
+      "correct": 474,
+      "cpu_s": 10955.734794786009,
+      "wall_s": 10986.57229876821,
+      "memory_sum_b": 65449635840,
+      "source_xml": "/data3/sujie/experiments/native-relational-fold-full-v82-20260723/results/method/method.2026-07-23_09-26-29.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0005039822008257033
+    },
+    {
+      "version": 83,
+      "correct": 474,
+      "cpu_s": 10949.733527820004,
+      "wall_s": 10984.913547939155,
+      "memory_sum_b": 61722783744,
+      "source_xml": "/data3/sujie/experiments/native-relational-fold-exec-full-v83-20260723/results/method/method.2026-07-23_09-40-22.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0009242408414138481
+    },
+    {
+      "version": 84,
+      "correct": 474,
+      "cpu_s": 10936.837925558008,
+      "wall_s": 10968.347739660647,
+      "memory_sum_b": 61851742208,
+      "source_xml": "/data3/sujie/experiments/native-relational-fold-inline-full-v84-20260723/results/method/method.2026-07-23_09-55-18.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 3.601599019020796e-10
+    },
+    {
+      "version": 89,
+      "correct": 481,
+      "cpu_s": 10506.757471286004,
+      "wall_s": 10541.448344442528,
+      "memory_sum_b": 60167909376,
+      "source_xml": "/data3/sujie/experiments/algebraic-segment-vs-v84-full-v89-20260723/results/method/method.2026-07-23_10-41-16.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 4.765752237290144e-10
+    },
+    {
+      "version": 95,
+      "correct": 484,
+      "cpu_s": 10326.647650791994,
+      "wall_s": 10358.44254189008,
+      "memory_sum_b": 59424276480,
+      "source_xml": "/data3/sujie/experiments/phase-ordered-stream-vs-v95-full-v99-20260723/results/control/control.2026-07-23_11-52-42.results.control.Concurrency.xml.bz2",
+      "tuple_distance": 0.0008073179251368856
+    },
+    {
+      "version": 99,
+      "correct": 488,
+      "cpu_s": 10082.093461772001,
+      "wall_s": 10113.261506935232,
+      "memory_sum_b": 58278821888,
+      "source_xml": "/data3/sujie/experiments/phase-ordered-stream-vs-v95-full-v99-20260723/results/method/method.2026-07-23_11-56-58.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 0.000954836768869427
+    },
+    {
+      "version": 105,
+      "correct": 497,
+      "cpu_s": 9527.519156369002,
+      "wall_s": 9787.19079449505,
+      "memory_sum_b": 55308947456,
+      "source_xml": "/data3/sujie/experiments/joined-effect-vs-v100-full-v105-20260723/results/method/method.2026-07-23_12-45-17.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 1.8189894035458565e-12
+    },
+    {
+      "version": 110,
+      "correct": 502,
+      "cpu_s": 9224.029551672002,
+      "wall_s": 9521.241465489147,
+      "memory_sum_b": 53717577728,
+      "source_xml": "/data3/sujie/experiments/native-jces-vs-v105-full-v110-20260723/results/method/method.2026-07-23_14-30-16.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 8.171464287443087e-7
+    },
+    {
+      "version": 112,
+      "correct": 503,
+      "cpu_s": 9168.254086492001,
+      "wall_s": 9467.96400711895,
+      "memory_sum_b": 53660835840,
+      "source_xml": "/data3/sujie/experiments/native-jces-corrected-full-v112-20260723/results/method/method.2026-07-23_14-59-56.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 6.109494279371575e-7
+    },
+    {
+      "version": 122,
+      "correct": 504,
+      "cpu_s": 9029.505239646,
+      "wall_s": 9315.011565249297,
+      "memory_sum_b": 52818817024,
+      "source_xml": "/data3/sujie/experiments/prefix-affine-envelope-v122-20260724/full-results/method/full-method.2026-07-23_18-53-02.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0006743967041984433
+    },
+    {
+      "version": 126,
+      "correct": 508,
+      "cpu_s": 8765.685016182002,
+      "wall_s": 8810.448621630203,
+      "memory_sum_b": 52494516224,
+      "source_xml": "/data3/sujie/experiments/ticket-rank-serializability-audit-v126-20260724/full-results/method/full-method.2026-07-24_05-03-03.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 0.000394551800127374
+    },
+    {
+      "version": 127,
+      "correct": 509,
+      "cpu_s": 8709.699271698999,
+      "wall_s": 8750.721894960501,
+      "memory_sum_b": 51979509760,
+      "source_xml": "/data3/sujie/experiments/concurrent-race-witness-audit-v127-20260724/full-results/method/full-method.2026-07-24_05-46-28.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 0.00037673849692509975
+    },
+    {
+      "version": 128,
+      "correct": 511,
+      "cpu_s": 8580.254028468004,
+      "wall_s": 8622.397190900403,
+      "memory_sum_b": 51602165760,
+      "source_xml": "/data3/sujie/experiments/lock-linearization-invariant-audit-v128-20260724/full-results/method/full-method.2026-07-24_06-47-05.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 0.00021936840494163334
+    },
+    {
+      "version": 129,
+      "correct": 513,
+      "cpu_s": 8459.056701568998,
+      "wall_s": 8644.793401655275,
+      "memory_sum_b": 51860066304,
+      "source_xml": "/data3/sujie/experiments/native-timeout-opportunity-audit-v130-20260724/full-results/control/v129-control.xml.bz2",
+      "tuple_distance": 0.0007000862788117956
+    },
+    {
+      "version": 130,
+      "correct": 521,
+      "cpu_s": 7978.895337161994,
+      "wall_s": 8006.758381654625,
+      "memory_sum_b": 48462123008,
+      "source_xml": "/data3/sujie/experiments/native-timeout-opportunity-audit-v130-20260724/full-results/method/full-method.2026-07-24_08-59-48.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0007188166182459099
+    },
+    {
+      "version": 131,
+      "correct": 525,
+      "cpu_s": 7737.441842779997,
+      "wall_s": 7763.987106867717,
+      "memory_sum_b": 47518035968,
+      "source_xml": "/data3/sujie/experiments/remaining-timeout-semantic-audit-v131-20260724/full-results/method/full-method.2026-07-24_10-14-35.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 0.00026408771918795537
+    },
+    {
+      "version": 132,
+      "correct": 531,
+      "cpu_s": 7371.720851083,
+      "wall_s": 7398.699595861486,
+      "memory_sum_b": 46204276736,
+      "source_xml": "/data3/sujie/experiments/post-commuting-timeout-theorem-audit-v133-20260724/full-results/control/source-v132.xml.bz2",
+      "tuple_distance": 0.0005530555135919712
+    },
+    {
+      "version": 133,
+      "correct": 532,
+      "cpu_s": 7309.697770232,
+      "wall_s": 7338.148314642021,
+      "memory_sum_b": 46217703424,
+      "source_xml": "/data3/sujie/experiments/monotone-lock-rely-audit-v135-20260724/full-results/control/v133-control.xml.bz2",
+      "tuple_distance": 0.0005444100215754588
+    },
+    {
+      "version": 135,
+      "correct": 535,
+      "cpu_s": 7125.628560697999,
+      "wall_s": 7158.900365646463,
+      "memory_sum_b": 45787471872,
+      "source_xml": "/data3/sujie/experiments/monotone-lock-rely-audit-v135-20260724/full-results/method/full-method.2026-07-24_12-57-38.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0008049484640650917
+    },
+    {
+      "version": 137,
+      "correct": 544,
+      "cpu_s": 6581.818498970995,
+      "wall_s": 6608.521960612736,
+      "memory_sum_b": 42879021056,
+      "source_xml": "/data3/sujie/experiments/post-extremum-timeout-theorem-audit-v138-20260725/full-results/control/v137-control.xml.bz2",
+      "tuple_distance": 0.0005383582592912717
+    },
+    {
+      "version": 138,
+      "correct": 546,
+      "cpu_s": 6470.3176995509975,
+      "wall_s": 6495.868507509003,
+      "memory_sum_b": 42448961536,
+      "source_xml": "/data3/sujie/experiments/post-extremum-timeout-theorem-audit-v138-20260725/full-results/method/full-method.2026-07-24_17-06-23.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 0.000792939998973452
+    },
+    {
+      "version": 139,
+      "correct": 549,
+      "cpu_s": 6288.173851850003,
+      "wall_s": 6313.815702595282,
+      "memory_sum_b": 42234646528,
+      "source_xml": "/data3/sujie/experiments/post-linear-timeout-theorem-audit-v140-20260725/full-results/control/v139-control.xml.bz2",
+      "tuple_distance": 0.0004455547141333227
+    },
+    {
+      "version": 140,
+      "correct": 554,
+      "cpu_s": 5987.637535544999,
+      "wall_s": 6012.822567780153,
+      "memory_sum_b": 40017129472,
+      "source_xml": "/data3/sujie/experiments/post-linear-timeout-theorem-audit-v140-20260725/full-results/method/full-method.2026-07-24_19-20-10.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0008966748482635012
+    },
+    {
+      "version": 141,
+      "correct": 559,
+      "cpu_s": 5681.889533218001,
+      "wall_s": 5704.85013331857,
+      "memory_sum_b": 38660591616,
+      "source_xml": "/data3/sujie/experiments/post-order-timeout-theorem-audit-v142-20260725/full-results/control/source-v141.xml.bz2",
+      "tuple_distance": 0.000600100569499773
+    },
+    {
+      "version": 142,
+      "correct": 562,
+      "cpu_s": 5501.335323455002,
+      "wall_s": 5524.2463681829395,
+      "memory_sum_b": 37951606784,
+      "source_xml": "/data3/sujie/experiments/post-order-timeout-theorem-audit-v142-20260725/full-results/method/full-method.2026-07-24_21-07-32.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0006916379415997653
+    },
+    {
+      "version": 143,
+      "correct": 567,
+      "cpu_s": 5196.294684108996,
+      "wall_s": 5219.7864546842175,
+      "memory_sum_b": 36548079616,
+      "source_xml": "/data3/sujie/experiments/post-hierarchical-timeout-theorem-audit-v143-20260725/full-results/method/full-method.2026-07-25_02-33-58.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 0.00077057522139512
+    },
+    {
+      "version": 144,
+      "correct": 573,
+      "cpu_s": 4828.971582905003,
+      "wall_s": 4852.495943282498,
+      "memory_sum_b": 34976636928,
+      "source_xml": "/data3/sujie/experiments/post-prefix-timeout-theorem-audit-v145-20260725/full-attempt1-preflight/full-results/control/source-v144.xml.bz2",
+      "tuple_distance": 0.00047381249896716326
+    },
+    {
+      "version": 145,
+      "correct": 575,
+      "cpu_s": 4710.885680778999,
+      "wall_s": 4733.318247112329,
+      "memory_sum_b": 34856558592,
+      "source_xml": "/data3/sujie/experiments/post-prefix-timeout-theorem-audit-v145-20260725/full-results/method/full-method.2026-07-25_05-17-55.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0005663333304255502
+    },
+    {
+      "version": 146,
+      "correct": 579,
+      "cpu_s": 4469.876680269997,
+      "wall_s": 4494.185407731915,
+      "memory_sum_b": 34664058880,
+      "source_xml": "/data3/sujie/experiments/post-lock-interval-timeout-theorem-audit-v147-20260725/setup-failures/attempt1/full-results/control/v146-control.xml.bz2",
+      "tuple_distance": 0.0007274619174495456
+    },
+    {
+      "version": 147,
+      "correct": 581,
+      "cpu_s": 4348.536356026997,
+      "wall_s": 4371.966538287234,
+      "memory_sum_b": 33971896320,
+      "source_xml": "/data3/sujie/experiments/post-lock-interval-timeout-theorem-audit-v147-20260725/full-results/method/full-method.2026-07-25_07-29-56.results.method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0008177397630788619
+    },
+    {
+      "version": 148,
+      "correct": 585,
+      "cpu_s": 4057.170171146002,
+      "wall_s": 4080.0369343189523,
+      "memory_sum_b": 32307486720,
+      "source_xml": "/data3/sujie/experiments/post-modular-chunk-timeout-theorem-audit-v148-20260725/full-run/results/method/full-method.2026-07-25_08-59-19.results.v148-method.exact725.xml.bz2",
+      "tuple_distance": 0.0002368270493207092
+    },
+    {
+      "version": 157,
+      "correct": 582,
+      "cpu_s": 4225.836896909999,
+      "wall_s": 4248.684079664759,
+      "memory_sum_b": 34050801664,
+      "source_xml": "/data3/sujie/experiments/property-directed-modular-lattice-v158-20260725/full-v158/results/control/v157-control.xml.bz2",
+      "tuple_distance": 0.00018275476031703874
+    },
+    {
+      "version": 158,
+      "correct": 583,
+      "cpu_s": 4226.126575957999,
+      "wall_s": 4247.662860402605,
+      "memory_sum_b": 33602011136,
+      "source_xml": "/data3/sujie/experiments/property-directed-modular-lattice-v158-20260725/full-v158/results/method/v158-method-normalized.xml.bz2",
+      "tuple_distance": 0.0005636393962049624
+    },
+    {
+      "version": 159,
+      "correct": 585,
+      "cpu_s": 4042.7705798780007,
+      "wall_s": 4064.731334340526,
+      "memory_sum_b": 33466933248,
+      "source_xml": "/data3/sujie/experiments/post-token-drain-residual-theorem-audit-v160-20260726/full-v160-final/results/control/v159-method-normalized.xml.bz2",
+      "tuple_distance": 0.0007544625250375248
+    },
+    {
+      "version": 160,
+      "correct": 588,
+      "cpu_s": 3922.849801236001,
+      "wall_s": 3943.1062124995515,
+      "memory_sum_b": 32277499904,
+      "source_xml": "/data3/sujie/experiments/post-role-split-residual-theorem-audit-v161-20260726/full-v161/results/control/v160-method-normalized.xml.bz2",
+      "tuple_distance": 0.0004112635501769546
+    },
+    {
+      "version": 161,
+      "correct": 592,
+      "cpu_s": 3613.626676995998,
+      "wall_s": 3634.5524406904588,
+      "memory_sum_b": 31182061568,
+      "source_xml": "/data3/sujie/experiments/post-role-split-residual-theorem-audit-v161-20260726/full-v161/results/method/v161-method-normalized.xml.bz2",
+      "tuple_distance": 0.0007636944606019824
+    },
+    {
+      "version": 162,
+      "correct": 594,
+      "cpu_s": 3560.4274169990035,
+      "wall_s": 3583.175366077223,
+      "memory_sum_b": 31127453696,
+      "source_xml": "/data3/sujie/experiments/post-publication-frontier-residual-theorem-audit-v162-20260726/full-v162/results/method.2026-07-25_19-45-48.results.v162-method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0007830762260709889
+    },
+    {
+      "version": 163,
+      "correct": 596,
+      "cpu_s": 3513.024539766998,
+      "wall_s": 3526.737250840175,
+      "memory_sum_b": 30197411840,
+      "source_xml": "/data3/sujie/experiments/post-bisimulation-residual-algorithm-audit-v163-20260726/full-v163/results/method/v163-method-normalized.xml.bz2",
+      "tuple_distance": 0.0007110731771717838
+    },
+    {
+      "version": 164,
+      "correct": 597,
+      "cpu_s": 3455.9513722580027,
+      "wall_s": 3469.3961877138354,
+      "memory_sum_b": 30118232064,
+      "source_xml": "/data3/sujie/experiments/post-group-action-residual-theory-audit-v164-20260726/full-v164/results/method/v164-method-normalized.xml.bz2",
+      "tuple_distance": 0.0005599718379016849
+    },
+    {
+      "version": 165,
+      "correct": 598,
+      "cpu_s": 3400.611150702997,
+      "wall_s": 3414.5633593593957,
+      "memory_sum_b": 29604675584,
+      "source_xml": "/data3/sujie/experiments/post-segmented-fold-residual-theory-audit-v165-20260726/full-v165/results/method-v165.2026-07-25_21-43-26.results.v165-method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0005100623925500258
+    },
+    {
+      "version": 166,
+      "correct": 600,
+      "cpu_s": 3281.476460868004,
+      "wall_s": 3294.791454210179,
+      "memory_sum_b": 28049362944,
+      "source_xml": "/data3/sujie/experiments/post-nested-iteration-residual-theory-audit-v166-20260726/full-v166/results/method-v166.2026-07-25_22-04-34.results.v166-method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0009150781825155718
+    },
+    {
+      "version": 167,
+      "correct": 604,
+      "cpu_s": 3044.7305397370064,
+      "wall_s": 3070.7120639448985,
+      "memory_sum_b": 25669898240,
+      "source_xml": "/data3/sujie/experiments/post-local-loop-residual-theory-audit-v167-20260726/full-v167method-v167.2026-07-25_22-18-21.results.v167-method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0005242078923402005
+    },
+    {
+      "version": 169,
+      "correct": 605,
+      "cpu_s": 2980.4532755820005,
+      "wall_s": 3006.475389722502,
+      "memory_sum_b": 25601200128,
+      "source_xml": "/data3/sujie/experiments/homogeneous-spawn-sequential-witness-v169-20260726/full-v169/method-v169.2026-07-25_22-52-13.results.v169-method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0006653045024904714
+    },
+    {
+      "version": 170,
+      "correct": 606,
+      "cpu_s": 2921.1893412389986,
+      "wall_s": 2946.5941212322796,
+      "memory_sum_b": 25483997184,
+      "source_xml": "/data3/sujie/experiments/post-spawn-witness-residual-theory-audit-v170-20260726/full-v170/method-v170.2026-07-25_23-27-30.results.v170-method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0004624712782970164
+    },
+    {
+      "version": 171,
+      "correct": 608,
+      "cpu_s": 2810.3531341010003,
+      "wall_s": 2837.948092648061,
+      "memory_sum_b": 25696157696,
+      "source_xml": "/data3/sujie/experiments/post-alternating-phase-residual-theory-audit-v171-20260726/full-v171/resultsmethod-v171.2026-07-26_02-18-38.results.v171-method.Concurrency.xml.bz2",
+      "tuple_distance": 0.00022674906131214811
+    },
+    {
+      "version": 172,
+      "correct": 611,
+      "cpu_s": 2989.7237732659987,
+      "wall_s": 3021.209679587977,
+      "memory_sum_b": 34186579968,
+      "source_xml": "/data3/sujie/experiments/residual-counterexample-resource-audit-v172-20260726/full-v172/method-v172.2026-07-26_02-44-32.results.v172-method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0005471460244734772
+    },
+    {
+      "version": 173,
+      "correct": 612,
+      "cpu_s": 2935.134404649,
+      "wall_s": 2966.362730585155,
+      "memory_sum_b": 34043596800,
+      "source_xml": "/data3/sujie/experiments/load-robust-deferred-counterexample-v173-20260726/full-v173/method-v173.2026-07-26_02-52-05.results.v173-method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0006740638445990044
+    },
+    {
+      "version": 174,
+      "correct": 625,
+      "cpu_s": 2954.7714001690015,
+      "wall_s": 2985.5598683970748,
+      "memory_sum_b": 38706970624,
+      "source_xml": "/data3/sujie/experiments/large-unwind-counterexample-depth-audit-v174-20260726/full-v174/method-v174.2026-07-26_03-31-49.results.v174-method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0005317719264894549
+    },
+    {
+      "version": 175,
+      "correct": 630,
+      "cpu_s": 2986.936491181002,
+      "wall_s": 3019.0365488820244,
+      "memory_sum_b": 40620834816,
+      "source_xml": "/data3/sujie/experiments/native-counterexample-portfolio-v176-20260726/full-p1/control-v175.xml.bz2",
+      "tuple_distance": 0.0009422989774066082
+    },
+    {
+      "version": 176,
+      "correct": 630,
+      "cpu_s": 2905.3267298530013,
+      "wall_s": 2939.30239860632,
+      "memory_sum_b": 39998967808,
+      "source_xml": "/data3/sujie/experiments/native-counterexample-portfolio-v176-20260726/full-p1/method-v176.method-v176.2026-07-26_05-34-59.results.v176-method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0006687533186777728
+    },
+    {
+      "version": 177,
+      "correct": 630,
+      "cpu_s": 2897.049317083998,
+      "wall_s": 2929.5796038752887,
+      "memory_sum_b": 40017920000,
+      "source_xml": "/data3/sujie/experiments/unified-native-counterexample-rescue-v177-20260726/full-v177/method-v177method-v177.2026-07-26_06-09-44.results.v177-method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0007132087093850714
+    },
+    {
+      "version": 180,
+      "correct": 630,
+      "cpu_s": 2891.9903127160014,
+      "wall_s": 2925.3147159719374,
+      "memory_sum_b": 38787346432,
+      "source_xml": "/data3/sujie/experiments/lazy-stable-nondet-cells-v180-20260726/full-v180-methodfull-v180.2026-07-26_08-11-13.results.v180-method.Concurrency.xml.bz2",
+      "tuple_distance": 0.0005967440642962174
+    },
+    {
+      "version": 181,
+      "correct": 631,
+      "cpu_s": 2836.669053174001,
+      "wall_s": 2868.4628660875605,
+      "memory_sum_b": 39589552128,
+      "source_xml": "/data3/sujie/experiments/residual-symbolic-region-budget-v181-20260726/full-v181-methodfull-v181.2026-07-26_08-26-28.results.v181-method.Concurrency.xml.bz2",
+      "tuple_distance": 0.00018708644074649783
+    },
+    {
+      "version": 187,
+      "correct": 635,
+      "cpu_s": 2651.614797628,
+      "wall_s": 2702.8493496570736,
+      "memory_sum_b": 38479290368,
+      "source_xml": "/data3/sujie/experiments/protocol-induced-capacity-cutoff-v187-20260726/full-v187/full-v187.2026-07-26_12-21-45.results.v187-method.Concurrency.xml.bz2",
+      "tuple_distance": 0
+    },
+    {
+      "version": 188,
+      "correct": 635,
+      "cpu_s": 2592.137512974,
+      "wall_s": 2623.1753125234973,
+      "memory_sum_b": 38384365568,
+      "source_xml": "/data3/sujie/experiments/fused-protocol-capacity-v188-20260726/full-v188/full-v188.2026-07-26_12-36-36.results.v188-method.Concurrency.xml.bz2",
+      "tuple_distance": 0
+    },
+    {
+      "version": 189,
+      "correct": 637,
+      "cpu_s": 2589.151891558,
+      "wall_s": 2620.292000974994,
+      "memory_sum_b": 37742215168,
+      "source_xml": "/data3/sujie/experiments/residual-semantic-opportunity-audit-v189-20260726/full-v189/full-v189.2026-07-26_13-13-49.results.v189-method.Concurrency.xml.bz2",
+      "tuple_distance": 0
+    },
+    {
+      "version": 190,
+      "correct": 641,
+      "cpu_s": 2575.998098589,
+      "wall_s": 2606.548923523864,
+      "memory_sum_b": 35703984128,
+      "source_xml": "/data3/sujie/experiments/property-directed-lock-boundary-v190-20260726/full-v190/full-v190.2026-07-26_13-36-44.results.v190-method.Concurrency.xml.bz2",
+      "tuple_distance": 0
+    },
+    {
+      "version": 191,
+      "correct": 646,
+      "cpu_s": 2574.652955357001,
+      "wall_s": 2605.069153071614,
+      "memory_sum_b": 35704438784,
+      "source_xml": "/data3/sujie/experiments/protected-access-path-regions-v191-20260726/full-v191/full-v191.2026-07-26_13-59-57.results.v191-method.Concurrency.xml.bz2",
+      "tuple_distance": 0
+    },
+    {
+      "version": 192,
+      "correct": 648,
+      "cpu_s": 2573.498902392001,
+      "wall_s": 2604.006005124189,
+      "memory_sum_b": 35078737920,
+      "source_xml": "/data3/sujie/experiments/goblint-loop-race-transfer-v192-20260726/full-v192/full-v192.2026-07-26_14-36-47.results.v192-method.Concurrency.xml.bz2",
+      "tuple_distance": 0
+    },
+    {
+      "version": 193,
+      "correct": 650,
+      "cpu_s": 2570.9563300149953,
+      "wall_s": 2601.458520903485,
+      "memory_sum_b": 34302844928,
+      "source_xml": "/data3/sujie/experiments/conditional-lock-transfer-v193-20260726/full-v193full-v193.2026-07-26_15-09-31.results.v193-method.Concurrency.xml.bz2",
+      "tuple_distance": 0
+    },
+    {
+      "version": 194,
+      "correct": 652,
+      "cpu_s": 2562.108056541999,
+      "wall_s": 2590.975206524832,
+      "memory_sum_b": 33770532864,
+      "source_xml": "/data3/sujie/experiments/fresh-region-protection-v194-20260726/full-v194full-v194.2026-07-26_16-24-33.results.v194-method.Concurrency.xml.bz2",
+      "tuple_distance": 0
+    },
+    {
+      "version": 195,
+      "correct": 652,
+      "cpu_s": 2564.269124301001,
+      "wall_s": 2594.7453050420154,
+      "memory_sum_b": 33926967296,
+      "source_xml": "/data3/sujie/workspaces/deagle-v193/experiments/region-lock-nonvacuity-v195-20260727/full-v195full-v195.2026-07-26_17-03-35.results.v195-method.Concurrency.xml.bz2",
+      "tuple_distance": 0
+    }
+  ]
+}
