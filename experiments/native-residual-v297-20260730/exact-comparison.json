@@ -1,0 +1,47 @@
+{
+  "base": {
+    "correct": 698,
+    "cpu": 1093.0650360000006,
+    "end": "2026-07-30T05:34:02.086815+08:00",
+    "memory": 27417141248,
+    "peak_memory": 3999997952,
+    "start": "2026-07-30T05:31:16.805666+08:00",
+    "unfinished": 24,
+    "wall": 1134.9193168370984,
+    "wrong": 3
+  },
+  "candidate": {
+    "correct": 700,
+    "cpu": 968.6572050000007,
+    "end": "2026-07-30T06:11:01.146282+08:00",
+    "memory": 26867920896,
+    "peak_memory": 3999997952,
+    "start": "2026-07-30T06:08:23.535759+08:00",
+    "unfinished": 22,
+    "wall": 1014.9598592408001,
+    "wrong": 3
+  },
+  "changes": [
+    {
+      "after_category": "correct",
+      "after_status": "true",
+      "before_category": "error",
+      "before_status": "TIMEOUT",
+      "task": "parallel-misc-3-extended.wvr.yml"
+    },
+    {
+      "after_category": "correct",
+      "after_status": "true",
+      "before_category": "error",
+      "before_status": "TIMEOUT",
+      "task": "parallel-misc-3.wvr.yml"
+    }
+  ],
+  "new_wrong": [],
+  "old_correct_losses": [],
+  "percent_change": {
+    "cpu": -11.381557995420133,
+    "memory": -2.003200651125736,
+    "wall": -10.569866581407105
+  }
+}

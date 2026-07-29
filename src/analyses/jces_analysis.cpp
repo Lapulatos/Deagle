@@ -17148,6 +17148,513 @@ bool bounded_alternating_cancellation_transform(
   return true;
 }
 
+namespace
+{
+struct phase_boundary_workert
+{
+  irep_idt function;
+  irep_idt phase;
+  irep_idt loop_flag;
+  irep_idt object;
+  mp_integer weight;
+};
+
+bool phase_boundary_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &function_id,
+  phase_boundary_workert &summary,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "phase_boundary_missing_worker";
+    return false;
+  }
+  const auto &program = function->second.body;
+  const auto semantic = semantic_instructions(program);
+  if(semantic.size() != 11)
+  {
+    reason =
+      "phase_boundary_instruction_count_" +
+      std::to_string(semantic.size());
+    return false;
+  }
+
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : program.instructions)
+    positions.emplace(&instruction, position++);
+
+  irep_idt loop_flag;
+  irep_idt phase;
+  if(
+    !semantic[0]->is_goto() ||
+    semantic[0]->targets.size() != 1 ||
+    !negated_nonzero_symbol_test(
+      semantic[0]->condition(), loop_flag) ||
+    positions.at(&*semantic[0]->get_target()) <=
+      positions.at(&*semantic[10]) ||
+    !semantic[1]->is_goto() ||
+    semantic[1]->targets.size() != 1 ||
+    !negated_nonzero_symbol_test(
+      semantic[1]->condition(), phase) ||
+    semantic[1]->get_target() != semantic[4])
+  {
+    reason = "phase_boundary_guards";
+    return false;
+  }
+
+  irep_idt positive_object;
+  irep_idt negative_object;
+  mp_integer positive;
+  mp_integer negative;
+  if(
+    !oscillator_delta(
+      *semantic[2], positive_object, positive) ||
+    !semantic[3]->is_goto() ||
+    !semantic[3]->condition().is_true() ||
+    semantic[3]->targets.size() != 1 ||
+    semantic[3]->get_target() != semantic[5] ||
+    !oscillator_delta(
+      *semantic[4], negative_object, negative) ||
+    positive_object != negative_object ||
+    positive <= 0 || negative != -positive)
+  {
+    reason = "phase_boundary_opposites";
+    return false;
+  }
+
+  irep_idt phase_lhs;
+  irep_idt phase_rhs;
+  irep_idt exit_phase;
+  if(
+    !semantic[5]->is_assign() ||
+    !direct_symbol(semantic[5]->assign_lhs(), phase_lhs) ||
+    phase_lhs != phase ||
+    !negated_nonzero_symbol_test(
+      semantic[5]->assign_rhs(), phase_rhs) ||
+    phase_rhs != phase ||
+    !semantic[6]->is_goto() ||
+    semantic[6]->targets.size() != 1 ||
+    !negated_nonzero_symbol_test(
+      semantic[6]->condition(), exit_phase) ||
+    exit_phase != phase ||
+    semantic[6]->get_target() != semantic[10])
+  {
+    reason = "phase_boundary_toggle";
+    return false;
+  }
+
+  irep_idt nondet_value;
+  irep_idt tested_value;
+  const exprt &nondet_rhs =
+    semantic[7]->is_assign()
+      ? without_cast(semantic[7]->assign_rhs())
+      : nil_exprt();
+  if(
+    !semantic[7]->is_assign() ||
+    !direct_symbol(
+      semantic[7]->assign_lhs(), nondet_value) ||
+    nondet_rhs.id() != ID_side_effect ||
+    to_side_effect_expr(nondet_rhs).get_statement() != ID_nondet ||
+    !semantic[8]->is_goto() ||
+    semantic[8]->targets.size() != 1 ||
+    !negated_nonzero_symbol_test(
+      semantic[8]->condition(), tested_value) ||
+    tested_value != nondet_value ||
+    positions.at(&*semantic[8]->get_target()) <=
+      positions.at(&*semantic[9]) ||
+    positions.at(&*semantic[8]->get_target()) >
+      positions.at(&*semantic[10]))
+  {
+    reason = "phase_boundary_nondet_exit";
+    return false;
+  }
+
+  irep_idt cleared_flag;
+  mp_integer zero;
+  if(
+    !semantic[9]->is_assign() ||
+    !direct_symbol(semantic[9]->assign_lhs(), cleared_flag) ||
+    cleared_flag != loop_flag ||
+    !constant_eval(semantic[9]->assign_rhs(), {}, zero) ||
+    zero != 0 ||
+    !semantic[10]->is_goto() ||
+    !semantic[10]->condition().is_true() ||
+    semantic[10]->targets.size() != 1 ||
+    semantic[10]->get_target() != semantic[0])
+  {
+    reason = "phase_boundary_loop_exit";
+    return false;
+  }
+
+  const symbolt *object_symbol = nullptr;
+  const symbolt *phase_symbol = nullptr;
+  const symbolt *flag_symbol = nullptr;
+  const symbolt *nondet_symbol = nullptr;
+  if(
+    ns.lookup(positive_object, object_symbol) ||
+    ns.lookup(phase, phase_symbol) ||
+    ns.lookup(loop_flag, flag_symbol) ||
+    ns.lookup(nondet_value, nondet_symbol) ||
+    !object_symbol->is_static_lifetime ||
+    object_symbol->type.id() != ID_signedbv ||
+    !is_atomic_symbol(*object_symbol) ||
+    object_symbol->type.get_bool(ID_C_volatile) ||
+    !phase_symbol->is_static_lifetime ||
+    phase_symbol->type.id() != ID_c_bool ||
+    is_atomic_symbol(*phase_symbol) ||
+    phase_symbol->type.get_bool(ID_C_volatile) ||
+    !flag_symbol->is_static_lifetime ||
+    flag_symbol->type.id() != ID_c_bool ||
+    is_atomic_symbol(*flag_symbol) ||
+    flag_symbol->type.get_bool(ID_C_volatile) ||
+    nondet_symbol->is_static_lifetime ||
+    nondet_symbol->type.id() != ID_c_bool)
+  {
+    reason = "phase_boundary_symbol_types";
+    return false;
+  }
+
+  for(const auto &instruction : program.instructions)
+  {
+    if(
+      instruction.is_assert() || instruction.is_assume() ||
+      instruction.is_function_call() ||
+      instruction.is_start_thread() ||
+      instruction.is_atomic_begin() ||
+      instruction.is_atomic_end())
+    {
+      reason = "phase_boundary_worker_effect";
+      return false;
+    }
+  }
+
+  summary.function = function_id;
+  summary.phase = phase;
+  summary.loop_flag = loop_flag;
+  summary.object = positive_object;
+  summary.weight = positive;
+  return true;
+}
+
+bool phase_boundary_initial_and_exclusive_state(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const std::vector<create_recordt> &creates,
+  const std::vector<phase_boundary_workert> &workers,
+  std::string &reason)
+{
+  const auto main =
+    model.goto_functions.function_map.find("main");
+  if(
+    main == model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+  {
+    reason = "phase_boundary_missing_main";
+    return false;
+  }
+
+  std::set<irep_idt> all_private;
+  std::set<irep_idt> objects;
+  std::set<irep_idt> owner_functions;
+  mp_integer outstanding_weight = 0;
+  for(const auto &worker : workers)
+  {
+    if(
+      !all_private.insert(worker.phase).second ||
+      !all_private.insert(worker.loop_flag).second)
+    {
+      reason = "phase_boundary_private_alias";
+      return false;
+    }
+    objects.insert(worker.object);
+    owner_functions.insert(worker.function);
+    outstanding_weight += worker.weight;
+  }
+  if(objects.size() != 1)
+  {
+    reason = "phase_boundary_object_mismatch";
+    return false;
+  }
+  const irep_idt object = *objects.begin();
+  const symbolt *object_symbol = nullptr;
+  if(ns.lookup(object, object_symbol))
+  {
+    reason = "phase_boundary_object_symbol";
+    return false;
+  }
+  const std::size_t width =
+    to_signedbv_type(object_symbol->type).get_width();
+  if(outstanding_weight > power(2, width - 1) - 1)
+  {
+    reason = "phase_boundary_transient_overflow";
+    return false;
+  }
+
+  const auto initializer =
+    model.goto_functions.function_map.find("__CPROVER_initialize");
+  if(
+    initializer == model.goto_functions.function_map.end() ||
+    !initializer->second.body_available())
+  {
+    reason = "phase_boundary_missing_initializer";
+    return false;
+  }
+  std::size_t zero_initializations = 0;
+  std::map<irep_idt, std::size_t> private_zero_initializations;
+  for(const auto &instruction :
+      initializer->second.body.instructions)
+  {
+    const bool mentions_object =
+      instruction_mentions_any(instruction, objects);
+    const bool mentions_private =
+      instruction_mentions_any(instruction, all_private);
+    if(!mentions_object && !mentions_private)
+      continue;
+    irep_idt target;
+    mp_integer value;
+    if(
+      mentions_object && mentions_private)
+    {
+      reason = "phase_boundary_initializer_alias";
+      return false;
+    }
+    if(
+      !instruction.is_assign() ||
+      !direct_symbol(instruction.assign_lhs(), target) ||
+      !constant_eval(instruction.assign_rhs(), {}, value) ||
+      value != 0)
+    {
+      reason = "phase_boundary_initializer_assignment";
+      return false;
+    }
+    if(mentions_object)
+    {
+      if(target != object)
+      {
+        reason = "phase_boundary_object_initialization";
+        return false;
+      }
+      ++zero_initializations;
+    }
+    else
+    {
+      if(all_private.count(target) == 0)
+      {
+        reason = "phase_boundary_private_static_initialization";
+        return false;
+      }
+      ++private_zero_initializations[target];
+    }
+  }
+  if(zero_initializations != 1)
+  {
+    reason = "phase_boundary_object_initialization";
+    return false;
+  }
+  for(const auto &identifier : all_private)
+  {
+    if(private_zero_initializations[identifier] != 1)
+    {
+      reason = "phase_boundary_private_static_initialization";
+      return false;
+    }
+  }
+
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : main->second.body.instructions)
+    positions.emplace(&instruction, position++);
+  std::map<irep_idt, std::size_t> initializations;
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != creates.front().instruction; ++instruction)
+  {
+    if(instruction_mentions_any(*instruction, objects))
+    {
+      reason = "phase_boundary_explicit_object_prefix";
+      return false;
+    }
+    if(!instruction_mentions_any(*instruction, all_private))
+      continue;
+    irep_idt target;
+    bool supported = false;
+    const auto control =
+      control_signature(
+        main->second.body,
+        positions,
+        positions.at(&*instruction),
+        supported);
+    mp_integer one;
+    if(
+      !instruction->is_assign() ||
+      !direct_symbol(instruction->assign_lhs(), target) ||
+      all_private.count(target) == 0 ||
+      !supported || !control.empty() ||
+      !constant_eval(instruction->assign_rhs(), {}, one) ||
+      one != 1)
+    {
+      reason = "phase_boundary_private_initialization";
+      return false;
+    }
+    ++initializations[target];
+  }
+  for(const auto &identifier : all_private)
+  {
+    if(initializations[identifier] != 1)
+    {
+      reason = "phase_boundary_private_initialization";
+      return false;
+    }
+  }
+
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(
+      !entry.second.body_available() ||
+      entry.first == "main" ||
+      entry.first == "__CPROVER_initialize" ||
+      owner_functions.count(entry.first) != 0)
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(
+        instruction_mentions_any(instruction, all_private) ||
+        instruction_mentions_any(instruction, objects))
+      {
+        reason = "phase_boundary_foreign_access";
+        return false;
+      }
+    }
+  }
+
+  for(std::size_t index = 0; index < workers.size(); ++index)
+  {
+    const std::set<irep_idt> owner_private{
+      workers[index].phase, workers[index].loop_flag};
+    for(std::size_t other = 0; other < workers.size(); ++other)
+    {
+      if(index == other)
+        continue;
+      const auto function =
+        model.goto_functions.function_map.find(
+          workers[other].function);
+      for(const auto &instruction :
+          function->second.body.instructions)
+      {
+        if(instruction_mentions_any(instruction, owner_private))
+        {
+          reason = "phase_boundary_cross_worker_private";
+          return false;
+        }
+      }
+    }
+  }
+
+  bool after_first_create = false;
+  for(const auto &instruction : main->second.body.instructions)
+  {
+    if(&instruction == &*creates.front().instruction)
+      after_first_create = true;
+    if(
+      after_first_create &&
+      instruction_mentions_any(instruction, all_private))
+    {
+      reason = "phase_boundary_observed_private";
+      return false;
+    }
+    if(
+      contains_address_of_symbol(instruction.code(), objects) ||
+      (instruction.has_condition() &&
+       contains_address_of_symbol(
+         instruction.condition(), objects)))
+    {
+      reason = "phase_boundary_object_alias";
+      return false;
+    }
+    if(
+      after_first_create && instruction.is_assign() &&
+      contains_symbol(instruction.assign_lhs(), objects))
+    {
+      reason = "phase_boundary_late_object_write";
+      return false;
+    }
+  }
+  return true;
+}
+} // namespace
+
+bool phase_boundary_cancellation_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  std::vector<create_recordt> creates;
+  std::vector<goto_programt::targett> joins;
+  std::string reason;
+  if(
+    !collect_lifecycle(goto_model, ns, creates, joins, reason) ||
+    creates.size() < 2 ||
+    !validate_main_region(
+      goto_model, ns, creates, joins, reason))
+  {
+    std::cout
+      << "NATIVE_PHASE_BOUNDARY_CANCELLATION applied=0 reason="
+      << (reason.empty() ? "phase_boundary_lifecycle" : reason)
+      << '\n';
+    return false;
+  }
+
+  std::vector<phase_boundary_workert> workers;
+  for(const auto &create : creates)
+  {
+    phase_boundary_workert worker;
+    if(!phase_boundary_worker(
+         goto_model, ns, create.worker, worker, reason))
+    {
+      std::cout
+        << "NATIVE_PHASE_BOUNDARY_CANCELLATION applied=0 reason="
+        << reason << " worker=" << create.worker << '\n';
+      return false;
+    }
+    workers.push_back(std::move(worker));
+  }
+  if(
+    !phase_boundary_initial_and_exclusive_state(
+      goto_model, ns, creates, workers, reason))
+  {
+    std::cout
+      << "NATIVE_PHASE_BOUNDARY_CANCELLATION applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+
+  for(const auto &worker : workers)
+  {
+    auto function =
+      goto_model.goto_functions.function_map.find(worker.function);
+    for(auto &instruction : function->second.body.instructions)
+    {
+      if(
+        !instruction.is_set_return_value() &&
+        !instruction.is_end_function())
+        instruction.turn_into_skip();
+    }
+  }
+  goto_model.goto_functions.update();
+  std::cout
+    << "NATIVE_PHASE_BOUNDARY_CANCELLATION applied=1"
+    << " workers=" << workers.size()
+    << " object=" << workers.front().object << '\n';
+  (void)message_handler;
+  return true;
+}
+
 bool homogeneous_spawn_witness_audit(
   const goto_modelt &goto_model,
   message_handlert &message_handler)

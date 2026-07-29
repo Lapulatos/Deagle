@@ -227,6 +227,13 @@ bool bounded_alternating_cancellation_transform(
   goto_modelt &goto_model,
   message_handlert &message_handler);
 
+/// Replace fully joined workers whose private phase permits nondeterministic
+/// termination only after an equal-opposite atomic update pair. Every finite
+/// transition word is the identity; unsupported shapes remain unchanged.
+bool phase_boundary_cancellation_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 /// Audit finite homogeneous spawn loops whose worker has one composable
 /// affine scalar effect. This does not mutate the GOTO model.
 bool homogeneous_spawn_witness_audit(
