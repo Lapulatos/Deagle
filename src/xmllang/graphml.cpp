@@ -451,23 +451,23 @@ bool write_graphml(const graphmlt &src, std::ostream &os, std::string filename, 
 
   // <key attr.name="assumption.scope" attr.type="string" for="edge"
   //      id="assumption.scope"/>
-  // {
-  //   xmlt &key=graphml.new_element("key");
-  //   key.set_attribute("attr.name", "assumption.scope");
-  //   key.set_attribute("attr.type", "string");
-  //   key.set_attribute("for", "edge");
-  //   key.set_attribute("id", "assumption.scope");
-  // }
+  {
+    xmlt &key=graphml.new_element("key");
+    key.set_attribute("attr.name", "assumption.scope");
+    key.set_attribute("attr.type", "string");
+    key.set_attribute("for", "edge");
+    key.set_attribute("id", "assumption.scope");
+  }
 
   // <key attr.name="enterFunction" attr.type="string" for="edge"
   //      id="enterFunction"/>
-  // {
-  //   xmlt &key=graphml.new_element("key");
-  //   key.set_attribute("attr.name", "enterFunction");
-  //   key.set_attribute("attr.type", "string");
-  //   key.set_attribute("for", "edge");
-  //   key.set_attribute("id", "enterFunction");
-  // }
+  {
+    xmlt &key=graphml.new_element("key");
+    key.set_attribute("attr.name", "enterFunction");
+    key.set_attribute("attr.type", "string");
+    key.set_attribute("for", "edge");
+    key.set_attribute("id", "enterFunction");
+  }
 
   // <key attr.name="returnFromFunction" attr.type="string" for="edge"
   //      id="returnFrom"/>

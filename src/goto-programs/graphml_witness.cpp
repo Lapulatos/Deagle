@@ -238,12 +238,16 @@ static bool filter_out(
   if(!it->is_assignment() && !it->is_goto() && !it->is_assert())
     return true;
 
-  // we filter out steps with the same source location
-  // TODO: if these are assignments we should accumulate them into
-  //       a single edge
+  // A source statement may expand into several consecutive SSA assignments.
+  // Keep the final visible state at that location: it is normally the
+  // source-level assignment or branch value, whereas the earlier states are
+  // library temporaries and actual-parameter plumbing.
+  const auto next_it = std::next(it);
   if(
-    prev_it != goto_trace.steps.end() &&
-    prev_it->pc->source_location() == it->pc->source_location())
+    it->is_assignment() &&
+    next_it != goto_trace.steps.end() &&
+    next_it->thread_nr == it->thread_nr &&
+    next_it->pc->source_location() == it->pc->source_location())
     return true;
 
   if(it->is_goto() && it->pc->condition().is_true())
@@ -388,7 +392,8 @@ void graphml_witnesst::operator()(const goto_tracet &goto_trace)
     step_to_node[it->step_nr]=node;
   }
 
-  unsigned thread_id = 0;
+  std::set<unsigned> introduced_threads{0};
+  std::set<unsigned> entered_threads{0};
 
   // build edges
   for(goto_tracet::stepst::const_iterator
@@ -444,19 +449,50 @@ void graphml_witnesst::operator()(const goto_tracet &goto_trace)
         data_t.data = std::to_string(it->thread_nr);
       }
 
+      if(
+        next != goto_trace.steps.end() &&
+        next->thread_nr != it->thread_nr &&
+        introduced_threads.insert(next->thread_nr).second)
+      {
+        xmlt &create_thread = edge.new_element("data");
+        create_thread.set_attribute("key", "createThread");
+        create_thread.data = std::to_string(next->thread_nr);
+      }
+
+      if(
+        it->thread_nr != 0 &&
+        entered_threads.insert(it->thread_nr).second)
+      {
+        xmlt &enter_function = edge.new_element("data");
+        enter_function.set_attribute("key", "enterFunction");
+        enter_function.data = id2string(it->function_id);
+      }
+
       const auto lhs_object = it->get_lhs_object();
       if(
         it->type == goto_trace_stept::typet::ASSIGNMENT &&
-        lhs_object.has_value())
+        lhs_object.has_value() &&
+        it->assignment_type !=
+          goto_trace_stept::assignment_typet::ACTUAL_PARAMETER)
       {
         const std::string &lhs_id = id2string(lhs_object->get_identifier());
+        const symbolt *lhs_symbol = nullptr;
+        const irep_idt lhs_scope =
+          !ns.lookup(lhs_id, lhs_symbol)
+            ? lhs_symbol->location.get_function()
+            : irep_idt{};
+        const bool source_level_lhs =
+          lhs_symbol != nullptr &&
+          !lhs_symbol->is_auxiliary &&
+          (lhs_scope.empty() || lhs_scope == it->function_id);
         if(lhs_id.find("pthread_create::thread") != std::string::npos)
         {
-          xmlt &data_t = edge.new_element("data");
-          data_t.set_attribute("key", "createThread");
-          data_t.data = std::to_string(++thread_id);
+          // Thread creation is attached to the first visible transition into
+          // the new thread above. The pthread library assignment itself is
+          // usually hidden or has a built-in source location.
         }
         else if(
+          source_level_lhs &&
           !contains_symbol_prefix(
             it->full_lhs_value, SYMEX_DYNAMIC_PREFIX "dynamic_object") &&
           !contains_symbol_prefix(
@@ -489,12 +525,36 @@ void graphml_witnesst::operator()(const goto_tracet &goto_trace)
             xmlt &val = edge.new_element("data");
             val.set_attribute("key", "assumption");
             val.data = assign_data;
+            if(!lhs_scope.empty())
+            {
+              xmlt &scope = edge.new_element("data");
+              scope.set_attribute("key", "assumption.scope");
+              scope.data = id2string(lhs_scope);
+            }
           }
           // __SZH_EDIT_END__
         }
       }
       else if(it->type == goto_trace_stept::typet::GOTO && it->pc->is_goto())
       {
+        // A conditional GOTO encodes whether its guard was taken.  C source
+        // branches and loops are normally lowered to "goto target if
+        // !source_condition", so peel logical negations before recording the
+        // source-level branch polarity.
+        exprt source_condition = it->pc->condition();
+        bool source_condition_value = it->cond_value;
+        while(source_condition.id() == ID_not)
+        {
+          source_condition = to_not_expr(source_condition).op();
+          source_condition_value = !source_condition_value;
+        }
+        if(!source_condition.is_constant())
+        {
+          xmlt &control = edge.new_element("data");
+          control.set_attribute("key", "control");
+          control.data =
+            source_condition_value ? "condition-true" : "condition-false";
+        }
       }
 
       graphml[to].in[from].xml_node = edge;

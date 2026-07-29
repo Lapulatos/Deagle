@@ -288,6 +288,126 @@ void output_error_trace(
 }
 
 /// outputs an error witness in graphml format
+static bool lift_native_spawn_prefix_witness(
+  const goto_tracet &input,
+  goto_tracet &output)
+{
+  const auto reject =
+    [](const std::string &reason)
+    {
+      std::cout
+        << "NATIVE_WITNESS_PREFIX_LIFT applied=0 reason="
+        << reason << '\n';
+      return false;
+    };
+  const auto is_thread_creation =
+    [](const goto_trace_stept &step)
+    {
+      if(
+        step.pc->source_location().get("deagle_trace_provenance") ==
+        "original_first_thread_create")
+        return true;
+      if(step.is_spawn())
+        return true;
+      if(!step.is_assignment())
+        return false;
+      const auto lhs_object = step.get_lhs_object();
+      return
+        lhs_object.has_value() &&
+        id2string(lhs_object->get_identifier()).find(
+          "pthread_create::thread") != std::string::npos;
+    };
+  auto failed_assertion = input.steps.end();
+  bool has_lift_provenance = false;
+  std::size_t worker_guard_visits = 0;
+  bool selector_value = false;
+  for(auto step = input.steps.begin(); step != input.steps.end(); ++step)
+  {
+    const auto &location = step->pc->source_location();
+    if(
+      location.get("deagle_trace_lift") ==
+      "single_worker_initialization_prefix_v1")
+      has_lift_provenance = true;
+    const irep_idt provenance =
+      location.get("deagle_trace_provenance");
+    if(provenance == "restricted_worker_first_iteration")
+      ++worker_guard_visits;
+    else if(
+      provenance == "original_nondet_choice" &&
+      step->is_assignment() &&
+      step->full_lhs_value.is_one())
+      selector_value = true;
+    if(step->is_assert() && !step->cond_value)
+      failed_assertion = step;
+  }
+  if(
+    !has_lift_provenance ||
+    failed_assertion == input.steps.end() ||
+    failed_assertion->thread_nr == 0 ||
+    worker_guard_visits != 1 ||
+    !selector_value)
+    return reject(
+      "prefix_obligation"
+      " marker=" + std::to_string(has_lift_provenance) +
+      " failed=" +
+      std::to_string(failed_assertion != input.steps.end()) +
+      " worker_guards=" + std::to_string(worker_guard_visits) +
+      " selector=" + std::to_string(selector_value));
+
+  const unsigned failing_thread = failed_assertion->thread_nr;
+  auto first_failing_thread_step = input.steps.end();
+  auto spawning_step = input.steps.end();
+  std::size_t spawn_guard_visits = 0;
+  for(auto step = input.steps.begin(); step != input.steps.end(); ++step)
+  {
+    if(step->thread_nr == failing_thread)
+    {
+      first_failing_thread_step = step;
+      break;
+    }
+    if(
+      step->thread_nr == 0 &&
+      step->pc->source_location().get("deagle_trace_provenance") ==
+        "restricted_spawn_first_iteration")
+      ++spawn_guard_visits;
+    if(step->thread_nr == 0 && is_thread_creation(*step))
+      spawning_step = step;
+  }
+  if(
+    first_failing_thread_step == input.steps.end() ||
+    spawning_step == input.steps.end() ||
+    spawn_guard_visits == 0)
+    return reject("missing_create_or_worker");
+
+  for(auto step = input.steps.begin();; ++step)
+  {
+    output.add_step(*step);
+    if(step == spawning_step)
+      break;
+  }
+  for(auto step = first_failing_thread_step;
+      step != input.steps.end(); ++step)
+  {
+    if(step->thread_nr == failing_thread)
+      output.add_step(*step);
+    if(step == failed_assertion)
+      break;
+  }
+
+  std::size_t step_number = 0;
+  for(auto &step : output.steps)
+    step.step_nr = ++step_number;
+  const bool lifted =
+    !output.steps.empty() &&
+    output.steps.back().is_assert() &&
+    !output.steps.back().cond_value;
+  if(lifted)
+    std::cout
+      << "NATIVE_WITNESS_PREFIX_LIFT applied=1"
+      << " steps=" << output.steps.size() << '\n';
+  return lifted ? true : reject("missing_final_property");
+}
+
 void output_graphml(
   const goto_tracet &goto_trace,
   const namespacet &ns,
@@ -304,8 +424,19 @@ void output_graphml(
     return;
   // __SZH_ADD_END__
 
+  goto_tracet lifted_trace;
+  const goto_tracet *witness_trace = &goto_trace;
+  if(
+    options.get_bool_option("native-witness-spawn-prefix-lift"))
+  {
+    if(!lift_native_spawn_prefix_witness(
+         goto_trace, lifted_trace))
+      return;
+    witness_trace = &lifted_trace;
+  }
+
   graphml_witnesst graphml_witness(ns);
-  graphml_witness(goto_trace);
+  graphml_witness(*witness_trace);
 
   std::string filename = options.get_option("filename");
 

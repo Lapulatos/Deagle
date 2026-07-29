@@ -15136,6 +15136,79 @@ bool single_worker_initialization_prefix_transform(
   }
 
   auto after_initialization = std::next(outer->backedge);
+  std::set<irep_idt> read_only_calls;
+  std::set<irep_idt> active_read_only_calls;
+  std::function<bool(const irep_idt &)> is_read_only_call =
+    [&](const irep_idt &callee) -> bool
+    {
+      if(read_only_calls.count(callee) != 0)
+        return true;
+      if(!active_read_only_calls.insert(callee).second)
+        return false;
+      const auto finish =
+        [&](const bool result)
+        {
+          active_read_only_calls.erase(callee);
+          if(result)
+            read_only_calls.insert(callee);
+          return result;
+        };
+      const auto function =
+        goto_model.goto_functions.function_map.find(callee);
+      if(
+        function == goto_model.goto_functions.function_map.end() ||
+        !function->second.body_available())
+      {
+        const std::string name = id2string(callee);
+        return finish(
+          name.find("__VERIFIER_nondet_") == 0 ||
+          name == "__CPROVER_assume" ||
+          name == "abort");
+      }
+      for(const auto &instruction : function->second.body.instructions)
+      {
+        if(
+          instruction.is_start_thread() ||
+          instruction.is_end_thread() ||
+          instruction.is_assert())
+          return finish(false);
+        if(instruction.is_assign())
+        {
+          irep_idt lhs;
+          if(!direct_symbol(instruction.assign_lhs(), lhs))
+            return finish(false);
+          const auto symbol =
+            goto_model.symbol_table.symbols.find(lhs);
+          if(
+            symbol == goto_model.symbol_table.symbols.end() ||
+            symbol->second.is_static_lifetime ||
+            symbol->second.location.get_function() != callee)
+            return finish(false);
+        }
+        if(instruction.is_function_call())
+        {
+          irep_idt nested;
+          if(
+            !direct_call_identifier(instruction, nested) ||
+            !is_read_only_call(nested))
+            return finish(false);
+          if(!instruction.call_lhs().is_nil())
+          {
+            irep_idt lhs;
+            if(!direct_symbol(instruction.call_lhs(), lhs))
+              return finish(false);
+            const auto symbol =
+              goto_model.symbol_table.symbols.find(lhs);
+            if(
+              symbol == goto_model.symbol_table.symbols.end() ||
+              symbol->second.is_static_lifetime ||
+              symbol->second.location.get_function() != callee)
+              return finish(false);
+          }
+        }
+      }
+      return finish(true);
+    };
   for(;
       after_initialization != program.instructions.end() &&
       &*after_initialization != candidates.front().create_instruction;
@@ -15144,11 +15217,13 @@ bool single_worker_initialization_prefix_transform(
     irep_idt callee;
     if(
       direct_call_identifier(*after_initialization, callee) &&
-      callee != "pthread_create")
+      callee != "pthread_create" &&
+      !is_read_only_call(callee))
     {
       std::cout
         << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=0"
-        << " reason=post_initialization_call\n";
+        << " reason=post_initialization_call"
+        << " callee=" << callee << '\n';
       return false;
     }
   }
@@ -15241,11 +15316,6 @@ bool single_worker_initialization_prefix_transform(
   }
 
   const namespacet ns(goto_model.symbol_table);
-  const symbolt *outer_induction_symbol = nullptr;
-  if(ns.lookup(outer->induction, outer_induction_symbol))
-    return false;
-  auto outer_head = program.const_cast_target(outer->head);
-
   const auto worker = goto_model.goto_functions.function_map.find(
     candidates.front().worker);
   if(
@@ -15379,20 +15449,30 @@ bool single_worker_initialization_prefix_transform(
       << " reason=spawn_transform_failed\n";
     return false;
   }
-  outer_head->condition_nonconst() = not_exprt(
-    binary_relation_exprt(
+  program.const_cast_target(candidates.front().head)
+    ->source_location_nonconst()
+    .set(
+      "deagle_trace_provenance",
+      "restricted_spawn_first_iteration");
+  worker_head->source_location_nonconst().set(
+    "deagle_trace_provenance",
+    "restricted_worker_first_iteration");
+  program.const_cast_target(after_initialization)
+    ->source_location_nonconst()
+    .set(
+    "deagle_trace_provenance", "original_first_thread_create");
+  worker_nondet->source_location_nonconst().set(
+    "deagle_trace_provenance", "original_nondet_choice");
+  auto selector_assumption = goto_programt::make_assumption(
+    equal_exprt(
       symbol_exprt(
-        outer->induction, outer_induction_symbol->type),
-      ID_lt,
-      from_integer(2, outer_induction_symbol->type)));
+        worker_induction, worker_induction_symbol->type),
+      from_integer(1, worker_induction_symbol->type)),
+    worker_nondet->source_location());
+  selector_assumption.source_location_nonconst().set(
+    "deagle_trace_provenance", "original_nondet_choice");
   worker_program.insert_after(
-    worker_nondet,
-    goto_programt::make_assumption(
-      equal_exprt(
-        symbol_exprt(
-          worker_induction, worker_induction_symbol->type),
-        from_integer(1, worker_induction_symbol->type)),
-      worker_nondet->source_location()));
+    worker_nondet, std::move(selector_assumption));
   worker_head->condition_nonconst() = not_exprt(
     binary_relation_exprt(
       symbol_exprt(
@@ -15402,15 +15482,32 @@ bool single_worker_initialization_prefix_transform(
   program.instructions.begin()
     ->source_location_nonconst()
     .set("deagle_single_worker_initialization_prefix", true);
+  program.instructions.begin()
+    ->source_location_nonconst()
+    .set(
+      "deagle_trace_lift",
+      "single_worker_initialization_prefix_v1");
   goto_model.goto_functions.update();
+  const irep_idt inner_unwind_loop =
+    goto_programt::loop_id("main", *inner->backedge);
+  const irep_idt outer_unwind_loop =
+    goto_programt::loop_id("main", *outer->backedge);
   program.instructions.begin()
     ->source_location_nonconst()
     .set(
       "deagle_single_worker_initialization_unwind_loop",
-      goto_programt::loop_id("main", *inner->backedge));
+      inner_unwind_loop);
+  program.instructions.begin()
+    ->source_location_nonconst()
+    .set(
+      "deagle_single_worker_initialization_outer_unwind_loop",
+      outer_unwind_loop);
   std::cout
     << "NATIVE_SINGLE_WORKER_INITIALIZATION_PREFIX applied=1"
-    << " loops=2 outer_prefix=2 inner_complete=1"
+    << " loops=2 initialization_complete=1"
+    << " unwind_loops=" << inner_unwind_loop
+    << "," << outer_unwind_loop
+    << " read_only_prefix_calls=" << read_only_calls.size()
     << " worker_selector=1 worker_domain=2 workers=1"
     << " truncated=" << (truncated ? 1 : 0) << '\n';
   (void)message_handler;
@@ -15445,6 +15542,22 @@ std::string single_worker_initialization_prefix_unwind_loop(
     main->second.body.instructions.begin()
       ->source_location()
       .get("deagle_single_worker_initialization_unwind_loop"));
+}
+
+std::string single_worker_initialization_prefix_outer_unwind_loop(
+  const goto_modelt &goto_model)
+{
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  if(
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available() ||
+    main->second.body.instructions.empty())
+    return "";
+  return id2string(
+    main->second.body.instructions.begin()
+      ->source_location()
+      .get("deagle_single_worker_initialization_outer_unwind_loop"));
 }
 
 bool pair_initialization_prefix_transform(

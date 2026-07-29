@@ -226,6 +226,130 @@ bool output_native_correctness_witness(
   }
   return true;
 }
+
+struct native_replay_choicet
+{
+  irep_idt function;
+  irep_idt line;
+  irep_idt lhs;
+  exprt value;
+};
+
+std::vector<native_replay_choicet>
+collect_native_replay_choices(const goto_tracet &trace)
+{
+  std::vector<native_replay_choicet> choices;
+  if(
+    trace.steps.empty() ||
+    !trace.get_last_step().is_assert())
+    return choices;
+  const unsigned failing_thread =
+    trace.get_last_step().thread_nr;
+  const irep_idt source_file =
+    trace.get_last_step().pc->source_location().get_file();
+  for(const auto &step : trace.steps)
+  {
+    if(
+      step.thread_nr != failing_thread ||
+      !step.is_assignment() ||
+      !step.pc->is_assign() ||
+      step.full_lhs_value.is_nil())
+      continue;
+    const exprt &rhs = step.pc->assign_rhs();
+    if(
+      rhs.id() != ID_side_effect ||
+      rhs.get(ID_statement) != ID_nondet)
+      continue;
+    const exprt &lhs = step.pc->assign_lhs();
+    if(lhs.id() != ID_symbol)
+      continue;
+    const irep_idt lhs_identifier =
+      to_symbol_expr(lhs).get_identifier();
+    const auto &location = step.pc->source_location();
+    if(
+      location.is_built_in() ||
+      location.get_file() != source_file ||
+      location.get_function().empty() ||
+      location.get_line().empty())
+      continue;
+    auto existing = std::find_if(
+      choices.begin(),
+      choices.end(),
+      [&](const native_replay_choicet &choice)
+      {
+        return
+          choice.function == location.get_function() &&
+          choice.line == location.get_line() &&
+          choice.lhs == lhs_identifier;
+      });
+    if(existing == choices.end())
+      choices.push_back(
+        {location.get_function(),
+         location.get_line(),
+         lhs_identifier,
+         step.full_lhs_value});
+    else
+      existing->value = step.full_lhs_value;
+  }
+  return choices;
+}
+
+bool apply_native_replay_choices(
+  goto_modelt &goto_model,
+  const std::vector<native_replay_choicet> &choices)
+{
+  std::vector<bool> consumed(choices.size(), false);
+  std::size_t applied = 0;
+  for(auto &function : goto_model.goto_functions.function_map)
+  {
+    if(!function.second.body_available())
+      continue;
+    auto &program = function.second.body;
+    for(auto instruction = program.instructions.begin();
+        instruction != program.instructions.end();
+        ++instruction)
+    {
+      if(!instruction->is_assign())
+        continue;
+      const exprt &rhs = instruction->assign_rhs();
+      if(
+        rhs.id() != ID_side_effect ||
+        rhs.get(ID_statement) != ID_nondet)
+        continue;
+      const exprt &lhs = instruction->assign_lhs();
+      if(lhs.id() != ID_symbol)
+        continue;
+      const irep_idt lhs_identifier =
+        to_symbol_expr(lhs).get_identifier();
+      const auto &location = instruction->source_location();
+      for(std::size_t index = 0; index < choices.size(); ++index)
+      {
+        if(
+          consumed[index] ||
+          choices[index].function != function.first ||
+          choices[index].line != location.get_line() ||
+          choices[index].lhs != lhs_identifier)
+          continue;
+        exprt value = choices[index].value;
+        if(value.type() != instruction->assign_lhs().type())
+          value = typecast_exprt(value, instruction->assign_lhs().type());
+        program.insert_after(
+          instruction,
+          goto_programt::make_assumption(
+            equal_exprt(instruction->assign_lhs(), value),
+            location));
+        consumed[index] = true;
+        ++applied;
+        break;
+      }
+    }
+  }
+  goto_model.goto_functions.update();
+  std::cout
+    << "NATIVE_ORIGINAL_GOTO_REPLAY choices=" << choices.size()
+    << " applied=" << applied << '\n';
+  return applied == choices.size() && applied != 0;
+}
 }
 
 cbmc_parse_optionst::cbmc_parse_optionst(int argc, const char **argv)
@@ -319,6 +443,13 @@ void cbmc_parse_optionst::get_command_line_options(optionst &options)
   {
     options.set_option("refined-pointer-analysis", false);
     options.set_option("allow-pointer-unsoundness", true);
+    // The single-worker initialization prefix may retain hundreds of
+    // allocation objects. Object identifiers are encoded while the GOTO model
+    // is processed, so this capacity must be selected before portfolio
+    // children are forked.
+    options.set_option("object-bits", "10");
+    config.bv_encoding.object_bits = 10;
+    config.bv_encoding.is_object_bits_default = false;
   }
   // __SZH_ADD_END__
 
@@ -694,14 +825,26 @@ int cbmc_parse_optionst::doit()
   }
 
   native_witness_assertionst native_witness_assertions;
+  std::unique_ptr<goto_modelt> native_original_replay_model;
   int get_goto_program_ret = get_goto_program(
     goto_model,
     options,
     cmdline,
     ui_message_handler,
-    [&native_witness_assertions](const goto_modelt &unprocessed_model) {
+    [&native_witness_assertions,
+     &native_original_replay_model,
+     this](const goto_modelt &unprocessed_model) {
       native_witness_assertions =
         collect_native_witness_assertions(unprocessed_model);
+      if(cmdline.isset("native-counterexample-rescue-portfolio"))
+      {
+        native_original_replay_model =
+          util_make_unique<goto_modelt>();
+        native_original_replay_model->symbol_table =
+          unprocessed_model.symbol_table;
+        native_original_replay_model->goto_functions.copy_from(
+          unprocessed_model.goto_functions);
+      }
     });
 
   if(get_goto_program_ret!=-1)
@@ -711,6 +854,8 @@ int cbmc_parse_optionst::doit()
   bool native_rescue_portfolio_child = false;
   if(cmdline.isset("native-counterexample-rescue-portfolio"))
   {
+    if(!single_worker_initialization_prefix_applied(goto_model))
+      native_original_replay_model.reset();
 #ifdef _WIN32
     std::cout
       << "NATIVE_COUNTEREXAMPLE_RESCUE_PORTFOLIO applied=0"
@@ -832,7 +977,6 @@ int cbmc_parse_optionst::doit()
           dup2(output_fd, STDERR_FILENO) < 0)
           _exit(CPROVER_EXIT_INTERNAL_ERROR);
         close(output_fd);
-
         if(rescue_variant.stage == rescue_staget::independent_index)
         {
           options.set_option("refined-pointer-analysis", false);
@@ -849,16 +993,21 @@ int cbmc_parse_optionst::doit()
         {
           options.set_option("refined-pointer-analysis", false);
           options.set_option("allow-pointer-unsoundness", false);
-          options.set_option("object-bits", "10");
           options.set_option("unwinding-assertions", false);
+          options.set_option(
+            "native-witness-spawn-prefix-lift", true);
           options.set_option("unwind", "3");
           const std::string initialization_loop =
             single_worker_initialization_prefix_unwind_loop(
               goto_model);
+          const std::string outer_initialization_loop =
+            single_worker_initialization_prefix_outer_unwind_loop(
+              goto_model);
           options.set_option(
             "unwindset",
             optionst::value_listt{
-              initialization_loop + ":32"});
+              initialization_loop + ":32",
+              outer_initialization_loop + ":11"});
         }
         else if(rescue_variant.stage == rescue_staget::initialized_pair)
         {
@@ -951,10 +1100,22 @@ int cbmc_parse_optionst::doit()
       child_output_stream.close();
       std::remove(output_path);
       const std::string child_output = child_output_buffer.str();
-      if(
+      const bool accepted_child =
         finished && WIFEXITED(status) &&
         WEXITSTATUS(status) == CPROVER_EXIT_VERIFICATION_UNSAFE &&
-        child_output.find("VERIFICATION FAILED") != std::string::npos)
+        child_output.find("VERIFICATION FAILED") != std::string::npos;
+      if(!accepted_child)
+      {
+        std::istringstream marker_stream(child_output);
+        std::string marker;
+        while(std::getline(marker_stream, marker))
+        {
+          if(
+            marker.find("NATIVE_ORIGINAL_GOTO_REPLAY ") == 0)
+            std::cout << marker << '\n';
+        }
+      }
+      if(accepted_child)
       {
         std::cout << child_output;
         return CPROVER_EXIT_VERIFICATION_UNSAFE;
@@ -1652,6 +1813,135 @@ int cbmc_parse_optionst::doit()
     }
 
     return CPROVER_EXIT_SUCCESS;
+  }
+
+  if(
+    native_rescue_portfolio_child &&
+    options.get_bool_option("native-witness-spawn-prefix-lift") &&
+    native_original_replay_model)
+  {
+    const std::string final_witness_path =
+      options.get_option("graphml-witness");
+    std::vector<native_replay_choicet> replay_choices;
+    irep_idt candidate_failure_function;
+    irep_idt candidate_failure_line;
+    {
+      optionst candidate_options = options;
+      candidate_options.set_option("graphml-witness", "");
+      candidate_options.set_option("trace", true);
+      all_properties_verifier_with_trace_storaget<multi_path_symex_checkert>
+        candidate_verifier(
+          candidate_options, ui_message_handler, goto_model);
+      const resultt candidate_result = candidate_verifier();
+      if(
+        candidate_result != resultt::FAIL ||
+        candidate_verifier.get_traces().all().empty())
+      {
+        std::cout
+          << "NATIVE_ORIGINAL_GOTO_REPLAY applied=0"
+          << " reason=no_candidate_trace\n";
+        return result_to_exit_code(candidate_result);
+      }
+
+      const goto_tracet &candidate_trace =
+        candidate_verifier.get_traces().all().front();
+      const auto &candidate_failure =
+        candidate_trace.get_last_step();
+      if(!candidate_failure.is_assert())
+      {
+        std::cout
+          << "NATIVE_ORIGINAL_GOTO_REPLAY applied=0"
+          << " reason=candidate_property\n";
+        return CPROVER_EXIT_VERIFICATION_SAFE;
+      }
+      replay_choices =
+        collect_native_replay_choices(candidate_trace);
+      candidate_failure_function =
+        candidate_failure.pc->source_location().get_function();
+      candidate_failure_line =
+        candidate_failure.pc->source_location().get_line();
+    }
+
+    optionst replay_options = options;
+    replay_options.set_option(
+      "graphml-witness", final_witness_path);
+    replay_options.set_option(
+      "native-pair-initialization-prefix", false);
+    replay_options.set_option(
+      "native-witness-spawn-prefix-lift", false);
+    replay_options.set_option("refined-pointer-analysis", false);
+    replay_options.set_option("allow-pointer-unsoundness", false);
+    replay_options.set_option("unwinding-assertions", false);
+    replay_options.set_option("unwind", "3");
+    replay_options.set_option(
+      "unwindset",
+      optionst::value_listt{
+        single_worker_initialization_prefix_unwind_loop(
+          goto_model) + ":32",
+        single_worker_initialization_prefix_outer_unwind_loop(
+          goto_model) + ":11"});
+
+    messaget replay_log{ui_message_handler};
+    if(
+      cbmc_parse_optionst::process_goto_program(
+        *native_original_replay_model,
+        replay_options,
+        replay_log) ||
+      !apply_native_replay_choices(
+        *native_original_replay_model, replay_choices))
+    {
+      std::cout
+        << "NATIVE_ORIGINAL_GOTO_REPLAY applied=0"
+        << " reason=guide_construction\n";
+      return CPROVER_EXIT_VERIFICATION_SAFE;
+    }
+
+    all_properties_verifier_with_trace_storaget<multi_path_symex_checkert>
+      replay_verifier(
+        replay_options,
+        ui_message_handler,
+        *native_original_replay_model);
+    const resultt replay_result = replay_verifier();
+    if(
+      replay_result != resultt::FAIL ||
+      replay_verifier.get_traces().all().empty())
+    {
+      std::cout
+        << "NATIVE_ORIGINAL_GOTO_REPLAY applied=0"
+        << " reason=original_model_result"
+        << " result=" << static_cast<int>(replay_result) << '\n';
+      return CPROVER_EXIT_VERIFICATION_SAFE;
+    }
+
+    const auto &replay_failure =
+      replay_verifier.get_traces().all().front().get_last_step();
+    if(
+      !replay_failure.is_assert() ||
+      candidate_failure_function !=
+        replay_failure.pc->source_location().get_function() ||
+      candidate_failure_line !=
+        replay_failure.pc->source_location().get_line())
+    {
+      std::cout
+        << "NATIVE_ORIGINAL_GOTO_REPLAY applied=0"
+        << " reason=property_mismatch\n";
+      return CPROVER_EXIT_VERIFICATION_SAFE;
+    }
+
+    std::cout
+      << "NATIVE_ORIGINAL_GOTO_REPLAY applied=1"
+      << " choices=" << replay_choices.size()
+      << " steps="
+      << replay_verifier.get_traces().all().front().steps.size()
+      << '\n';
+    const namespacet replay_namespace(
+      native_original_replay_model->symbol_table);
+    output_graphml(
+      replay_verifier.get_traces().all().front(),
+      replay_namespace,
+      replay_options);
+    replay_verifier.report();
+    return CPROVER_EXIT_VERIFICATION_UNSAFE;
   }
 
   std::unique_ptr<goto_verifiert> verifier = nullptr;

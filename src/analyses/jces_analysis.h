@@ -89,6 +89,9 @@ bool single_worker_initialization_prefix_applied(
 std::string single_worker_initialization_prefix_unwind_loop(
   const goto_modelt &goto_model);
 
+std::string single_worker_initialization_prefix_outer_unwind_loop(
+  const goto_modelt &goto_model);
+
 // Soundly removes a dormant worker population when every worker performs an
 // exact zero-sum scalar update while holding the same mutex that protects the
 // zero assertion.
