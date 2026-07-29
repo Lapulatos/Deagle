@@ -1335,6 +1335,15 @@ int cbmc_parse_optionst::doit()
 
   if(
     cmdline.isset("native-jces") &&
+    cmdline.isset("native-pure-spin-wait") &&
+    !cmdline.isset("unwind-suggest"))
+    native_model_transformed =
+      pure_spin_wait_dispatch(
+        goto_model, ui_message_handler) ||
+      native_model_transformed;
+
+  if(
+    cmdline.isset("native-jces") &&
     !cmdline.isset("unwind-suggest"))
     native_model_transformed =
       local_loop_acceleration_transform(

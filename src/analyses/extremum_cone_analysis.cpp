@@ -126,6 +126,17 @@ bool shared_signed(
     symbol->type.id() == ID_signedbv;
 }
 
+bool shared_unsigned32(
+  const irep_idt &identifier,
+  const namespacet &ns)
+{
+  const symbolt *symbol = lookup(identifier, ns);
+  return
+    symbol != nullptr && symbol->is_static_lifetime && !symbol->is_type &&
+    symbol->type.id() == ID_unsignedbv &&
+    to_unsignedbv_type(symbol->type).get_width() == 32;
+}
+
 bool shared_boolean(
   const irep_idt &identifier,
   const namespacet &ns)
@@ -4286,6 +4297,10 @@ bool flow_range_worker(
   const auto &program =
     model.goto_functions.function_map.at(worker).body;
   goto_programt::const_targett fold_call = program.instructions.end();
+  goto_programt::const_targett contribution_call =
+    program.instructions.end();
+  irep_idt contribution_temporary;
+  exprt contribution_expression;
   unsigned atomic_depth = 0;
   std::size_t atomic_begins = 0;
   std::size_t atomic_ends = 0;
@@ -4321,22 +4336,57 @@ bool flow_range_worker(
         continue;
       irep_idt accumulator;
       irep_idt first;
+      const bool fold_shape =
+        !instruction->call_lhs().is_nil() &&
+        instruction->call_arguments().size() == 2 &&
+        symbol_id(instruction->call_lhs(), accumulator) &&
+        symbol_id(instruction->call_arguments()[0], first) &&
+        accumulator == first && shared_signed(accumulator, ns);
+      if(fold_shape)
+      {
+        if(
+          atomic_depth != 1 ||
+          fold_call != program.instructions.end())
+        {
+          reason = "flow_worker_call";
+          return false;
+        }
+        result.accumulator = accumulator;
+        result.operation = callee;
+        const exprt &argument =
+          strip(instruction->call_arguments()[1]);
+        irep_idt argument_symbol;
+        if(
+          !contribution_temporary.empty() &&
+          symbol_id(argument, argument_symbol) &&
+          argument_symbol == contribution_temporary)
+          result.contribution = contribution_expression;
+        else
+          result.contribution = argument;
+        result.writes.insert(&*instruction);
+        fold_call = instruction;
+        continue;
+      }
+
+      irep_idt temporary;
       if(
         instruction->call_lhs().is_nil() ||
         instruction->call_arguments().size() != 2 ||
-        !symbol_id(instruction->call_lhs(), accumulator) ||
-        !symbol_id(instruction->call_arguments()[0], first) ||
-        accumulator != first || !shared_signed(accumulator, ns) ||
-        atomic_depth != 1 || fold_call != program.instructions.end())
+        !symbol_id(instruction->call_lhs(), temporary) ||
+        shared_signed(temporary, ns) ||
+        atomic_depth != 1 ||
+        contribution_call != program.instructions.end() ||
+        !signed_addition_helper(model, ns, callee, reason))
       {
-        reason = "flow_worker_call";
+        if(reason.empty())
+          reason = "flow_worker_call";
         return false;
       }
-      result.accumulator = accumulator;
-      result.operation = callee;
-      result.contribution = strip(instruction->call_arguments()[1]);
-      result.writes.insert(&*instruction);
-      fold_call = instruction;
+      contribution_temporary = temporary;
+      contribution_expression = plus_exprt(
+        strip(instruction->call_arguments()[0]),
+        strip(instruction->call_arguments()[1]));
+      contribution_call = instruction;
       continue;
     }
     if(instruction->is_assign())
@@ -4365,7 +4415,9 @@ bool flow_range_worker(
   }
   if(
     atomic_depth != 0 || atomic_begins != 1 || atomic_ends != 1 ||
-    fold_call == program.instructions.end())
+    fold_call == program.instructions.end() ||
+    (!contribution_temporary.empty() &&
+     contribution_call->location_number >= fold_call->location_number))
   {
     reason = "flow_worker_fold";
     return false;
@@ -4475,6 +4527,336 @@ bool flow_range_worker(
   return true;
 }
 
+struct ordered_extremum_propertyt
+{
+  irep_idt whole;
+  irep_idt prefix;
+  irep_idt suffix;
+  bool minimum;
+  bool shared_partition_accumulator;
+  const goto_programt::instructiont *assumption;
+  const goto_programt::instructiont *error;
+
+  ordered_extremum_propertyt()
+    : minimum(false),
+      shared_partition_accumulator(false),
+      assumption(nullptr),
+      error(nullptr)
+  {
+  }
+};
+
+bool ordered_extremum_expression(
+  const exprt &src,
+  irep_idt &prefix,
+  irep_idt &suffix,
+  bool &minimum)
+{
+  const exprt &choice = strip(src);
+  if(choice.id() != ID_if || choice.operands().size() != 3)
+    return false;
+  const exprt &condition = strip(choice.op0());
+  if(
+    (condition.id() != ID_lt && condition.id() != ID_gt) ||
+    condition.operands().size() != 2)
+    return false;
+  irep_idt left;
+  irep_idt right;
+  irep_idt true_value;
+  irep_idt false_value;
+  if(
+    !symbol_id(condition.op0(), left) ||
+    !symbol_id(condition.op1(), right) ||
+    !symbol_id(choice.op1(), true_value) ||
+    !symbol_id(choice.op2(), false_value) ||
+    true_value != right || false_value != left ||
+    left == right)
+    return false;
+  prefix = left;
+  suffix = right;
+  minimum = condition.id() == ID_gt;
+  return true;
+}
+
+bool find_ordered_extremum_property(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const lifecyclet &life,
+  ordered_extremum_propertyt &property,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::size_t matches = 0;
+  std::size_t errors = 0;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(call_id(instruction, callee) && is_reach_error(callee))
+      {
+        ++errors;
+        if(entry.first != ID_main)
+        {
+          reason = "ordered_extremum_error_function";
+          return false;
+        }
+        property.error = &instruction;
+      }
+    }
+  }
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.last_join == nullptr ||
+      instruction.location_number <= life.last_join->location_number)
+      continue;
+    irep_idt callee;
+    if(
+      !call_id(instruction, callee) || !is_assume(callee) ||
+      instruction.call_arguments().size() != 1)
+      continue;
+    const exprt &condition =
+      strip(instruction.call_arguments().front());
+    if(
+      condition.id() != ID_notequal ||
+      condition.operands().size() != 2)
+      continue;
+    irep_idt whole;
+    irep_idt prefix;
+    irep_idt suffix;
+    bool minimum = false;
+    bool parsed =
+      symbol_id(condition.op0(), whole) &&
+      ordered_extremum_expression(
+        condition.op1(), prefix, suffix, minimum);
+    if(!parsed)
+      parsed =
+        symbol_id(condition.op1(), whole) &&
+        ordered_extremum_expression(
+          condition.op0(), prefix, suffix, minimum);
+    bool shared_partition_accumulator = false;
+    if(!parsed)
+    {
+      parsed =
+        symbol_id(condition.op0(), whole) &&
+        symbol_id(condition.op1(), prefix);
+      if(!parsed)
+        parsed =
+          symbol_id(condition.op1(), whole) &&
+          symbol_id(condition.op0(), prefix);
+      if(parsed)
+      {
+        suffix = prefix;
+        shared_partition_accumulator = true;
+      }
+    }
+    if(
+      !parsed || !shared_signed(whole, ns) ||
+      !shared_signed(prefix, ns) || !shared_signed(suffix, ns) ||
+      whole == prefix || whole == suffix ||
+      (!shared_partition_accumulator && prefix == suffix))
+      continue;
+    ++matches;
+    property.whole = whole;
+    property.prefix = prefix;
+    property.suffix = suffix;
+    property.minimum = minimum;
+    property.shared_partition_accumulator =
+      shared_partition_accumulator;
+    property.assumption = &instruction;
+  }
+  if(
+    matches != 1 || errors != 1 ||
+    property.assumption == nullptr || property.error == nullptr ||
+    property.assumption->location_number >=
+      property.error->location_number)
+  {
+    reason =
+      matches == 0 ? "ordered_extremum_property" :
+                     "ordered_extremum_property_ambiguous";
+    return false;
+  }
+  return true;
+}
+
+bool ordered_extremum_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  const bool minimum,
+  flow_range_workert &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  goto_programt::const_targett update = program.instructions.end();
+  unsigned atomic_depth = 0;
+  std::size_t atomic_begins = 0;
+  std::size_t atomic_ends = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_atomic_begin())
+    {
+      ++atomic_depth;
+      ++atomic_begins;
+      if(atomic_depth != 1)
+      {
+        reason = "ordered_extremum_atomic_nesting";
+        return false;
+      }
+      continue;
+    }
+    if(instruction->is_atomic_end())
+    {
+      if(atomic_depth != 1)
+      {
+        reason = "ordered_extremum_atomic_balance";
+        return false;
+      }
+      --atomic_depth;
+      ++atomic_ends;
+      continue;
+    }
+    irep_idt callee;
+    if(call_id(*instruction, callee))
+    {
+      if(is_assume(callee))
+        continue;
+      reason = "ordered_extremum_worker_call";
+      return false;
+    }
+    if(!instruction->is_assign())
+      continue;
+    irep_idt lhs;
+    if(shared_symbol_lhs(*instruction, ns, lhs))
+    {
+      if(
+        atomic_depth != 1 ||
+        update != program.instructions.end() ||
+        !shared_signed(lhs, ns) ||
+        !guarded_direction(
+          program, instruction, lhs, minimum))
+      {
+        reason = "ordered_extremum_update";
+        return false;
+      }
+      irep_idt base;
+      irep_idt index;
+      if(
+        !array_symbol_index(
+          instruction->assign_rhs(), base, index))
+      {
+        reason = "ordered_extremum_element";
+        return false;
+      }
+      result.accumulator = lhs;
+      result.contribution = strip(instruction->assign_rhs());
+      result.writes.insert(&*instruction);
+      update = instruction;
+    }
+    else
+    {
+      irep_idt base;
+      if(base_pointer(instruction->assign_lhs(), base))
+      {
+        reason = "ordered_extremum_array_write";
+        return false;
+      }
+    }
+  }
+  if(
+    atomic_depth != 0 || atomic_begins != 1 || atomic_ends != 1 ||
+    update == program.instructions.end())
+  {
+    reason = "ordered_extremum_worker_shape";
+    return false;
+  }
+
+  natural_loopst loops;
+  loops(program);
+  if(loops.loop_map.size() != 1)
+  {
+    reason = "ordered_extremum_loop_count";
+    return false;
+  }
+  const auto &entry = *loops.loop_map.begin();
+  if(!entry.second.contains(update))
+  {
+    reason = "ordered_extremum_update_outside_loop";
+    return false;
+  }
+  flow_loop_dimensiont dimension;
+  if(
+    !parse_loop_exit(
+      *entry.first, dimension.induction, dimension.bound) ||
+    !loop_initial_value(
+      program,
+      entry.first,
+      dimension.induction,
+      dimension.start,
+      reason))
+  {
+    if(reason.empty())
+      reason = "ordered_extremum_loop_guard";
+    return false;
+  }
+  std::size_t increments = 0;
+  std::size_t backedges = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(entry.second.contains(instruction))
+      dimension.members.insert(&*instruction);
+    if(
+      entry.second.contains(instruction) &&
+      unit_increment(*instruction, dimension.induction))
+      ++increments;
+    if(
+      instruction->is_goto() &&
+      entry.second.contains(instruction) &&
+      instruction != entry.first &&
+      instruction->condition().is_true() &&
+      instruction->targets.size() == 1 &&
+      instruction->get_target() == entry.first)
+      ++backedges;
+  }
+  if(increments != 1 || backedges != 1)
+  {
+    reason = "ordered_extremum_loop_skeleton";
+    return false;
+  }
+  irep_idt contribution_base;
+  irep_idt contribution_index;
+  if(
+    !array_symbol_index(
+      result.contribution,
+      contribution_base,
+      contribution_index) ||
+    contribution_index != dimension.induction)
+  {
+    reason = "ordered_extremum_index";
+    return false;
+  }
+  result.dimensions.push_back(dimension);
+  result.normalized_contribution = result.contribution;
+  normalize_flow_expression(
+    result.dimensions, result.normalized_contribution);
+  collect_static_symbols(
+    result.contribution, ns, result.input_symbols);
+  collect_static_symbols(
+    dimension.start, ns, result.input_symbols);
+  collect_static_symbols(
+    dimension.bound, ns, result.input_symbols);
+  result.input_symbols.erase(result.accumulator);
+  collect_pointer_bases(
+    result.contribution, result.pointer_bases);
+  result.worker = worker;
+  return true;
+}
+
 bool relation_symbols(
   const exprt &src,
   const irep_idt &relation_id,
@@ -4499,7 +4881,7 @@ bool static_partition_precondition(
   const auto &main =
     model.goto_functions.function_map.at(ID_main).body;
   bool nonnegative = false;
-  bool strict_bound = false;
+  bool within_bound = false;
   for(const auto &instruction : main.instructions)
   {
     if(
@@ -4519,13 +4901,15 @@ bool static_partition_precondition(
         nonnegative ||
         relation_zero(term, split, ID_ge) ||
         relation_zero(term, split, ID_gt);
-      strict_bound =
-        strict_bound ||
+      within_bound =
+        within_bound ||
         relation_symbols(term, ID_gt, bound, split) ||
-        relation_symbols(term, ID_lt, split, bound);
+        relation_symbols(term, ID_lt, split, bound) ||
+        relation_symbols(term, ID_ge, bound, split) ||
+        relation_symbols(term, ID_le, split, bound);
     }
   }
-  return nonnegative && strict_bound;
+  return nonnegative && within_bound;
 }
 
 bool flow_main_control(
@@ -4760,6 +5144,2208 @@ bool equivalent_static_partition_proof_impl(
   std::cout << "NATIVE_RELATIONAL_FLOW applied=1 rule=static_partition"
             << " left=" << property.left
             << " right=" << property.right << '\n';
+  return true;
+}
+
+struct modular_sum_propertyt
+{
+  irep_idt whole;
+  irep_idt prefix;
+  irep_idt suffix;
+  const goto_programt::instructiont *assumption;
+  const goto_programt::instructiont *error;
+
+  modular_sum_propertyt() : assumption(nullptr), error(nullptr)
+  {
+  }
+};
+
+bool modular_sum_expression(
+  const exprt &src,
+  irep_idt &prefix,
+  irep_idt &suffix)
+{
+  const exprt &sum = strip(src);
+  return
+    sum.id() == ID_plus && sum.operands().size() == 2 &&
+    symbol_id(sum.op0(), prefix) && symbol_id(sum.op1(), suffix) &&
+    prefix != suffix;
+}
+
+bool find_modular_sum_property(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const lifecyclet &life,
+  modular_sum_propertyt &property,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::size_t matches = 0;
+  std::size_t errors = 0;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(call_id(instruction, callee) && is_reach_error(callee))
+      {
+        ++errors;
+        if(entry.first != ID_main)
+        {
+          reason = "modular_sum_error_function";
+          return false;
+        }
+        property.error = &instruction;
+      }
+    }
+  }
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.last_join == nullptr ||
+      instruction.location_number <= life.last_join->location_number)
+      continue;
+    irep_idt callee;
+    if(
+      !call_id(instruction, callee) || !is_assume(callee) ||
+      instruction.call_arguments().size() != 1)
+      continue;
+    const exprt &condition =
+      strip(instruction.call_arguments().front());
+    if(
+      condition.id() != ID_notequal ||
+      condition.operands().size() != 2)
+      continue;
+    irep_idt whole;
+    irep_idt prefix;
+    irep_idt suffix;
+    bool parsed =
+      symbol_id(condition.op0(), whole) &&
+      modular_sum_expression(condition.op1(), prefix, suffix);
+    if(!parsed)
+      parsed =
+        symbol_id(condition.op1(), whole) &&
+        modular_sum_expression(condition.op0(), prefix, suffix);
+    if(
+      !parsed || !shared_unsigned32(whole, ns) ||
+      !shared_unsigned32(prefix, ns) ||
+      !shared_unsigned32(suffix, ns) ||
+      whole == prefix || whole == suffix)
+      continue;
+    ++matches;
+    property.whole = whole;
+    property.prefix = prefix;
+    property.suffix = suffix;
+    property.assumption = &instruction;
+  }
+  if(
+    matches != 1 || errors != 1 ||
+    property.assumption == nullptr || property.error == nullptr ||
+    property.assumption->location_number >=
+      property.error->location_number)
+  {
+    reason =
+      matches == 0 ? "modular_sum_property" :
+                     "modular_sum_property_ambiguous";
+    return false;
+  }
+  return true;
+}
+
+bool modular_sum_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  flow_range_workert &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  goto_programt::const_targett update = program.instructions.end();
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_atomic_begin() || instruction->is_atomic_end())
+    {
+      reason = "modular_sum_atomic";
+      return false;
+    }
+    irep_idt callee;
+    if(call_id(*instruction, callee))
+    {
+      if(is_assume(callee))
+        continue;
+      reason = "modular_sum_worker_call";
+      return false;
+    }
+    if(!instruction->is_assign())
+      continue;
+    irep_idt lhs;
+    if(shared_symbol_lhs(*instruction, ns, lhs))
+    {
+      const exprt &rhs = strip(instruction->assign_rhs());
+      if(
+        update != program.instructions.end() ||
+        !shared_unsigned32(lhs, ns) ||
+        rhs.id() != ID_plus || rhs.operands().size() != 2)
+      {
+        reason = "modular_sum_update";
+        return false;
+      }
+      irep_idt first;
+      irep_idt second;
+      exprt contribution;
+      if(symbol_id(rhs.op0(), first) && first == lhs)
+        contribution = strip(rhs.op1());
+      else if(symbol_id(rhs.op1(), second) && second == lhs)
+        contribution = strip(rhs.op0());
+      else
+      {
+        reason = "modular_sum_recurrence";
+        return false;
+      }
+      irep_idt base;
+      irep_idt index;
+      if(!array_symbol_index(contribution, base, index))
+      {
+        reason = "modular_sum_element";
+        return false;
+      }
+      result.accumulator = lhs;
+      result.contribution = contribution;
+      result.writes.insert(&*instruction);
+      update = instruction;
+    }
+    else
+    {
+      irep_idt base;
+      if(base_pointer(instruction->assign_lhs(), base))
+      {
+        reason = "modular_sum_array_write";
+        return false;
+      }
+    }
+  }
+  if(update == program.instructions.end())
+  {
+    reason = "modular_sum_worker_shape";
+    return false;
+  }
+
+  natural_loopst loops;
+  loops(program);
+  if(loops.loop_map.size() != 1)
+  {
+    reason = "modular_sum_loop_count";
+    return false;
+  }
+  const auto &entry = *loops.loop_map.begin();
+  if(!entry.second.contains(update))
+  {
+    reason = "modular_sum_update_outside_loop";
+    return false;
+  }
+  flow_loop_dimensiont dimension;
+  if(
+    !parse_loop_exit(
+      *entry.first, dimension.induction, dimension.bound) ||
+    !loop_initial_value(
+      program,
+      entry.first,
+      dimension.induction,
+      dimension.start,
+      reason))
+  {
+    if(reason.empty())
+      reason = "modular_sum_loop_guard";
+    return false;
+  }
+  std::size_t increments = 0;
+  std::size_t backedges = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(entry.second.contains(instruction))
+      dimension.members.insert(&*instruction);
+    if(
+      entry.second.contains(instruction) &&
+      unit_increment(*instruction, dimension.induction))
+      ++increments;
+    if(
+      instruction->is_goto() &&
+      entry.second.contains(instruction) &&
+      instruction != entry.first &&
+      instruction->condition().is_true() &&
+      instruction->targets.size() == 1 &&
+      instruction->get_target() == entry.first)
+      ++backedges;
+  }
+  irep_idt contribution_base;
+  irep_idt contribution_index;
+  if(
+    increments != 1 || backedges != 1 ||
+    !array_symbol_index(
+      result.contribution,
+      contribution_base,
+      contribution_index) ||
+    contribution_index != dimension.induction)
+  {
+    reason = "modular_sum_loop_skeleton";
+    return false;
+  }
+  result.dimensions.push_back(dimension);
+  result.normalized_contribution = result.contribution;
+  normalize_flow_expression(
+    result.dimensions, result.normalized_contribution);
+  collect_static_symbols(
+    result.contribution, ns, result.input_symbols);
+  collect_static_symbols(
+    dimension.start, ns, result.input_symbols);
+  collect_static_symbols(
+    dimension.bound, ns, result.input_symbols);
+  result.input_symbols.erase(result.accumulator);
+  collect_pointer_bases(
+    result.contribution, result.pointer_bases);
+  result.worker = worker;
+  return true;
+}
+
+bool modular_sum_partition_proof_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &reason)
+{
+  lifecyclet life;
+  if(!lifecycle(model, life, reason) || life.workers.size() != 3)
+  {
+    if(reason.empty())
+      reason = "modular_sum_lifecycle";
+    return false;
+  }
+  modular_sum_propertyt property;
+  if(!find_modular_sum_property(model, ns, life, property, reason))
+    return false;
+
+  std::vector<flow_range_workert> workers;
+  for(const auto &worker_id : life.workers)
+  {
+    flow_range_workert worker;
+    if(!modular_sum_worker(model, ns, worker_id, worker, reason))
+      return false;
+    workers.push_back(worker);
+  }
+  for(const auto &worker : workers)
+  {
+    if(
+      worker.normalized_contribution !=
+      workers.front().normalized_contribution)
+    {
+      reason = "modular_sum_input_alignment";
+      return false;
+    }
+  }
+
+  const flow_range_workert *whole = nullptr;
+  const flow_range_workert *prefix = nullptr;
+  const flow_range_workert *suffix = nullptr;
+  for(const auto &candidate : workers)
+  {
+    if(candidate.accumulator == property.whole)
+      whole = &candidate;
+    else if(candidate.accumulator == property.prefix)
+      prefix = &candidate;
+    else if(candidate.accumulator == property.suffix)
+      suffix = &candidate;
+  }
+  if(
+    whole == nullptr || prefix == nullptr || suffix == nullptr ||
+    !value_is(whole->dimensions.front().start, 0) ||
+    !value_is(prefix->dimensions.front().start, 0) ||
+    whole->dimensions.front().bound !=
+      suffix->dimensions.front().bound ||
+    prefix->dimensions.front().bound !=
+      suffix->dimensions.front().start)
+  {
+    reason = "modular_sum_partition";
+    return false;
+  }
+  irep_idt split;
+  irep_idt bound;
+  if(
+    !symbol_id(suffix->dimensions.front().start, split) ||
+    !symbol_id(suffix->dimensions.front().bound, bound) ||
+    !static_partition_precondition(model, life, split, bound))
+  {
+    reason = "modular_sum_range";
+    return false;
+  }
+
+  std::set<irep_idt> protected_symbols = {
+    property.whole,
+    property.prefix,
+    property.suffix,
+    split,
+    bound};
+  std::set<irep_idt> pointer_bases;
+  std::set<const goto_programt::instructiont *> allowed;
+  for(const auto &worker : workers)
+  {
+    protected_symbols.insert(
+      worker.input_symbols.begin(), worker.input_symbols.end());
+    pointer_bases.insert(
+      worker.pointer_bases.begin(), worker.pointer_bases.end());
+    allowed.insert(worker.writes.begin(), worker.writes.end());
+  }
+  if(
+    !zero_initialized_symbols(
+      model,
+      {property.whole, property.prefix, property.suffix},
+      allowed,
+      reason) ||
+    !no_main_symbol_writes_before_create(
+      model,
+      life,
+      {property.whole, property.prefix, property.suffix},
+      nullptr,
+      reason))
+    return false;
+
+  flow_equality_propertyt control;
+  control.left = property.whole;
+  control.right = property.prefix;
+  control.assumption = property.assumption;
+  control.error = property.error;
+  if(
+    !static_partition_global_obligations(
+      model,
+      life,
+      control,
+      workers,
+      protected_symbols,
+      pointer_bases,
+      reason))
+    return false;
+
+  std::cout
+    << "NATIVE_MODULAR_SUM_PARTITION applied=1"
+    << " whole=" << property.whole
+    << " prefix=" << property.prefix
+    << " suffix=" << property.suffix << '\n';
+  return true;
+}
+
+struct boolean_segment_propertyt
+{
+  irep_idt whole;
+  irep_idt prefix;
+  irep_idt suffix;
+  const goto_programt::instructiont *assumption;
+  const goto_programt::instructiont *error;
+
+  boolean_segment_propertyt() : assumption(nullptr), error(nullptr)
+  {
+  }
+};
+
+bool boolean_value_symbol(
+  const exprt &src,
+  irep_idt &identifier)
+{
+  const exprt &value = strip(src);
+  if(symbol_id(value, identifier))
+    return true;
+  if(
+    value.id() != ID_notequal ||
+    value.operands().size() != 2)
+    return false;
+  return
+    (symbol_id(value.op0(), identifier) &&
+     value_is(value.op1(), 0)) ||
+    (symbol_id(value.op1(), identifier) &&
+     value_is(value.op0(), 0));
+}
+
+bool boolean_segment_expression(
+  const exprt &src,
+  irep_idt &prefix,
+  irep_idt &suffix)
+{
+  const exprt &conjunction = strip(src);
+  return
+    conjunction.id() == ID_and &&
+    conjunction.operands().size() == 2 &&
+    boolean_value_symbol(conjunction.op0(), prefix) &&
+    boolean_value_symbol(conjunction.op1(), suffix) &&
+    prefix != suffix;
+}
+
+bool find_boolean_segment_property(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const lifecyclet &life,
+  boolean_segment_propertyt &property,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::size_t matches = 0;
+  std::size_t errors = 0;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(call_id(instruction, callee) && is_reach_error(callee))
+      {
+        ++errors;
+        if(entry.first != ID_main)
+        {
+          reason = "boolean_segment_error_function";
+          return false;
+        }
+        property.error = &instruction;
+      }
+    }
+  }
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.last_join == nullptr ||
+      instruction.location_number <= life.last_join->location_number)
+      continue;
+    irep_idt callee;
+    if(
+      !call_id(instruction, callee) || !is_assume(callee) ||
+      instruction.call_arguments().size() != 1)
+      continue;
+    const exprt &condition =
+      strip(instruction.call_arguments().front());
+    if(
+      condition.id() != ID_notequal ||
+      condition.operands().size() != 2)
+      continue;
+    irep_idt whole;
+    irep_idt prefix;
+    irep_idt suffix;
+    bool parsed =
+      symbol_id(condition.op0(), whole) &&
+      boolean_segment_expression(
+        condition.op1(), prefix, suffix);
+    if(!parsed)
+      parsed =
+        symbol_id(condition.op1(), whole) &&
+        boolean_segment_expression(
+          condition.op0(), prefix, suffix);
+    if(
+      !parsed || !shared_boolean(whole, ns) ||
+      !shared_boolean(prefix, ns) ||
+      !shared_boolean(suffix, ns) ||
+      whole == prefix || whole == suffix)
+      continue;
+    ++matches;
+    property.whole = whole;
+    property.prefix = prefix;
+    property.suffix = suffix;
+    property.assumption = &instruction;
+  }
+  if(
+    matches != 1 || errors != 1 ||
+    property.assumption == nullptr || property.error == nullptr ||
+    property.assumption->location_number >=
+      property.error->location_number)
+  {
+    reason =
+      matches == 0 ? "boolean_segment_property" :
+                     "boolean_segment_property_ambiguous";
+    return false;
+  }
+  return true;
+}
+
+bool boolean_segment_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  flow_range_workert &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  goto_programt::const_targett update = program.instructions.end();
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_atomic_begin() || instruction->is_atomic_end())
+    {
+      reason = "boolean_segment_atomic";
+      return false;
+    }
+    irep_idt callee;
+    if(call_id(*instruction, callee))
+    {
+      if(is_assume(callee))
+        continue;
+      reason = "boolean_segment_worker_call";
+      return false;
+    }
+    if(!instruction->is_assign())
+      continue;
+    irep_idt lhs;
+    if(shared_symbol_lhs(*instruction, ns, lhs))
+    {
+      const exprt &rhs = strip(instruction->assign_rhs());
+      if(
+        update != program.instructions.end() ||
+        !shared_boolean(lhs, ns) ||
+        rhs.id() != ID_and || rhs.operands().size() != 2)
+      {
+        reason = "boolean_segment_update";
+        return false;
+      }
+      irep_idt first;
+      irep_idt second;
+      exprt contribution;
+      if(boolean_value_symbol(rhs.op0(), first) && first == lhs)
+        contribution = strip(rhs.op1());
+      else if(boolean_value_symbol(rhs.op1(), second) && second == lhs)
+        contribution = strip(rhs.op0());
+      else
+      {
+        reason = "boolean_segment_recurrence";
+        return false;
+      }
+      if(
+        contribution.id() != ID_lt ||
+        contribution.operands().size() != 2)
+      {
+        reason = "boolean_segment_relation";
+        return false;
+      }
+      result.accumulator = lhs;
+      result.contribution = contribution;
+      result.writes.insert(&*instruction);
+      update = instruction;
+    }
+    else
+    {
+      irep_idt base;
+      if(base_pointer(instruction->assign_lhs(), base))
+      {
+        reason = "boolean_segment_array_write";
+        return false;
+      }
+    }
+  }
+  if(update == program.instructions.end())
+  {
+    reason = "boolean_segment_worker_shape";
+    return false;
+  }
+
+  natural_loopst loops;
+  loops(program);
+  if(loops.loop_map.size() != 1)
+  {
+    reason = "boolean_segment_loop_count";
+    return false;
+  }
+  const auto &entry = *loops.loop_map.begin();
+  if(!entry.second.contains(update))
+  {
+    reason = "boolean_segment_update_outside_loop";
+    return false;
+  }
+  flow_loop_dimensiont dimension;
+  if(
+    !parse_loop_exit(
+      *entry.first, dimension.induction, dimension.bound) ||
+    !loop_initial_value(
+      program,
+      entry.first,
+      dimension.induction,
+      dimension.start,
+      reason))
+  {
+    if(reason.empty())
+      reason = "boolean_segment_loop_guard";
+    return false;
+  }
+  std::size_t increments = 0;
+  std::size_t backedges = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(entry.second.contains(instruction))
+      dimension.members.insert(&*instruction);
+    if(
+      entry.second.contains(instruction) &&
+      unit_increment(*instruction, dimension.induction))
+      ++increments;
+    if(
+      instruction->is_goto() &&
+      entry.second.contains(instruction) &&
+      instruction != entry.first &&
+      instruction->condition().is_true() &&
+      instruction->targets.size() == 1 &&
+      instruction->get_target() == entry.first)
+      ++backedges;
+  }
+  if(increments != 1 || backedges != 1)
+  {
+    reason = "boolean_segment_loop_skeleton";
+    return false;
+  }
+  result.dimensions.push_back(dimension);
+  result.normalized_contribution = result.contribution;
+  normalize_flow_expression(
+    result.dimensions, result.normalized_contribution);
+  collect_static_symbols(
+    result.contribution, ns, result.input_symbols);
+  collect_static_symbols(
+    dimension.start, ns, result.input_symbols);
+  collect_static_symbols(
+    dimension.bound, ns, result.input_symbols);
+  result.input_symbols.erase(result.accumulator);
+  collect_pointer_bases(
+    result.contribution, result.pointer_bases);
+  result.worker = worker;
+  return true;
+}
+
+bool boolean_true_initialization(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const std::set<irep_idt> &symbols,
+  std::set<const goto_programt::instructiont *> &allowed,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::set<irep_idt> initialized;
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr &&
+      instruction.location_number >= life.first_create->location_number)
+      break;
+    if(!instruction.is_assign())
+      continue;
+    irep_idt lhs;
+    if(
+      !symbol_id(instruction.assign_lhs(), lhs) ||
+      symbols.count(lhs) == 0)
+      continue;
+    if(
+      !value_is(instruction.assign_rhs(), 1) ||
+      !initialized.insert(lhs).second)
+    {
+      reason = "boolean_segment_identity_init";
+      return false;
+    }
+    allowed.insert(&instruction);
+  }
+  if(initialized != symbols)
+  {
+    reason = "boolean_segment_identity_init";
+    return false;
+  }
+  return true;
+}
+
+bool boolean_segment_partition_proof_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &reason)
+{
+  lifecyclet life;
+  if(!lifecycle(model, life, reason) || life.workers.size() != 3)
+  {
+    if(reason.empty())
+      reason = "boolean_segment_lifecycle";
+    return false;
+  }
+  boolean_segment_propertyt property;
+  if(
+    !find_boolean_segment_property(
+      model, ns, life, property, reason))
+    return false;
+
+  std::vector<flow_range_workert> workers;
+  for(const auto &worker_id : life.workers)
+  {
+    flow_range_workert worker;
+    if(!boolean_segment_worker(model, ns, worker_id, worker, reason))
+      return false;
+    workers.push_back(worker);
+  }
+  for(const auto &worker : workers)
+  {
+    if(
+      worker.normalized_contribution !=
+      workers.front().normalized_contribution)
+    {
+      reason = "boolean_segment_input_alignment";
+      return false;
+    }
+  }
+
+  const flow_range_workert *whole = nullptr;
+  const flow_range_workert *prefix = nullptr;
+  const flow_range_workert *suffix = nullptr;
+  for(const auto &candidate : workers)
+  {
+    if(candidate.accumulator == property.whole)
+      whole = &candidate;
+    else if(candidate.accumulator == property.prefix)
+      prefix = &candidate;
+    else if(candidate.accumulator == property.suffix)
+      suffix = &candidate;
+  }
+  if(
+    whole == nullptr || prefix == nullptr || suffix == nullptr ||
+    !value_is(whole->dimensions.front().start, 0) ||
+    !value_is(prefix->dimensions.front().start, 0) ||
+    whole->dimensions.front().bound !=
+      suffix->dimensions.front().bound ||
+    prefix->dimensions.front().bound !=
+      suffix->dimensions.front().start)
+  {
+    reason = "boolean_segment_partition";
+    return false;
+  }
+  irep_idt split;
+  irep_idt bound_base;
+  const exprt &whole_bound =
+    strip(whole->dimensions.front().bound);
+  if(
+    !symbol_id(suffix->dimensions.front().start, split) ||
+    whole_bound.id() != ID_minus ||
+    whole_bound.operands().size() != 2 ||
+    !symbol_id(whole_bound.op0(), bound_base) ||
+    !value_is(whole_bound.op1(), 1) ||
+    !static_partition_precondition(
+      model, life, split, bound_base))
+  {
+    reason = "boolean_segment_range";
+    return false;
+  }
+
+  std::set<irep_idt> protected_symbols = {
+    property.whole,
+    property.prefix,
+    property.suffix,
+    split,
+    bound_base};
+  std::set<irep_idt> pointer_bases;
+  std::set<const goto_programt::instructiont *> allowed;
+  for(const auto &worker : workers)
+  {
+    protected_symbols.insert(
+      worker.input_symbols.begin(), worker.input_symbols.end());
+    pointer_bases.insert(
+      worker.pointer_bases.begin(), worker.pointer_bases.end());
+    allowed.insert(worker.writes.begin(), worker.writes.end());
+  }
+  const std::set<irep_idt> summaries = {
+    property.whole, property.prefix, property.suffix};
+  if(
+    !boolean_true_initialization(
+      model, life, summaries, allowed, reason))
+    return false;
+
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      const exprt *lhs = nullptr;
+      if(instruction.is_assign())
+        lhs = &instruction.assign_lhs();
+      else if(
+        instruction.is_function_call() &&
+        !instruction.call_lhs().is_nil())
+        lhs = &instruction.call_lhs();
+      if(lhs == nullptr)
+        continue;
+      irep_idt direct;
+      irep_idt base;
+      const bool protected_write =
+        (symbol_id(*lhs, direct) &&
+         protected_symbols.count(direct) != 0) ||
+        (base_pointer(*lhs, base) &&
+         pointer_bases.count(base) != 0);
+      if(!protected_write)
+        continue;
+      if(
+        is_start_function(entry.first) &&
+        instruction.is_assign() &&
+        value_is(instruction.assign_rhs(), 0))
+        continue;
+      if(
+        entry.first == ID_main && life.first_create != nullptr &&
+        instruction.location_number <
+          life.first_create->location_number &&
+        summaries.count(direct) == 0)
+        continue;
+      if(allowed.count(&instruction) == 0)
+      {
+        reason = "boolean_segment_external_writer";
+        return false;
+      }
+    }
+  }
+  for(const auto &base : pointer_bases)
+  {
+    if(!flow_alias_free(model, base, reason))
+      return false;
+  }
+  flow_equality_propertyt control;
+  control.left = property.whole;
+  control.right = property.prefix;
+  control.assumption = property.assumption;
+  control.error = property.error;
+  if(
+    !no_addresses(model, protected_symbols, reason) ||
+    !flow_main_control(model, life, control, reason))
+    return false;
+
+  std::cout
+    << "NATIVE_BOOLEAN_SEGMENT_PARTITION applied=1"
+    << " whole=" << property.whole
+    << " prefix=" << property.prefix
+    << " suffix=" << property.suffix << '\n';
+  return true;
+}
+
+bool shared_pointer_to_unsigned32(
+  const irep_idt &identifier,
+  const namespacet &ns)
+{
+  const symbolt *symbol = lookup(identifier, ns);
+  if(
+    symbol == nullptr || !symbol->is_static_lifetime ||
+    symbol->is_type || symbol->type.id() != ID_pointer)
+    return false;
+  const typet &subtype = to_pointer_type(symbol->type).base_type();
+  return
+    subtype.id() == ID_unsignedbv &&
+    to_unsignedbv_type(subtype).get_width() == 32;
+}
+
+struct pointwise_map_propertyt
+{
+  irep_idt whole_output;
+  irep_idt partition_output;
+  irep_idt index;
+  irep_idt bound;
+  const goto_programt::instructiont *range_assumption;
+  const goto_programt::instructiont *property_assumption;
+  const goto_programt::instructiont *error;
+
+  pointwise_map_propertyt()
+    : range_assumption(nullptr),
+      property_assumption(nullptr),
+      error(nullptr)
+  {
+  }
+};
+
+bool find_pointwise_map_property(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const lifecyclet &life,
+  pointwise_map_propertyt &property,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::size_t matches = 0;
+  std::size_t errors = 0;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(call_id(instruction, callee) && is_reach_error(callee))
+      {
+        ++errors;
+        if(entry.first != ID_main)
+        {
+          reason = "pointwise_map_error_function";
+          return false;
+        }
+        property.error = &instruction;
+      }
+    }
+  }
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.last_join == nullptr ||
+      instruction.location_number <= life.last_join->location_number)
+      continue;
+    irep_idt callee;
+    if(
+      !call_id(instruction, callee) || !is_assume(callee) ||
+      instruction.call_arguments().size() != 1)
+      continue;
+    const exprt &condition =
+      strip(instruction.call_arguments().front());
+    if(
+      condition.id() != ID_notequal ||
+      condition.operands().size() != 2)
+      continue;
+    irep_idt left_base;
+    irep_idt left_index;
+    irep_idt right_base;
+    irep_idt right_index;
+    if(
+      !array_symbol_index(
+        condition.op0(), left_base, left_index) ||
+      !array_symbol_index(
+        condition.op1(), right_base, right_index) ||
+      left_index != right_index || left_base == right_base ||
+      !shared_pointer_to_unsigned32(left_base, ns) ||
+      !shared_pointer_to_unsigned32(right_base, ns))
+      continue;
+    ++matches;
+    property.whole_output = left_base;
+    property.partition_output = right_base;
+    property.index = left_index;
+    property.property_assumption = &instruction;
+  }
+  if(
+    matches != 1 || errors != 1 ||
+    property.property_assumption == nullptr ||
+    property.error == nullptr ||
+    property.property_assumption->location_number >=
+      property.error->location_number)
+  {
+    reason =
+      matches == 0 ? "pointwise_map_property" :
+                     "pointwise_map_property_ambiguous";
+    return false;
+  }
+
+  std::size_t range_matches = 0;
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.last_join == nullptr ||
+      instruction.location_number <= life.last_join->location_number ||
+      instruction.location_number >=
+        property.property_assumption->location_number)
+      continue;
+    irep_idt callee;
+    if(
+      !call_id(instruction, callee) || !is_assume(callee) ||
+      instruction.call_arguments().size() != 1)
+      continue;
+    bool nonnegative = false;
+    bool below_bound = false;
+    irep_idt bound;
+    std::vector<exprt> terms;
+    flatten_and(instruction.call_arguments().front(), terms);
+    for(const auto &term : terms)
+    {
+      nonnegative =
+        nonnegative ||
+        relation_zero(term, property.index, ID_ge);
+      const exprt &nonnegative_relation = strip(term);
+      irep_idt nonnegative_candidate;
+      nonnegative =
+        nonnegative ||
+        (nonnegative_relation.id() == ID_le &&
+         nonnegative_relation.operands().size() == 2 &&
+         value_is(nonnegative_relation.op0(), 0) &&
+         symbol_id(
+           nonnegative_relation.op1(),
+           nonnegative_candidate) &&
+         nonnegative_candidate == property.index);
+      const exprt &relation = strip(term);
+      irep_idt left;
+      irep_idt right;
+      if(
+        relation.id() == ID_lt &&
+        relation.operands().size() == 2 &&
+        symbol_id(relation.op0(), left) &&
+        left == property.index &&
+        symbol_id(relation.op1(), right))
+      {
+        below_bound = true;
+        bound = right;
+      }
+    }
+    if(nonnegative && below_bound && shared_signed(bound, ns))
+    {
+      ++range_matches;
+      property.bound = bound;
+      property.range_assumption = &instruction;
+    }
+  }
+  if(range_matches != 1 || property.range_assumption == nullptr)
+  {
+    reason = "pointwise_map_index_range";
+    return false;
+  }
+  return true;
+}
+
+struct pointwise_map_workert
+{
+  irep_idt worker;
+  irep_idt output;
+  exprt expression;
+  exprt normalized_expression;
+  flow_loop_dimensiont dimension;
+  std::set<irep_idt> input_symbols;
+  std::set<irep_idt> pointer_bases;
+  std::set<const goto_programt::instructiont *> writes;
+};
+
+bool pointwise_map_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  pointwise_map_workert &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  goto_programt::const_targett update = program.instructions.end();
+  irep_idt update_index;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_atomic_begin() || instruction->is_atomic_end())
+    {
+      reason = "pointwise_map_atomic";
+      return false;
+    }
+    irep_idt callee;
+    if(call_id(*instruction, callee))
+    {
+      if(is_assume(callee))
+        continue;
+      reason = "pointwise_map_worker_call";
+      return false;
+    }
+    if(!instruction->is_assign())
+      continue;
+    irep_idt output;
+    irep_idt index;
+    if(array_symbol_index(
+         instruction->assign_lhs(), output, index))
+    {
+      const exprt &rhs = strip(instruction->assign_rhs());
+      if(
+        update != program.instructions.end() ||
+        !shared_pointer_to_unsigned32(output, ns) ||
+        rhs.id() != ID_plus || rhs.operands().size() != 2)
+      {
+        reason = "pointwise_map_update";
+        return false;
+      }
+      irep_idt left_base;
+      irep_idt left_index;
+      irep_idt right_base;
+      irep_idt right_index;
+      if(
+        !array_symbol_index(
+          rhs.op0(), left_base, left_index) ||
+        !array_symbol_index(
+          rhs.op1(), right_base, right_index) ||
+        left_index != index || right_index != index ||
+        left_base == right_base || left_base == output ||
+        right_base == output ||
+        !shared_pointer_to_unsigned32(left_base, ns) ||
+        !shared_pointer_to_unsigned32(right_base, ns))
+      {
+        reason = "pointwise_map_expression";
+        return false;
+      }
+      result.output = output;
+      result.expression = rhs;
+      result.writes.insert(&*instruction);
+      update_index = index;
+      update = instruction;
+    }
+    else
+    {
+      irep_idt shared;
+      irep_idt base;
+      if(
+        shared_symbol_lhs(*instruction, ns, shared) ||
+        base_pointer(instruction->assign_lhs(), base))
+      {
+        reason = "pointwise_map_extra_write";
+        return false;
+      }
+    }
+  }
+  if(update == program.instructions.end())
+  {
+    reason = "pointwise_map_worker_shape";
+    return false;
+  }
+
+  natural_loopst loops;
+  loops(program);
+  if(loops.loop_map.size() != 1)
+  {
+    reason = "pointwise_map_loop_count";
+    return false;
+  }
+  const auto &entry = *loops.loop_map.begin();
+  if(
+    !entry.second.contains(update) ||
+    !parse_loop_exit(
+      *entry.first,
+      result.dimension.induction,
+      result.dimension.bound) ||
+    !loop_initial_value(
+      program,
+      entry.first,
+      result.dimension.induction,
+      result.dimension.start,
+      reason) ||
+    update_index != result.dimension.induction)
+  {
+    if(reason.empty())
+      reason = "pointwise_map_loop_shape";
+    return false;
+  }
+  std::size_t increments = 0;
+  std::size_t backedges = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(entry.second.contains(instruction))
+      result.dimension.members.insert(&*instruction);
+    if(
+      entry.second.contains(instruction) &&
+      unit_increment(*instruction, result.dimension.induction))
+      ++increments;
+    if(
+      instruction->is_goto() &&
+      entry.second.contains(instruction) &&
+      instruction != entry.first &&
+      instruction->condition().is_true() &&
+      instruction->targets.size() == 1 &&
+      instruction->get_target() == entry.first)
+      ++backedges;
+  }
+  if(increments != 1 || backedges != 1)
+  {
+    reason = "pointwise_map_loop_skeleton";
+    return false;
+  }
+  result.normalized_expression = result.expression;
+  std::vector<flow_loop_dimensiont> dimensions = {
+    result.dimension};
+  normalize_flow_expression(
+    dimensions, result.normalized_expression);
+  collect_static_symbols(
+    result.expression, ns, result.input_symbols);
+  result.input_symbols.erase(result.output);
+  collect_pointer_bases(
+    result.expression, result.pointer_bases);
+  result.worker = worker;
+  return true;
+}
+
+bool pointwise_map_main_control(
+  const goto_modelt &model,
+  const lifecyclet &life,
+  const pointwise_map_propertyt &property,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::size_t index_assignments = 0;
+  std::set<irep_idt> nondet_temporaries;
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.first_create != nullptr && life.last_join != nullptr &&
+      instruction.location_number >= life.first_create->location_number &&
+      instruction.location_number <= life.last_join->location_number)
+    {
+      if(
+        instruction.is_assign() || instruction.is_goto() ||
+        instruction.is_assert() || instruction.is_assume() ||
+        instruction.is_atomic_begin() || instruction.is_atomic_end())
+      {
+        reason = "pointwise_map_main_concurrent_effect";
+        return false;
+      }
+      irep_idt callee;
+      if(
+        call_id(instruction, callee) &&
+        !is_create(callee) && !is_join(callee))
+      {
+        reason = "pointwise_map_main_concurrent_call";
+        return false;
+      }
+    }
+    if(
+      life.last_join != nullptr &&
+      instruction.location_number > life.last_join->location_number)
+    {
+      if(instruction.is_assign())
+      {
+        irep_idt lhs;
+        if(!symbol_id(instruction.assign_lhs(), lhs))
+        {
+          reason = "pointwise_map_postjoin_assignment";
+          return false;
+        }
+        if(lhs == property.index)
+        {
+          irep_idt temporary;
+          if(
+            !contains_side_effect(instruction.assign_rhs()) &&
+            (!symbol_id(instruction.assign_rhs(), temporary) ||
+             nondet_temporaries.count(temporary) == 0))
+          {
+            reason = "pointwise_map_index_assignment";
+            return false;
+          }
+          ++index_assignments;
+        }
+        else
+        {
+          const symbolt *symbol = lookup(lhs, namespacet(model.symbol_table));
+          if(
+            symbol == nullptr || symbol->is_static_lifetime ||
+            !contains_side_effect(instruction.assign_rhs()) ||
+            !nondet_temporaries.insert(lhs).second)
+          {
+            reason = "pointwise_map_postjoin_assignment";
+            return false;
+          }
+        }
+        continue;
+      }
+      if(
+        instruction.is_goto() || instruction.is_assert() ||
+        instruction.is_assume() ||
+        instruction.is_atomic_begin() || instruction.is_atomic_end())
+      {
+        reason = "pointwise_map_postjoin_control";
+        return false;
+      }
+      irep_idt callee;
+      if(
+        call_id(instruction, callee) &&
+        &instruction != property.range_assumption &&
+        &instruction != property.property_assumption &&
+        &instruction != property.error)
+      {
+        reason = "pointwise_map_postjoin_call";
+        return false;
+      }
+    }
+  }
+  if(index_assignments != 1)
+  {
+    reason = "pointwise_map_index_assignment";
+    return false;
+  }
+  return true;
+}
+
+bool pointwise_map_partition_proof_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &reason)
+{
+  lifecyclet life;
+  if(!lifecycle(model, life, reason) || life.workers.size() != 3)
+  {
+    if(reason.empty())
+      reason = "pointwise_map_lifecycle";
+    return false;
+  }
+  pointwise_map_propertyt property;
+  if(!find_pointwise_map_property(model, ns, life, property, reason))
+    return false;
+
+  std::vector<pointwise_map_workert> workers;
+  for(const auto &worker_id : life.workers)
+  {
+    pointwise_map_workert worker;
+    if(!pointwise_map_worker(model, ns, worker_id, worker, reason))
+      return false;
+    workers.push_back(worker);
+  }
+  for(const auto &worker : workers)
+  {
+    if(
+      worker.normalized_expression !=
+      workers.front().normalized_expression)
+    {
+      reason = "pointwise_map_alignment";
+      return false;
+    }
+  }
+  const pointwise_map_workert *whole = nullptr;
+  const pointwise_map_workert *prefix = nullptr;
+  const pointwise_map_workert *suffix = nullptr;
+  for(const auto &candidate : workers)
+  {
+    if(candidate.output == property.whole_output)
+      whole = &candidate;
+    else if(
+      candidate.output == property.partition_output &&
+      value_is(candidate.dimension.start, 0))
+      prefix = &candidate;
+    else if(candidate.output == property.partition_output)
+      suffix = &candidate;
+  }
+  if(
+    whole == nullptr || prefix == nullptr || suffix == nullptr ||
+    !value_is(whole->dimension.start, 0) ||
+    whole->dimension.bound != suffix->dimension.bound ||
+    prefix->dimension.bound != suffix->dimension.start ||
+    whole->dimension.bound != symbol_exprt(
+      property.bound, whole->dimension.bound.type()))
+  {
+    reason = "pointwise_map_partition";
+    return false;
+  }
+  irep_idt split;
+  if(
+    !symbol_id(suffix->dimension.start, split) ||
+    !static_partition_precondition(
+      model, life, split, property.bound))
+  {
+    reason = "pointwise_map_range";
+    return false;
+  }
+
+  std::set<irep_idt> protected_symbols = {
+    property.whole_output,
+    property.partition_output,
+    property.index,
+    property.bound,
+    split};
+  std::set<irep_idt> pointer_bases = {
+    property.whole_output, property.partition_output};
+  std::set<const goto_programt::instructiont *> allowed;
+  for(const auto &worker : workers)
+  {
+    protected_symbols.insert(
+      worker.input_symbols.begin(), worker.input_symbols.end());
+    pointer_bases.insert(
+      worker.pointer_bases.begin(), worker.pointer_bases.end());
+    allowed.insert(worker.writes.begin(), worker.writes.end());
+  }
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(!instruction.is_assign())
+        continue;
+      irep_idt direct;
+      irep_idt base;
+      const bool protected_write =
+        (symbol_id(instruction.assign_lhs(), direct) &&
+         pointer_bases.count(direct) != 0) ||
+        (base_pointer(instruction.assign_lhs(), base) &&
+         pointer_bases.count(base) != 0);
+      if(!protected_write)
+        continue;
+      if(
+        is_start_function(entry.first) &&
+        value_is(instruction.assign_rhs(), 0))
+        continue;
+      if(
+        entry.first == ID_main && life.first_create != nullptr &&
+        instruction.location_number <
+          life.first_create->location_number)
+        continue;
+      if(allowed.count(&instruction) == 0)
+      {
+        reason = "pointwise_map_external_writer";
+        return false;
+      }
+    }
+  }
+  for(const auto &base : pointer_bases)
+  {
+    if(!flow_alias_free(model, base, reason))
+      return false;
+  }
+  if(
+    !no_addresses(model, protected_symbols, reason) ||
+    !pointwise_map_main_control(model, life, property, reason))
+    return false;
+
+  std::cout
+    << "NATIVE_POINTWISE_MAP_PARTITION applied=1"
+    << " whole=" << property.whole_output
+    << " partition=" << property.partition_output
+    << " index=" << property.index << '\n';
+  return true;
+}
+
+struct maximum_tail_propertyt
+{
+  irep_idt whole;
+  irep_idt prefix;
+  irep_idt suffix;
+  irep_idt suffix_sum;
+  const goto_programt::instructiont *assumption;
+  const goto_programt::instructiont *error;
+
+  maximum_tail_propertyt() : assumption(nullptr), error(nullptr)
+  {
+  }
+};
+
+bool signed_sum_symbols(
+  const exprt &src,
+  irep_idt &left,
+  irep_idt &right)
+{
+  const exprt &sum = strip(src);
+  return
+    sum.id() == ID_plus && sum.operands().size() == 2 &&
+    symbol_id(sum.op0(), left) && symbol_id(sum.op1(), right) &&
+    left != right;
+}
+
+bool maximum_tail_expression(
+  const exprt &src,
+  irep_idt &prefix,
+  irep_idt &suffix,
+  irep_idt &suffix_sum)
+{
+  const exprt &choice = strip(src);
+  if(choice.id() != ID_if || choice.operands().size() != 3)
+    return false;
+  const exprt &condition = strip(choice.op0());
+  if(
+    condition.id() != ID_lt ||
+    condition.operands().size() != 2 ||
+    !symbol_id(condition.op0(), suffix))
+    return false;
+  irep_idt condition_prefix;
+  irep_idt condition_sum;
+  irep_idt true_prefix;
+  irep_idt true_sum;
+  irep_idt false_suffix;
+  if(
+    !signed_sum_symbols(
+      condition.op1(), condition_prefix, condition_sum) ||
+    !signed_sum_symbols(
+      choice.op1(), true_prefix, true_sum) ||
+    !symbol_id(choice.op2(), false_suffix) ||
+    condition_prefix != true_prefix ||
+    condition_sum != true_sum ||
+    suffix != false_suffix)
+    return false;
+  prefix = condition_prefix;
+  suffix_sum = condition_sum;
+  return true;
+}
+
+bool find_maximum_tail_property(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const lifecyclet &life,
+  maximum_tail_propertyt &property,
+  std::string &reason)
+{
+  const auto &main =
+    model.goto_functions.function_map.at(ID_main).body;
+  std::size_t matches = 0;
+  std::size_t errors = 0;
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(call_id(instruction, callee) && is_reach_error(callee))
+      {
+        ++errors;
+        if(entry.first != ID_main)
+        {
+          reason = "maximum_tail_error_function";
+          return false;
+        }
+        property.error = &instruction;
+      }
+    }
+  }
+  for(const auto &instruction : main.instructions)
+  {
+    if(
+      life.last_join == nullptr ||
+      instruction.location_number <= life.last_join->location_number)
+      continue;
+    irep_idt callee;
+    if(
+      !call_id(instruction, callee) || !is_assume(callee) ||
+      instruction.call_arguments().size() != 1)
+      continue;
+    const exprt &condition =
+      strip(instruction.call_arguments().front());
+    if(
+      condition.id() != ID_notequal ||
+      condition.operands().size() != 2)
+      continue;
+    irep_idt whole;
+    irep_idt prefix;
+    irep_idt suffix;
+    irep_idt suffix_sum;
+    bool parsed =
+      symbol_id(condition.op0(), whole) &&
+      maximum_tail_expression(
+        condition.op1(), prefix, suffix, suffix_sum);
+    if(!parsed)
+      parsed =
+        symbol_id(condition.op1(), whole) &&
+        maximum_tail_expression(
+          condition.op0(), prefix, suffix, suffix_sum);
+    if(
+      !parsed || !shared_signed(whole, ns) ||
+      !shared_signed(prefix, ns) ||
+      !shared_signed(suffix, ns) ||
+      !shared_signed(suffix_sum, ns) ||
+      whole == prefix || whole == suffix || whole == suffix_sum ||
+      prefix == suffix || prefix == suffix_sum ||
+      suffix == suffix_sum)
+      continue;
+    ++matches;
+    property.whole = whole;
+    property.prefix = prefix;
+    property.suffix = suffix;
+    property.suffix_sum = suffix_sum;
+    property.assumption = &instruction;
+  }
+  if(
+    matches != 1 || errors != 1 ||
+    property.assumption == nullptr || property.error == nullptr ||
+    property.assumption->location_number >=
+      property.error->location_number)
+  {
+    reason =
+      matches == 0 ? "maximum_tail_property" :
+                     "maximum_tail_property_ambiguous";
+    return false;
+  }
+  return true;
+}
+
+struct maximum_tail_workert
+{
+  irep_idt worker;
+  irep_idt accumulator;
+  irep_idt sum;
+  irep_idt operation;
+  exprt contribution;
+  exprt normalized_contribution;
+  flow_loop_dimensiont dimension;
+  std::set<irep_idt> input_symbols;
+  std::set<irep_idt> pointer_bases;
+  std::set<const goto_programt::instructiont *> writes;
+};
+
+bool maximum_tail_recurrence(
+  const exprt &src,
+  const irep_idt &temporary,
+  const irep_idt &accumulator,
+  const exprt &contribution)
+{
+  const exprt &choice = strip(src);
+  if(choice.id() != ID_if || choice.operands().size() != 3)
+    return false;
+  const exprt &condition = strip(choice.op0());
+  irep_idt condition_temporary;
+  if(
+    condition.id() != ID_lt ||
+    condition.operands().size() != 2 ||
+    !symbol_id(condition.op0(), condition_temporary) ||
+    condition_temporary != temporary ||
+    !value_is(condition.op1(), 0) ||
+    !value_is(choice.op1(), 0))
+    return false;
+  const exprt &sum = strip(choice.op2());
+  if(sum.id() != ID_plus || sum.operands().size() != 2)
+    return false;
+  irep_idt first;
+  irep_idt second;
+  return
+    (symbol_id(sum.op0(), first) && first == accumulator &&
+     strip(sum.op1()) == contribution) ||
+    (symbol_id(sum.op1(), second) && second == accumulator &&
+     strip(sum.op0()) == contribution);
+}
+
+bool maximum_tail_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  maximum_tail_workert &result,
+  std::string &reason)
+{
+  const auto &program =
+    model.goto_functions.function_map.at(worker).body;
+  goto_programt::const_targett recurrence_call =
+    program.instructions.end();
+  goto_programt::const_targett recurrence_write =
+    program.instructions.end();
+  goto_programt::const_targett sum_call =
+    program.instructions.end();
+  irep_idt recurrence_temporary;
+  unsigned atomic_depth = 0;
+  std::size_t atomic_begins = 0;
+  std::size_t atomic_ends = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(instruction->is_atomic_begin())
+    {
+      ++atomic_depth;
+      ++atomic_begins;
+      if(atomic_depth != 1)
+      {
+        reason = "maximum_tail_atomic_nesting";
+        return false;
+      }
+      continue;
+    }
+    if(instruction->is_atomic_end())
+    {
+      if(atomic_depth != 1)
+      {
+        reason = "maximum_tail_atomic_balance";
+        return false;
+      }
+      --atomic_depth;
+      ++atomic_ends;
+      continue;
+    }
+    irep_idt callee;
+    if(call_id(*instruction, callee))
+    {
+      if(is_assume(callee))
+        continue;
+      if(
+        instruction->call_lhs().is_nil() ||
+        instruction->call_arguments().size() != 2)
+      {
+        reason = "maximum_tail_worker_call";
+        return false;
+      }
+      irep_idt call_lhs;
+      irep_idt accumulator;
+      if(
+        !symbol_id(instruction->call_lhs(), call_lhs) ||
+        !symbol_id(
+          instruction->call_arguments()[0], accumulator) ||
+        !shared_signed(accumulator, ns))
+      {
+        reason = "maximum_tail_call_shape";
+        return false;
+      }
+      const exprt contribution =
+        strip(instruction->call_arguments()[1]);
+      irep_idt base;
+      irep_idt index;
+      if(!array_symbol_index(contribution, base, index))
+      {
+        reason = "maximum_tail_element";
+        return false;
+      }
+      if(call_lhs == accumulator)
+      {
+        if(
+          sum_call != program.instructions.end() ||
+          atomic_depth != 1)
+        {
+          reason = "maximum_tail_sum_call";
+          return false;
+        }
+        result.sum = accumulator;
+        sum_call = instruction;
+        result.writes.insert(&*instruction);
+      }
+      else
+      {
+        if(
+          recurrence_call != program.instructions.end() ||
+          shared_signed(call_lhs, ns))
+        {
+          reason = "maximum_tail_recurrence_call";
+          return false;
+        }
+        result.accumulator = accumulator;
+        result.operation = callee;
+        result.contribution = contribution;
+        recurrence_temporary = call_lhs;
+        recurrence_call = instruction;
+      }
+      continue;
+    }
+    if(!instruction->is_assign())
+      continue;
+    irep_idt lhs;
+    if(shared_symbol_lhs(*instruction, ns, lhs))
+    {
+      if(
+        recurrence_call == program.instructions.end() ||
+        recurrence_write != program.instructions.end() ||
+        lhs != result.accumulator ||
+        !maximum_tail_recurrence(
+          instruction->assign_rhs(),
+          recurrence_temporary,
+          result.accumulator,
+          result.contribution))
+      {
+        reason = "maximum_tail_recurrence";
+        return false;
+      }
+      if(atomic_begins != 0 && atomic_depth != 1)
+      {
+        reason = "maximum_tail_recurrence_atomic";
+        return false;
+      }
+      recurrence_write = instruction;
+      result.writes.insert(&*instruction);
+    }
+    else
+    {
+      irep_idt base;
+      if(base_pointer(instruction->assign_lhs(), base))
+      {
+        reason = "maximum_tail_array_write";
+        return false;
+      }
+    }
+  }
+  if(
+    atomic_depth != 0 ||
+    recurrence_call == program.instructions.end() ||
+    recurrence_write == program.instructions.end() ||
+    recurrence_call->location_number >=
+      recurrence_write->location_number ||
+    atomic_begins != atomic_ends ||
+    atomic_begins > 1 ||
+    ((sum_call == program.instructions.end()) !=
+     (atomic_begins == 0)))
+  {
+    reason = "maximum_tail_worker_shape";
+    return false;
+  }
+  if(
+    sum_call != program.instructions.end() &&
+    (sum_call->location_number <=
+       recurrence_write->location_number ||
+     strip(sum_call->call_arguments()[1]) !=
+       result.contribution ||
+     sum_call->call_function() !=
+       recurrence_call->call_function()))
+  {
+    reason = "maximum_tail_sum_alignment";
+    return false;
+  }
+
+  natural_loopst loops;
+  loops(program);
+  if(loops.loop_map.size() != 1)
+  {
+    reason = "maximum_tail_loop_count";
+    return false;
+  }
+  const auto &entry = *loops.loop_map.begin();
+  if(
+    !entry.second.contains(recurrence_call) ||
+    (sum_call != program.instructions.end() &&
+     !entry.second.contains(sum_call)) ||
+    !parse_loop_exit(
+      *entry.first,
+      result.dimension.induction,
+      result.dimension.bound) ||
+    !loop_initial_value(
+      program,
+      entry.first,
+      result.dimension.induction,
+      result.dimension.start,
+      reason))
+  {
+    if(reason.empty())
+      reason = "maximum_tail_loop_shape";
+    return false;
+  }
+  irep_idt contribution_base;
+  irep_idt contribution_index;
+  if(
+    !array_symbol_index(
+      result.contribution,
+      contribution_base,
+      contribution_index) ||
+    contribution_index != result.dimension.induction)
+  {
+    reason = "maximum_tail_index";
+    return false;
+  }
+  std::size_t increments = 0;
+  std::size_t backedges = 0;
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(entry.second.contains(instruction))
+      result.dimension.members.insert(&*instruction);
+    if(
+      entry.second.contains(instruction) &&
+      unit_increment(*instruction, result.dimension.induction))
+      ++increments;
+    if(
+      instruction->is_goto() &&
+      entry.second.contains(instruction) &&
+      instruction != entry.first &&
+      instruction->condition().is_true() &&
+      instruction->targets.size() == 1 &&
+      instruction->get_target() == entry.first)
+      ++backedges;
+  }
+  if(increments != 1 || backedges != 1)
+  {
+    reason = "maximum_tail_loop_skeleton";
+    return false;
+  }
+  result.normalized_contribution = result.contribution;
+  std::vector<flow_loop_dimensiont> dimensions = {
+    result.dimension};
+  normalize_flow_expression(
+    dimensions, result.normalized_contribution);
+  collect_static_symbols(
+    result.contribution, ns, result.input_symbols);
+  collect_static_symbols(
+    result.dimension.start, ns, result.input_symbols);
+  collect_static_symbols(
+    result.dimension.bound, ns, result.input_symbols);
+  result.input_symbols.erase(result.accumulator);
+  result.input_symbols.erase(result.sum);
+  collect_pointer_bases(
+    result.contribution, result.pointer_bases);
+  result.worker = worker;
+  return true;
+}
+
+bool maximum_tail_partition_proof_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &reason)
+{
+  lifecyclet life;
+  if(!lifecycle(model, life, reason) || life.workers.size() != 3)
+  {
+    if(reason.empty())
+      reason = "maximum_tail_lifecycle";
+    return false;
+  }
+  maximum_tail_propertyt property;
+  if(!find_maximum_tail_property(model, ns, life, property, reason))
+    return false;
+
+  std::vector<maximum_tail_workert> workers;
+  for(const auto &worker_id : life.workers)
+  {
+    maximum_tail_workert worker;
+    if(!maximum_tail_worker(model, ns, worker_id, worker, reason))
+      return false;
+    workers.push_back(worker);
+  }
+  for(const auto &worker : workers)
+  {
+    if(
+      worker.operation != workers.front().operation ||
+      worker.normalized_contribution !=
+        workers.front().normalized_contribution)
+    {
+      reason = "maximum_tail_input_alignment";
+      return false;
+    }
+  }
+  if(
+    !signed_addition_helper(
+      model, ns, workers.front().operation, reason))
+    return false;
+
+  const maximum_tail_workert *whole = nullptr;
+  const maximum_tail_workert *prefix = nullptr;
+  const maximum_tail_workert *suffix = nullptr;
+  for(const auto &candidate : workers)
+  {
+    if(candidate.accumulator == property.whole)
+      whole = &candidate;
+    else if(candidate.accumulator == property.prefix)
+      prefix = &candidate;
+    else if(candidate.accumulator == property.suffix)
+      suffix = &candidate;
+  }
+  if(
+    whole == nullptr || prefix == nullptr || suffix == nullptr ||
+    !whole->sum.empty() || !prefix->sum.empty() ||
+    suffix->sum != property.suffix_sum ||
+    !value_is(whole->dimension.start, 0) ||
+    !value_is(prefix->dimension.start, 0) ||
+    whole->dimension.bound != suffix->dimension.bound ||
+    prefix->dimension.bound != suffix->dimension.start)
+  {
+    reason = "maximum_tail_partition";
+    return false;
+  }
+  irep_idt split;
+  irep_idt bound;
+  if(
+    !symbol_id(suffix->dimension.start, split) ||
+    !symbol_id(suffix->dimension.bound, bound) ||
+    !static_partition_precondition(model, life, split, bound))
+  {
+    reason = "maximum_tail_range";
+    return false;
+  }
+
+  std::set<irep_idt> protected_symbols = {
+    property.whole,
+    property.prefix,
+    property.suffix,
+    property.suffix_sum,
+    split,
+    bound};
+  std::set<irep_idt> pointer_bases;
+  std::set<const goto_programt::instructiont *> allowed;
+  std::vector<flow_range_workert> flow_workers;
+  for(const auto &worker : workers)
+  {
+    protected_symbols.insert(
+      worker.input_symbols.begin(), worker.input_symbols.end());
+    pointer_bases.insert(
+      worker.pointer_bases.begin(), worker.pointer_bases.end());
+    allowed.insert(worker.writes.begin(), worker.writes.end());
+    flow_range_workert flow_worker;
+    flow_worker.worker = worker.worker;
+    flow_worker.accumulator = worker.accumulator;
+    flow_worker.input_symbols = worker.input_symbols;
+    flow_worker.pointer_bases = worker.pointer_bases;
+    flow_worker.writes = worker.writes;
+    flow_workers.push_back(flow_worker);
+  }
+  if(
+    !zero_initialized_symbols(
+      model,
+      {
+        property.whole,
+        property.prefix,
+        property.suffix,
+        property.suffix_sum,
+      },
+      allowed,
+      reason) ||
+    !no_main_symbol_writes_before_create(
+      model,
+      life,
+      {
+        property.whole,
+        property.prefix,
+        property.suffix,
+        property.suffix_sum,
+      },
+      nullptr,
+      reason))
+    return false;
+  flow_equality_propertyt control;
+  control.left = property.whole;
+  control.right = property.prefix;
+  control.assumption = property.assumption;
+  control.error = property.error;
+  if(
+    !static_partition_global_obligations(
+      model,
+      life,
+      control,
+      flow_workers,
+      protected_symbols,
+      pointer_bases,
+      reason))
+    return false;
+
+  std::cout
+    << "NATIVE_MAXIMUM_TAIL_PARTITION applied=1"
+    << " whole=" << property.whole
+    << " prefix=" << property.prefix
+    << " suffix=" << property.suffix
+    << " suffix_sum=" << property.suffix_sum << '\n';
+  return true;
+}
+
+bool ordered_extremum_partition_proof_impl(
+  const goto_modelt &model,
+  const namespacet &ns,
+  std::string &reason)
+{
+  lifecyclet life;
+  if(!lifecycle(model, life, reason) || life.workers.size() != 3)
+  {
+    if(reason.empty())
+      reason = "ordered_extremum_lifecycle";
+    return false;
+  }
+  ordered_extremum_propertyt property;
+  if(
+    !find_ordered_extremum_property(
+      model, ns, life, property, reason))
+    return false;
+
+  std::vector<flow_range_workert> workers;
+  bool workers_parsed = true;
+  for(const auto &worker_id : life.workers)
+  {
+    flow_range_workert worker;
+    if(
+      !ordered_extremum_worker(
+        model,
+        ns,
+        worker_id,
+        property.minimum,
+        worker,
+        reason))
+    {
+      workers_parsed = false;
+      break;
+    }
+    workers.push_back(worker);
+  }
+  if(!workers_parsed && property.shared_partition_accumulator)
+  {
+    property.minimum = true;
+    workers.clear();
+    reason.clear();
+    for(const auto &worker_id : life.workers)
+    {
+      flow_range_workert worker;
+      if(
+        !ordered_extremum_worker(
+          model,
+          ns,
+          worker_id,
+          property.minimum,
+          worker,
+          reason))
+        return false;
+      workers.push_back(worker);
+    }
+  }
+  else if(!workers_parsed)
+    return false;
+  for(const auto &worker : workers)
+  {
+    if(
+      worker.normalized_contribution !=
+        workers.front().normalized_contribution)
+    {
+      reason = "ordered_extremum_input_alignment";
+      return false;
+    }
+  }
+
+  const flow_range_workert *whole = nullptr;
+  const flow_range_workert *prefix = nullptr;
+  const flow_range_workert *suffix = nullptr;
+  for(const auto &candidate : workers)
+  {
+    if(candidate.accumulator == property.whole)
+      whole = &candidate;
+    else if(
+      candidate.accumulator == property.prefix &&
+      value_is(candidate.dimensions.front().start, 0))
+      prefix = &candidate;
+    else if(candidate.accumulator == property.suffix)
+      suffix = &candidate;
+  }
+  if(
+    whole == nullptr || prefix == nullptr || suffix == nullptr ||
+    !value_is(whole->dimensions.front().start, 0) ||
+    !value_is(prefix->dimensions.front().start, 0) ||
+    whole->dimensions.front().bound !=
+      suffix->dimensions.front().bound ||
+    prefix->dimensions.front().bound !=
+      suffix->dimensions.front().start)
+  {
+    reason = "ordered_extremum_partition";
+    return false;
+  }
+  irep_idt split;
+  irep_idt bound;
+  if(
+    !symbol_id(suffix->dimensions.front().start, split) ||
+    !symbol_id(suffix->dimensions.front().bound, bound) ||
+    !static_partition_precondition(model, life, split, bound))
+  {
+    reason = "ordered_extremum_range";
+    return false;
+  }
+
+  std::set<irep_idt> protected_symbols = {
+    property.whole,
+    property.prefix,
+    property.suffix,
+    split,
+    bound};
+  std::set<irep_idt> pointer_bases;
+  for(const auto &worker : workers)
+  {
+    protected_symbols.insert(
+      worker.input_symbols.begin(), worker.input_symbols.end());
+    pointer_bases.insert(
+      worker.pointer_bases.begin(), worker.pointer_bases.end());
+  }
+  std::set<const goto_programt::instructiont *> allowed;
+  for(const auto &worker : workers)
+    allowed.insert(worker.writes.begin(), worker.writes.end());
+  if(
+    !zero_initialized_symbols(
+      model,
+      {property.whole, property.prefix, property.suffix},
+      allowed,
+      reason) ||
+    !no_main_symbol_writes_before_create(
+      model,
+      life,
+      {property.whole, property.prefix, property.suffix},
+      nullptr,
+      reason))
+    return false;
+
+  flow_equality_propertyt control;
+  control.left = property.whole;
+  control.right = property.prefix;
+  control.assumption = property.assumption;
+  control.error = property.error;
+  if(
+    !static_partition_global_obligations(
+      model,
+      life,
+      control,
+      workers,
+      protected_symbols,
+      pointer_bases,
+      reason))
+    return false;
+
+  std::cout
+    << "NATIVE_ORDERED_EXTREMUM_PARTITION applied=1"
+    << " operation=" << (property.minimum ? "min" : "max")
+    << " whole=" << property.whole
+    << " prefix=" << property.prefix
+    << " suffix=" << property.suffix
+    << " shared_partition_accumulator="
+    << (property.shared_partition_accumulator ? 1 : 0) << '\n';
   return true;
 }
 
@@ -6294,7 +8880,8 @@ bool find_stream_flow_property(
       strip(instruction.call_arguments().front());
     irep_idt total;
     if(
-      condition.id() != ID_le || condition.operands().size() != 2 ||
+      (condition.id() != ID_le && condition.id() != ID_notequal) ||
+      condition.operands().size() != 2 ||
       !symbol_id(condition.op0(), total) ||
       !value_is(condition.op1(), 0) || !shared_signed(total, ns))
       continue;
@@ -6367,6 +8954,7 @@ bool publish_drain_condition(
 struct stream_flow_rolet
 {
   bool producer;
+  irep_idt worker;
   irep_idt queue;
   irep_idt progress;
   irep_idt bound;
@@ -6392,6 +8980,7 @@ bool stream_flow_role(
 {
   const auto &program =
     model.goto_functions.function_map.at(worker).body;
+  role.worker = worker;
   natural_loopst loops;
   loops(program);
   if(loops.loop_map.size() != 1)
@@ -6603,7 +9192,7 @@ bool stream_flow_role(
   {
     role.producer = true;
     if(
-      assume_calls != 1 || role.queue.empty() || role.back.empty() ||
+      assume_calls < 1 || role.queue.empty() || role.back.empty() ||
       role.progress.empty() || role.bound.empty() ||
       back_write == program.instructions.end() ||
       progress_write == program.instructions.end() ||
@@ -6663,6 +9252,7 @@ bool stream_positive_preconditions(
   const irep_idt &positive_bound,
   const irep_idt &negative_bound,
   const irep_idt &element,
+  const stream_flow_rolet &negative,
   const std::vector<stream_flow_rolet> &roles)
 {
   const auto &main =
@@ -6678,6 +9268,16 @@ bool stream_positive_preconditions(
       life.first_create != nullptr &&
       instruction.location_number >= life.first_create->location_number)
       break;
+    if(instruction.is_assign())
+    {
+      irep_idt left;
+      irep_idt right;
+      if(
+        symbol_id(instruction.assign_lhs(), left) &&
+        symbol_id(instruction.assign_rhs(), right))
+        empty_channels.insert({left, right});
+      continue;
+    }
     irep_idt callee;
     if(
       !call_id(instruction, callee) || !is_assume(callee) ||
@@ -6718,6 +9318,49 @@ bool stream_positive_preconditions(
       }
     }
   }
+  if(!defined_negation)
+  {
+    const auto &negative_program =
+      model.goto_functions.function_map.at(negative.worker).body;
+    bool pointwise_guard = false;
+    bool pointwise_use = false;
+    for(const auto &instruction : negative_program.instructions)
+    {
+      irep_idt callee;
+      if(
+        !call_id(instruction, callee) || !is_assume(callee) ||
+        instruction.call_arguments().size() != 1)
+        continue;
+      std::vector<exprt> terms;
+      flatten_and(instruction.call_arguments().front(), terms);
+      for(const auto &term_src : terms)
+      {
+        const exprt &term = strip(term_src);
+        mp_integer constant;
+        irep_idt base;
+        irep_idt index;
+        if(
+          term.id() == ID_gt && term.operands().size() == 2 &&
+          array_symbol_index(term.op0(), base, index) &&
+          base == element && index == negative.progress &&
+          integer_constant(term.op1(), constant) &&
+          constant == -power(2, 31))
+          pointwise_guard = true;
+
+        irep_idt queue;
+        irep_idt queue_index;
+        exprt value;
+        if(
+          array_equality_term(
+            term, queue, queue_index, value) &&
+          queue == negative.queue &&
+          queue_index == negative.back &&
+          strip(value) == strip(negative.element))
+          pointwise_use = pointwise_guard;
+      }
+    }
+    defined_negation = pointwise_use;
+  }
   for(const auto &role : roles)
   {
     if(!role.producer)
@@ -6737,9 +9380,13 @@ bool stream_positive_preconditions(
     if(!empty)
       return false;
   }
-  return
+  const bool exact_cancellation =
+    positive_bound == negative_bound &&
+    negative_nonnegative && defined_negation;
+  const bool positive_residual =
     strict_residual && negative_nonnegative &&
     element_positive && defined_negation;
+  return exact_cancellation || positive_residual;
 }
 
 bool stream_main_allocations(
@@ -6868,15 +9515,31 @@ bool ordered_stream_residual_proof_impl(
   for(const auto *producer : producers)
   {
     irep_idt candidate;
+    irep_idt candidate_index;
     if(symbol_id(producer->element, candidate))
     {
       positive = producer;
       element = candidate;
     }
+    else if(
+      array_symbol_index(
+        producer->element, candidate, candidate_index) &&
+      candidate_index == producer->progress)
+    {
+      positive = producer;
+      element = candidate;
+    }
     const exprt &value = strip(producer->element);
-    if(
-      value.id() == ID_unary_minus && value.operands().size() == 1 &&
-      symbol_id(value.op0(), candidate))
+    bool negative_element = false;
+    if(value.id() == ID_unary_minus && value.operands().size() == 1)
+    {
+      negative_element =
+        symbol_id(value.op0(), candidate) ||
+        (array_symbol_index(
+           value.op0(), candidate, candidate_index) &&
+         candidate_index == producer->progress);
+    }
+    if(negative_element)
     {
       negative = producer;
       if(element.empty())
@@ -6888,16 +9551,27 @@ bool ordered_stream_residual_proof_impl(
       }
     }
   }
+  const symbolt *element_symbol =
+    element.empty() ? nullptr : lookup(element, ns);
+  const bool signed_element =
+    element_symbol != nullptr &&
+    element_symbol->is_static_lifetime &&
+    !element_symbol->is_type &&
+    (element_symbol->type.id() == ID_signedbv ||
+     (element_symbol->type.id() == ID_pointer &&
+      to_pointer_type(
+        element_symbol->type).base_type().id() == ID_signedbv));
   if(
     positive == nullptr || negative == nullptr ||
     positive == negative || element.empty() ||
-    !shared_signed(element, ns) ||
+    !signed_element ||
     !stream_positive_preconditions(
       model,
       life,
       positive->bound,
       negative->bound,
       element,
+      *negative,
       roles))
   {
     reason = "stream_residual_precondition";
@@ -6908,6 +9582,9 @@ bool ordered_stream_residual_proof_impl(
     producers[0]->queue, producers[1]->queue};
   if(!stream_main_allocations(model, life, queues, ns, reason))
     return false;
+  std::set<irep_idt> pointer_bases = queues;
+  if(element_symbol->type.id() == ID_pointer)
+    pointer_bases.insert(element);
   std::set<irep_idt> protected_symbols = {
     property.total,
     positive->bound,
@@ -6957,7 +9634,8 @@ bool ordered_stream_residual_proof_impl(
       const bool protected_write =
         (symbol_id(*lhs, direct) &&
          protected_symbols.count(direct) != 0) ||
-        (base_pointer(*lhs, base) && queues.count(base) != 0);
+        (base_pointer(*lhs, base) &&
+         pointer_bases.count(base) != 0);
       if(!protected_write)
         continue;
       if(
@@ -6975,9 +9653,9 @@ bool ordered_stream_residual_proof_impl(
       }
     }
   }
-  for(const auto &queue : queues)
+  for(const auto &base : pointer_bases)
   {
-    if(!flow_alias_free(model, queue, reason))
+    if(!flow_alias_free(model, base, reason))
       return false;
   }
   flow_equality_propertyt control_property;
@@ -6994,17 +9672,6 @@ bool ordered_stream_residual_proof_impl(
             << " positive_bound=" << positive->bound
             << " negative_bound=" << negative->bound << '\n';
   return true;
-}
-
-bool shared_unsigned32(
-  const irep_idt &identifier,
-  const namespacet &ns)
-{
-  const symbolt *symbol = lookup(identifier, ns);
-  return
-    symbol != nullptr && symbol->is_static_lifetime && !symbol->is_type &&
-    symbol->type.id() == ID_unsignedbv &&
-    to_unsignedbv_type(symbol->type).get_width() == 32;
 }
 
 struct stream_refine_channelt
@@ -21792,10 +24459,46 @@ bool extremum_cone_proof(
   std::cout << "NATIVE_HIERARCHICAL_FOLD applied=0 reason="
             << reason << '\n';
   reason.clear();
-  if(equivalent_static_partition_proof_impl(goto_model, ns, reason))
+  if(equivalent_static_partition_proof_impl(
+       goto_model, ns, reason))
     return true;
   std::cout << "NATIVE_RELATIONAL_FLOW applied=0 reason="
             << reason << '\n';
+  reason.clear();
+  if(modular_sum_partition_proof_impl(
+       goto_model, ns, reason))
+    return true;
+  std::cout
+    << "NATIVE_MODULAR_SUM_PARTITION applied=0 reason="
+    << reason << '\n';
+  reason.clear();
+  if(boolean_segment_partition_proof_impl(
+       goto_model, ns, reason))
+    return true;
+  std::cout
+    << "NATIVE_BOOLEAN_SEGMENT_PARTITION applied=0 reason="
+    << reason << '\n';
+  reason.clear();
+  if(pointwise_map_partition_proof_impl(
+       goto_model, ns, reason))
+    return true;
+  std::cout
+    << "NATIVE_POINTWISE_MAP_PARTITION applied=0 reason="
+    << reason << '\n';
+  reason.clear();
+  if(maximum_tail_partition_proof_impl(
+       goto_model, ns, reason))
+    return true;
+  std::cout
+    << "NATIVE_MAXIMUM_TAIL_PARTITION applied=0 reason="
+    << reason << '\n';
+  reason.clear();
+  if(ordered_extremum_partition_proof_impl(
+       goto_model, ns, reason))
+    return true;
+  std::cout
+    << "NATIVE_ORDERED_EXTREMUM_PARTITION applied=0 reason="
+    << reason << '\n';
   reason.clear();
   if(equivalent_dynamic_partition_proof_impl(goto_model, ns, reason))
     return true;
