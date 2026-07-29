@@ -824,6 +824,20 @@ assert "zero v285-correct losses" in v287["description"].lower()
 assert "zero new wrong results" in v287["description"].lower()
 assert "byte-identical wrapper" in v287["description"].lower()
 
+v288 = next(row for row in DATA["rows"] if row["version"] == 288)
+assert v288["status"] == "successful"
+assert v288["scope"] == "exact725"
+assert v288["contribution_class"] == "native_redo"
+assert v288["metrics"]["correct"] == 703
+assert v288["metrics"]["cpu_s"] == 865.0478599520001
+assert v288["metrics"]["wall_s"] == 908.7999609876424
+assert v288["metrics"]["memory_sum_b"] == 25715208192
+assert v288["metrics"]["correct_vs_previous_success"] == 1
+assert "zero v287-correct losses" in v288["description"].lower()
+assert "no other new wrong results" in v288["description"].lower()
+assert "byte-identical wrapper" in v288["description"].lower()
+assert "task93 remains unknown" in v288["description"].lower()
+
 timing_expected = {
     264: 3.121307483333333,
     265: 6.578901950000001,
@@ -844,6 +858,7 @@ timing_expected = {
     285: 183.41666666666666,
     286: 16.789320416666667,
     287: 25.7,
+    288: 19.4,
 }
 for version, duration in timing_expected.items():
     row = next(row for row in DATA["rows"] if row["version"] == version)
@@ -866,9 +881,9 @@ with sync_playwright() as playwright:
     page.goto(HTML.as_uri())
     page.wait_for_load_state("networkidle")
 
-    assert "V1–V287" in page.title()
-    assert page.locator("#rangeMax").get_attribute("max") == "287"
-    assert page.locator("#rangeMax").input_value() == "287"
+    assert "V1–V288" in page.title()
+    assert page.locator("#rangeMax").get_attribute("max") == "288"
+    assert page.locator("#rangeMax").input_value() == "288"
     for version, correct in (
         (259, 687), (260, 688), (261, 689), (262, 690), (263, 691),
         (266, 692), (267, 694), (268, 695), (270, 696),
@@ -888,6 +903,8 @@ with sync_playwright() as playwright:
     assert "701" in page.locator("#row-286").inner_text()
     assert "成功" in page.locator("#row-287").inner_text()
     assert "702" in page.locator("#row-287").inner_text()
+    assert "成功" in page.locator("#row-288").inner_text()
+    assert "703" in page.locator("#row-288").inner_text()
     assert page.locator(".point[data-version='258']").count() >= 1
     assert "686" in page.locator("#row-258").inner_text()
     for version in (256, 257):
@@ -895,8 +912,8 @@ with sync_playwright() as playwright:
         assert "685" in page.locator(f"#row-{version}").inner_text()
     assert page.locator(".point[data-version='254']").count() >= 1
     assert page.locator("#chart .point").count() >= 200
-    # One header, Baseline, and V1--V287.
-    assert page.locator("#ledger .ledger-row").count() == 289
+    # One header, Baseline, and V1--V288.
+    assert page.locator("#ledger .ledger-row").count() == 290
     for version, duration_text in (
         (264, "3.12 min"),
         (265, "6.58 min"),
@@ -917,6 +934,7 @@ with sync_playwright() as playwright:
         (285, "183.42 min"),
         (286, "16.79 min"),
         (287, "25.7 min"),
+        (288, "19.4 min"),
     ):
         row_text = page.locator(f"#row-{version}").inner_text()
         assert "时间不可确定" not in row_text

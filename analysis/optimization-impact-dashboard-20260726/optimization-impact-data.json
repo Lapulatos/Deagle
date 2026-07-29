@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-29T13:14:40.551Z",
+  "generated_at": "2026-07-29T13:48:51.137Z",
   "comparison_protocol": {
     "tasks": 725,
     "workers": 48,
@@ -14499,6 +14499,53 @@
       "wrapper_metrics": null,
       "extracted_evidence": {
         "correct": "- Accepted baseline: V285, 700 official / 701 adjudicated correct.",
+        "cpu": null,
+        "wall": null,
+        "peak_memory": null,
+        "paired_memory": null
+      },
+      "exact_override": true,
+      "wrapper_exact_evidence": false
+    },
+    {
+      "version": 288,
+      "label": "V288",
+      "method": "Single-Worker Initialization Counterexample",
+      "status": "successful",
+      "scope": "exact725",
+      "contribution_class": "native_redo",
+      "description": "Native V288 derives two nested initialization domains and one homogeneous worker class from the GOTO model, retains domains 0 and 1, fully initializes the retained inner domain, and materializes one representative worker fixed to domain 1. One deagle_exe performs admission, counterexample search, verdict, and witness generation; the byte-identical wrapper performs bounded routing and argument selection only. Exact725 changes only expected-true 28-race_reach_91-arrayloop2_racefree from ERROR to false(unreach-call): official correct remains 701, while semantic adjudication rises from 702 to 703 because the source initializes a retained slot-1 node with nonzero datum and the worker's zero assertion is reachable. There are zero V287-correct losses and no other new wrong results; task93 remains unknown. Prior90 is 90/90, six premise-breaking mutations reject, and the 219,691-byte violation witness passes WitnessLint as a format gate. CPU, summed wall, and summed memory change -0.171%, -0.228%, and +0.351% against V287.",
+      "source": "../../experiments/native-residual-v288-single-worker-20260729/conclusion.md",
+      "source_notes": "../../experiments/native-residual-v288-single-worker-20260729/notes.md",
+      "memory_sum_source": "/data3/sujie/experiments/v288-native-single-worker-exact725-r1/results/exact725.2026-07-29_13-34-25.results.accepted-native-integration-exact725.Concurrency.xml.bz2",
+      "timing": {
+        "version": 288,
+        "directory": "native-residual-v288-single-worker-20260729",
+        "available": true,
+        "start_epoch_s": 1785331545,
+        "end_epoch_s": 1785332709,
+        "start_iso": "2026-07-29T13:25:45.000Z",
+        "end_iso": "2026-07-29T13:45:09.000Z",
+        "duration_minutes": 19.4,
+        "evidence_kind": "candidate_worktree_birth_to_remote_source_confirmation"
+      },
+      "metrics": {
+        "correct": 703,
+        "cpu_s": 865.0478599520001,
+        "wall_s": 908.7999609876424,
+        "memory_sum_b": 25715208192,
+        "paired_memory_delta_pct": null,
+        "correct_vs_baseline": 259,
+        "cpu_vs_baseline_pct": -93.20854768115355,
+        "wall_vs_baseline_pct": -92.87895929850504,
+        "memory_sum_vs_baseline_pct": -62.34907173868025,
+        "correct_vs_previous_success": 1,
+        "cpu_vs_previous_success_pct": -0.171523342683233,
+        "wall_vs_previous_success_pct": -0.22775762836284574
+      },
+      "wrapper_metrics": null,
+      "extracted_evidence": {
+        "correct": null,
         "cpu": null,
         "wall": null,
         "peak_memory": null,
