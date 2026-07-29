@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<graphml xmlns="http://graphml.graphdrawing.org/xmlns" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <key attr.name="originFileName" attr.type="string" for="edge" id="originfile">
+    <default>&lt;command-line&gt;</default>
+  </key>
+  <key attr.name="invariant" attr.type="string" for="node" id="invariant"/>
+  <key attr.name="invariant.scope" attr.type="string" for="node" id="invariant.scope"/>
+  <key attr.name="isViolationNode" attr.type="boolean" for="node" id="violation">
+    <default>false</default>
+  </key>
+  <key attr.name="isEntryNode" attr.type="boolean" for="node" id="entry">
+    <default>false</default>
+  </key>
+  <key attr.name="isSinkNode" attr.type="boolean" for="node" id="sink">
+    <default>false</default>
+  </key>
+  <key attr.name="enterLoopHead" attr.type="boolean" for="edge" id="enterLoopHead">
+    <default>false</default>
+  </key>
+  <key attr.name="cyclehead" attr.type="boolean" for="node" id="cyclehead">
+    <default>false</default>
+  </key>
+  <key attr.name="threadId" attr.type="int" for="edge" id="threadId">
+    <default>0</default>
+  </key>
+  <key attr.name="createThread" attr.type="int" for="edge" id="createThread">
+    <default>0</default>
+  </key>
+  <key attr.name="sourcecodeLanguage" attr.type="string" for="graph" id="sourcecodelang"/>
+  <key attr.name="programFile" attr.type="string" for="graph" id="programfile"/>
+  <key attr.name="programHash" attr.type="string" for="graph" id="programhash"/>
+  <key attr.name="specification" attr.type="string" for="graph" id="specification"/>
+  <key attr.name="architecture" attr.type="string" for="graph" id="architecture"/>
+  <key attr.name="producer" attr.type="string" for="graph" id="producer"/>
+  <key attr.name="creationtime" attr.type="string" for="graph" id="creationtime"/>
+  <key attr.name="startline" attr.type="int" for="edge" id="startline"/>
+  <key attr.name="control" attr.type="string" for="edge" id="control"/>
+  <key attr.name="assumption" attr.type="string" for="edge" id="assumption"/>
+  <key attr.name="assumption.scope" attr.type="string" for="edge" id="assumption.scope"/>
+  <key attr.name="enterFunction" attr.type="string" for="edge" id="enterFunction"/>
+  <key attr.name="witness-type" attr.type="string" for="graph" id="witness-type"/>
+  <key attr.name="witness-format-version" attr.type="string" for="graph" id="witness-format-version"/>
+  <graph edgedefault="directed">
+    <data key="witness-type">correctness_witness</data>
+    <data key="witness-format-version">1.0</data>
+    <data key="producer">Deagle 4.1.0</data>
+    <data key="specification">CHECK( init(main()), LTL(G ! call(reach_error())) )</data>
+    <data key="programfile">/home/lapulatos/svcomp2026-caat/sv-benchmarks/c/weaver/mult-flipped-dist.wvr.c</data>
+    <data key="programhash">7CFD33CA5F647ADF12592C5E71401AB9DA35A49D8F2EC6D0757EA2CC237974CC</data>
+    <data key="architecture">32bit</data>
+    <data key="creationtime">2026-07-30T04:25:43+08:00</data>
+    <data key="sourcecodelang">C</data>
+    <node id="N0">
+      <data key="entry">true</data>
+    </node>
+    <edge source="N0" target="P1">
+      <data key="originfile">/home/lapulatos/svcomp2026-caat/sv-benchmarks/c/weaver/mult-flipped-dist.wvr.c</data>
+      <data key="startline">21</data>
+    </edge>
+    <node id="P1">
+      <data key="invariant">FALSE</data>
+      <data key="invariant.scope">reach_error</data>
+    </node>
+  </graph>
+</graphml>

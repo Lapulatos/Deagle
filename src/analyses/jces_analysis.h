@@ -245,6 +245,12 @@ bool local_loop_acceleration_transform(
   goto_modelt &goto_model,
   message_handlert &message_handler);
 
+/// After a native proof has made worker calls sequential, replace simple
+/// unsigned zero-based accumulation loops by their exact modular closed form.
+bool local_modular_accumulation_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 /// Collapse exactly one marked pure spin loop to its first exiting
 /// observation. Every omitted iteration must contain one atomic load,
 /// local-only bookkeeping, and no shared effect.

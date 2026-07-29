@@ -1,0 +1,27 @@
+Running witnesslint version 2.1.3-dev
+
+--- Witness File Metadata ---
+Witness File: /exp/mult-flipped-dist.correctness.graphml
+Witness Size in Bytes: 3464
+Witness Lines of Code: 65
+Witness Hash: b3650412fcf800139e3cf29f8ded3c461455ab3190d8b011bdc39c060ea6e75c
+
+--- Witness Information Before Linting ---
+Witness Version: 1.0
+
+--- Witness Content Information ---
+Witness Type: correctness_witness
+Witness Type-Match: Unknown
+Producer: Deagle 4.1.0
+Creation Time: 2026-07-30T04:25:43+08:00
+Architecture: 32bit
+Program File: /home/lapulatos/svcomp2026-caat/sv-benchmarks/c/weaver/mult-flipped-dist.wvr.c
+Program Hash: 7CFD33CA5F647ADF12592C5E71401AB9DA35A49D8F2EC6D0757EA2CC237974CC
+Source-Code Language: C
+Amount of Nodes: 2
+Amount of Edges: 1
+Amount of Invariants: 1
+Specification: CHECK( init(main()), LTL(G ! call(reach_error())) )
+
+
+witnesslint finished with exit code 0

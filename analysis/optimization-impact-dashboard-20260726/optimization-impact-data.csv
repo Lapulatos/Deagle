@@ -293,3 +293,4 @@ version,label,method,status,scope,correct,cpu_s,wall_s,memory_sum_b,paired_memor
 291,V291,Prefix-Aware Retry Admission,successful,exact725,705,1383.8831540000003,1421.6679298453964,28949061632,,2026-07-29T18:33:19.000Z,2026-07-29T19:33:31.000Z,60.2,261,,,../../experiments/native-guided-schedule-v291-20260730/conclusion.md
 292,V292,Native Residual Feasibility,failed,target_or_audit,,,,,,2026-07-29T19:43:10.000Z,2026-07-29T19:55:13.000Z,12.05,,,,../../experiments/native-residual-v292-20260730/conclusion.md
 293,V293,Affine and RF Selector Feasibility,failed,target_or_audit,,,,,,2026-07-29T19:59:21.000Z,2026-07-29T20:10:12.000Z,10.85,,,,../../experiments/native-affine-nontermination-v293-20260730/conclusion.md
+294,V294,Native Modular Loop Summary,successful,exact725,708,1206.378017999999,1247.4008251582272,28088336384,,2026-07-29T20:18:29.000Z,2026-07-29T20:50:47.000Z,32.3,264,,,../../experiments/native-modular-loop-summary-v294-20260730/conclusion.md

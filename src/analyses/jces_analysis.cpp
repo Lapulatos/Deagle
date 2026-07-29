@@ -17043,6 +17043,506 @@ bool local_loop_acceleration_transform(
   return transformed != 0;
 }
 
+namespace
+{
+using modular_monomialt = std::vector<exprt>;
+using modular_polynomialt = std::vector<modular_monomialt>;
+
+bool modular_polynomial(
+  const exprt &src,
+  const typet &type,
+  std::size_t &budget,
+  modular_polynomialt &result)
+{
+  if(budget == 0 || src.type() != type)
+    return false;
+  --budget;
+  const exprt &expr = without_cast(src);
+  if(expr.type() != type)
+    return false;
+  mp_integer constant;
+  const bool is_constant =
+    constant_eval(expr, {}, constant);
+  if(is_constant && constant == 0)
+  {
+    result.clear();
+    return true;
+  }
+  if(is_constant && constant == 1)
+  {
+    result = {modular_monomialt{}};
+    return true;
+  }
+  if(expr.id() == ID_plus)
+  {
+    result.clear();
+    for(const auto &operand : expr.operands())
+    {
+      modular_polynomialt operand_terms;
+      if(!modular_polynomial(
+           operand, type, budget, operand_terms))
+        return false;
+      result.insert(
+        result.end(),
+        operand_terms.begin(),
+        operand_terms.end());
+      if(result.size() > 32)
+        return false;
+    }
+    return true;
+  }
+  if(expr.id() == ID_mult)
+  {
+    result = {modular_monomialt{}};
+    for(const auto &operand : expr.operands())
+    {
+      modular_polynomialt operand_terms;
+      if(!modular_polynomial(
+           operand, type, budget, operand_terms))
+        return false;
+      if(operand_terms.empty())
+      {
+        result.clear();
+        return true;
+      }
+      modular_polynomialt product;
+      for(const auto &left : result)
+      {
+        for(const auto &right : operand_terms)
+        {
+          modular_monomialt monomial = left;
+          monomial.insert(
+            monomial.end(), right.begin(), right.end());
+          if(monomial.size() > 16)
+            return false;
+          product.push_back(std::move(monomial));
+          if(product.size() > 32)
+            return false;
+        }
+      }
+      result = std::move(product);
+    }
+    return true;
+  }
+  result = {{src}};
+  return true;
+}
+
+exprt modular_polynomial_expression(
+  modular_polynomialt polynomial,
+  const typet &type)
+{
+  if(polynomial.empty())
+    return from_integer(0, type);
+  for(auto &monomial : polynomial)
+    std::sort(monomial.begin(), monomial.end());
+  std::sort(polynomial.begin(), polynomial.end());
+
+  std::vector<exprt> terms;
+  terms.reserve(polynomial.size());
+  for(const auto &monomial : polynomial)
+  {
+    exprt term = from_integer(1, type);
+    if(!monomial.empty())
+    {
+      term = monomial.front();
+      for(std::size_t index = 1; index < monomial.size(); ++index)
+        term = mult_exprt(std::move(term), monomial[index]);
+    }
+    terms.push_back(std::move(term));
+  }
+  exprt result = terms.front();
+  for(std::size_t index = 1; index < terms.size(); ++index)
+    result = plus_exprt(std::move(result), terms[index]);
+  return result;
+}
+
+std::size_t normalize_unsigned_modular_expression(exprt &expr)
+{
+  std::size_t rewrites = 0;
+  for(auto &operand : expr.operands())
+    rewrites += normalize_unsigned_modular_expression(operand);
+  if(
+    expr.type().id() != ID_unsignedbv ||
+    (expr.id() != ID_plus && expr.id() != ID_mult))
+    return rewrites;
+  std::size_t budget = 128;
+  modular_polynomialt polynomial;
+  if(!modular_polynomial(expr, expr.type(), budget, polynomial))
+    return rewrites;
+  exprt normalized =
+    modular_polynomial_expression(
+      std::move(polynomial), expr.type());
+  if(normalized != expr)
+  {
+    expr = std::move(normalized);
+    ++rewrites;
+  }
+  return rewrites;
+}
+
+std::size_t normalize_unsigned_modular_model(
+  goto_modelt &goto_model)
+{
+  std::size_t rewrites = 0;
+  for(auto &function_entry :
+      goto_model.goto_functions.function_map)
+  {
+    if(!function_entry.second.body_available())
+      continue;
+    for(auto &instruction :
+        function_entry.second.body.instructions)
+    {
+      if(instruction.is_assign())
+        rewrites += normalize_unsigned_modular_expression(
+          instruction.assign_rhs_nonconst());
+      if(instruction.has_condition())
+        rewrites += normalize_unsigned_modular_expression(
+          instruction.condition_nonconst());
+      if(instruction.is_function_call())
+      {
+        auto &call =
+          to_code_function_call(instruction.code_nonconst());
+        for(auto &argument : call.arguments())
+          rewrites +=
+            normalize_unsigned_modular_expression(argument);
+      }
+    }
+  }
+  return rewrites;
+}
+
+bool stable_modular_scalar_expression(
+  const exprt &expr,
+  const namespacet &ns,
+  const std::set<irep_idt> &excluded)
+{
+  const exprt &value = without_cast(expr);
+  if(
+    value.id() == ID_side_effect || value.id() == ID_dereference ||
+    value.id() == ID_address_of)
+    return false;
+  if(value.id() == ID_symbol)
+  {
+    const symbolt *symbol = nullptr;
+    const irep_idt identifier =
+      to_symbol_expr(value).get_identifier();
+    return
+      excluded.count(identifier) == 0 &&
+      !ns.lookup(identifier, symbol) && !symbol->is_type &&
+      !symbol->type.get_bool(ID_C_volatile) &&
+      (symbol->type.id() == ID_signedbv ||
+       symbol->type.id() == ID_unsignedbv);
+  }
+  for(const auto &operand : value.operands())
+  {
+    if(!stable_modular_scalar_expression(operand, ns, excluded))
+      return false;
+  }
+  return true;
+}
+
+struct modular_accumulation_loopt
+{
+  irep_idt induction;
+  irep_idt accumulator;
+  exprt bound;
+  exprt delta;
+};
+
+bool modular_accumulation_loop(
+  const goto_programt &program,
+  const namespacet &ns,
+  goto_programt::const_targett backedge,
+  modular_accumulation_loopt &summary)
+{
+  if(
+    !backedge->is_goto() || !backedge->condition().is_true() ||
+    backedge->targets.size() != 1)
+    return false;
+  const auto head = backedge->get_target();
+  if(!parse_exit_guard(*head, summary.induction, summary.bound))
+    return false;
+
+  const symbolt *induction_symbol = nullptr;
+  if(
+    ns.lookup(summary.induction, induction_symbol) ||
+    induction_symbol->is_static_lifetime || induction_symbol->is_type ||
+    induction_symbol->type.id() != ID_unsignedbv ||
+    induction_symbol->type.get_bool(ID_C_volatile))
+    return false;
+
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : program.instructions)
+    positions.emplace(&instruction, position++);
+  const auto head_position = positions.at(&*head);
+  const auto backedge_position = positions.at(&*backedge);
+  if(
+    head->targets.size() != 1 ||
+    positions.at(&*head->get_target()) <= backedge_position)
+    return false;
+
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(!instruction->is_goto())
+      continue;
+    const auto source_position = positions.at(&*instruction);
+    for(const auto &target : instruction->targets)
+    {
+      const auto target_position = positions.at(&*target);
+      if(
+        target_position >= head_position &&
+        target_position <= backedge_position &&
+        (source_position < head_position ||
+         source_position > backedge_position))
+        return false;
+    }
+  }
+
+  std::size_t increments = 0;
+  std::size_t accumulations = 0;
+  for(auto instruction = head; instruction != std::next(backedge);
+      ++instruction)
+  {
+    if(instruction == head || instruction == backedge)
+      continue;
+    irep_idt incremented;
+    if(
+      parse_unit_increment(*instruction, incremented) &&
+      incremented == summary.induction)
+    {
+      ++increments;
+      continue;
+    }
+    if(instruction->is_assign())
+    {
+      irep_idt lhs;
+      if(
+        !direct_symbol(instruction->assign_lhs(), lhs) ||
+        lhs == summary.induction)
+        return false;
+      const exprt &rhs = without_cast(instruction->assign_rhs());
+      if(
+        rhs.id() != ID_plus || rhs.operands().size() != 2)
+        return false;
+      irep_idt first;
+      irep_idt second;
+      if(direct_symbol(rhs.op0(), first) && first == lhs)
+        summary.delta = rhs.op1();
+      else if(direct_symbol(rhs.op1(), second) && second == lhs)
+        summary.delta = rhs.op0();
+      else
+        return false;
+      if(!summary.accumulator.empty() && summary.accumulator != lhs)
+        return false;
+      summary.accumulator = lhs;
+      ++accumulations;
+      continue;
+    }
+    if(instruction->is_skip() || instruction->is_location())
+      continue;
+    return false;
+  }
+
+  const symbolt *accumulator_symbol = nullptr;
+  const std::set<irep_idt> excluded = {
+    summary.induction, summary.accumulator};
+  if(
+    increments != 1 || accumulations != 1 ||
+    summary.accumulator.empty() ||
+    ns.lookup(summary.accumulator, accumulator_symbol) ||
+    !accumulator_symbol->is_static_lifetime ||
+    accumulator_symbol->type.id() != ID_unsignedbv ||
+    accumulator_symbol->type.get_bool(ID_C_volatile) ||
+    !stable_modular_scalar_expression(
+      summary.bound, ns, excluded) ||
+    !stable_modular_scalar_expression(
+      summary.delta, ns, excluded))
+    return false;
+
+  bool zero_initialized = false;
+  auto last_semantic = program.instructions.end();
+  for(auto instruction = program.instructions.begin(); instruction != head;
+      ++instruction)
+  {
+    if(!instruction->is_skip() && !instruction->is_location())
+      last_semantic = instruction;
+    if(
+      instruction->is_assign() &&
+      without_cast(instruction->assign_lhs()).id() == ID_symbol &&
+      to_symbol_expr(without_cast(instruction->assign_lhs()))
+          .get_identifier() == summary.induction)
+      zero_initialized =
+        parse_zero_initialization(*instruction, summary.induction);
+  }
+  return
+    zero_initialized &&
+    last_semantic != program.instructions.end() &&
+    parse_zero_initialization(*last_semantic, summary.induction);
+}
+} // namespace
+
+bool local_modular_accumulation_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  const auto main =
+    goto_model.goto_functions.function_map.find(ID_main);
+  if(
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+    return false;
+  std::set<irep_idt> sequential_calls;
+  for(const auto &instruction : main->second.body.instructions)
+  {
+    irep_idt callee;
+    if(
+      direct_call_identifier(instruction, callee) &&
+      goto_model.goto_functions.function_map.count(callee) != 0)
+      sequential_calls.insert(callee);
+  }
+
+  std::size_t candidate_backedges = 0;
+  for(const auto &function_id : sequential_calls)
+  {
+    const auto &function =
+      goto_model.goto_functions.function_map.at(function_id);
+    if(!function.body_available())
+      continue;
+    const auto &program = function.body;
+    std::map<const goto_programt::instructiont *, std::size_t> positions;
+    std::size_t position = 0;
+    for(const auto &instruction : program.instructions)
+      positions.emplace(&instruction, position++);
+    for(auto instruction = program.instructions.begin();
+        instruction != program.instructions.end(); ++instruction)
+    {
+      if(!instruction->is_goto())
+        continue;
+      bool backward = false;
+      for(const auto &target : instruction->targets)
+      {
+        if(positions.at(&*target) < positions.at(&*instruction))
+          backward = true;
+      }
+      if(!backward)
+        continue;
+      ++candidate_backedges;
+      modular_accumulation_loopt summary;
+      if(
+        !instruction->condition().is_true() ||
+        instruction->targets.size() != 1 ||
+        !modular_accumulation_loop(
+          program, ns, instruction, summary))
+      {
+        std::cout
+          << "NATIVE_MODULAR_LOOP_SUMMARY applied=0"
+          << " reason=transactional_preflight"
+          << " function=" << function_id << '\n';
+        return false;
+      }
+    }
+  }
+  if(candidate_backedges == 0)
+  {
+    std::cout
+      << "NATIVE_MODULAR_LOOP_SUMMARY applied=0"
+      << " reason=no_direct_call_loop\n";
+    return false;
+  }
+
+  std::size_t transformed = 0;
+  std::set<irep_idt> functions;
+  for(auto &function_entry : goto_model.goto_functions.function_map)
+  {
+    if(
+      sequential_calls.count(function_entry.first) == 0 ||
+      !function_entry.second.body_available())
+      continue;
+    auto &program = function_entry.second.body;
+    std::map<const goto_programt::instructiont *, std::size_t> positions;
+    std::size_t position = 0;
+    for(const auto &instruction : program.instructions)
+      positions.emplace(&instruction, position++);
+
+    std::vector<goto_programt::targett> backedges;
+    for(auto instruction = program.instructions.begin();
+        instruction != program.instructions.end(); ++instruction)
+    {
+      if(
+        instruction->is_goto() && instruction->condition().is_true() &&
+        instruction->targets.size() == 1 &&
+        positions.at(&*instruction->get_target()) <
+          positions.at(&*instruction))
+        backedges.push_back(instruction);
+    }
+
+    for(auto backedge : backedges)
+    {
+      modular_accumulation_loopt summary;
+      if(
+        !modular_accumulation_loop(
+          program, ns, backedge, summary))
+        continue;
+      const symbolt *induction_symbol = nullptr;
+      const symbolt *accumulator_symbol = nullptr;
+      INVARIANT(
+        !ns.lookup(summary.induction, induction_symbol) &&
+        !ns.lookup(summary.accumulator, accumulator_symbol),
+        "accepted modular loop symbols exist");
+      exprt count =
+        exact_count(summary.bound, induction_symbol->type);
+      count = cast_if_needed(count, accumulator_symbol->type);
+      exprt delta =
+        cast_if_needed(summary.delta, accumulator_symbol->type);
+      exprt contribution =
+        mult_exprt(std::move(count), std::move(delta));
+      symbol_exprt accumulator(
+        summary.accumulator, accumulator_symbol->type);
+      exprt update =
+        plus_exprt(accumulator, std::move(contribution));
+      const auto head = backedge->get_target();
+      const auto location = head->source_location();
+      program.insert_before(
+        head,
+        goto_programt::make_assignment(
+          symbol_exprt(
+            summary.induction, induction_symbol->type),
+          exact_count(summary.bound, induction_symbol->type),
+          location));
+      program.insert_before(
+        head,
+        goto_programt::make_assignment(
+          accumulator, std::move(update), location));
+      for(auto instruction = head; instruction != std::next(backedge);
+          ++instruction)
+        instruction->turn_into_skip();
+      ++transformed;
+      functions.insert(function_entry.first);
+    }
+  }
+  if(transformed != 0)
+  {
+    const std::size_t normalized =
+      normalize_unsigned_modular_model(goto_model);
+    goto_model.goto_functions.update();
+    std::cout
+      << "NATIVE_MODULAR_RING_NORMALIZE applied="
+      << (normalized != 0 ? 1 : 0)
+      << " rewrites=" << normalized << '\n';
+  }
+  std::cout
+    << "NATIVE_MODULAR_LOOP_SUMMARY applied="
+    << (transformed != 0 ? 1 : 0)
+    << " loops=" << transformed
+    << " functions=" << functions.size() << '\n';
+  (void)message_handler;
+  return transformed != 0;
+}
+
 void nested_iteration_homomorphism_audit(
   const goto_modelt &goto_model,
   message_handlert &message_handler)

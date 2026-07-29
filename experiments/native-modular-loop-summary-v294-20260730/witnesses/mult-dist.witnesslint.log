@@ -1,0 +1,27 @@
+Running witnesslint version 2.1.3-dev
+
+--- Witness File Metadata ---
+Witness File: /exp/mult-dist.correctness.graphml
+Witness Size in Bytes: 3448
+Witness Lines of Code: 65
+Witness Hash: 7c4ae52e11cc75c11322010ba97f472af80e3d28c5935000c2c1fbd2adad51d2
+
+--- Witness Information Before Linting ---
+Witness Version: 1.0
+
+--- Witness Content Information ---
+Witness Type: correctness_witness
+Witness Type-Match: Unknown
+Producer: Deagle 4.1.0
+Creation Time: 2026-07-30T04:25:43+08:00
+Architecture: 32bit
+Program File: /home/lapulatos/svcomp2026-caat/sv-benchmarks/c/weaver/mult-dist.wvr.c
+Program Hash: C31F1603FD15E011308B2E8FCD1CD45B23F0B00AC0B8B466C4F212460081639C
+Source-Code Language: C
+Amount of Nodes: 2
+Amount of Edges: 1
+Amount of Invariants: 1
+Specification: CHECK( init(main()), LTL(G ! call(reach_error())) )
+
+
+witnesslint finished with exit code 0
