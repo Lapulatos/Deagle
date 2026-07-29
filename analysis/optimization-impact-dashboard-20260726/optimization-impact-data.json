@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-29T19:39:34.992Z",
+  "generated_at": "2026-07-29T19:57:05.022Z",
   "comparison_protocol": {
     "tasks": 725,
     "workers": 48,
@@ -14703,6 +14703,53 @@
         "paired_memory": null
       },
       "exact_override": true,
+      "wrapper_exact_evidence": false
+    },
+    {
+      "version": 292,
+      "label": "V292",
+      "method": "Native Residual Feasibility",
+      "status": "failed",
+      "scope": "target_or_audit",
+      "contribution_class": "verifier_or_audit",
+      "description": "V292 tested two native residual directions and rejected both before release testing. Generalizing the exactly-one pure-read admission allowed four more libvsync tasks into Deagle, but all still exceeded 45 seconds. A bounded-progress feasibility study on SafeStack likewise exceeded 90 seconds after supplying bound 3 and 9-11 object bits. The six LDV front-end residuals contain real x86 instructions and were not lowered as empty barriers. Coverage gain is zero; production C++ and the wrapper remain unchanged, so Prior90 and Exact725 were not run.",
+      "source": "../../experiments/native-residual-v292-20260730/conclusion.md",
+      "source_notes": "../../experiments/native-residual-v292-20260730/notes.md",
+      "memory_sum_source": null,
+      "timing": {
+        "version": 292,
+        "directory": "native-residual-v292-20260730",
+        "available": true,
+        "start_epoch_s": 1785354190,
+        "end_epoch_s": 1785354913,
+        "start_iso": "2026-07-29T19:43:10.000Z",
+        "end_iso": "2026-07-29T19:55:13.000Z",
+        "duration_minutes": 12.05,
+        "evidence_kind": "candidate_directory_birth_to_feasibility_rejection"
+      },
+      "metrics": {
+        "correct": null,
+        "cpu_s": null,
+        "wall_s": null,
+        "memory_sum_b": null,
+        "paired_memory_delta_pct": null,
+        "correct_vs_baseline": null,
+        "cpu_vs_baseline_pct": null,
+        "wall_vs_baseline_pct": null,
+        "memory_sum_vs_baseline_pct": null,
+        "correct_vs_previous_success": null,
+        "cpu_vs_previous_success_pct": null,
+        "wall_vs_previous_success_pct": null
+      },
+      "wrapper_metrics": null,
+      "extracted_evidence": {
+        "correct": null,
+        "cpu": null,
+        "wall": null,
+        "peak_memory": null,
+        "paired_memory": null
+      },
+      "exact_override": false,
       "wrapper_exact_evidence": false
     }
   ]
