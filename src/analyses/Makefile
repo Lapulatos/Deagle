@@ -70,6 +70,7 @@ SRC = ai.cpp \
       variable-sensitivity/write_location_context.cpp \
       variable-sensitivity/write_stack.cpp \
       variable-sensitivity/write_stack_entry.cpp \
+      pure_spin_wait_analysis.cpp \
       # Empty last line
 
 INCLUDES= -I ..
