@@ -1661,6 +1661,8 @@ int cbmc_parse_optionst::doit()
         goto_model, ui_message_handler) ||
       phase_boundary_cancellation_transform(
         goto_model, ui_message_handler) ||
+      joined_terminal_overwrite_transform(
+        goto_model, ui_message_handler) ||
       predicate_stable_linearization_transform(
         goto_model, ui_message_handler) ||
       cas_linearization_stability_transform(

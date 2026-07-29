@@ -234,6 +234,14 @@ bool phase_boundary_cancellation_transform(
   goto_modelt &goto_model,
   message_handlert &message_handler);
 
+/// Replace fully joined workers whose only shared effect is an unsigned
+/// nondeterministic loop followed by an unconditional constant overwrite.
+/// Every terminating execution has the same post-join state, while a
+/// nonterminating execution cannot reach code after the joins.
+bool joined_terminal_overwrite_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 /// Audit finite homogeneous spawn loops whose worker has one composable
 /// affine scalar effect. This does not mutate the GOTO model.
 bool homogeneous_spawn_witness_audit(

@@ -1,0 +1,35 @@
+Running witnesslint version 2.1.3-dev
+
+--- Witness File Metadata ---
+Witness File: experiments/native-residual-v298-20260730/witnesses/spaghetti.graphml
+Witness Size in Bytes: 3448
+Witness Lines of Code: 65
+Witness Hash: 35b5035c3551c673c46b7ca33a8762af8074f4467ecc1cb0e367925e569fc5a8
+
+--- Witness Information Before Linting ---
+Witness Version: 1.0
+
+--- Overview of analyzed program ---
+name: experiments/native-residual-v298-20260730/witnesses/spaghetti.wvr.c
+num_chars: 2371
+num_lines: 101
+sha256_hash: 846f3fa2b3520d0013071e1a40d4401eee84eafe31e419bacc7c09bfb8abae71
+function_names: []
+sucessfully_parsed: False
+
+--- Witness Content Information ---
+Witness Type: correctness_witness
+Witness Type-Match: Unknown
+Producer: Deagle 4.1.0
+Creation Time: 2026-07-30T06:32:14+08:00
+Architecture: 32bit
+Program File: /home/lapulatos/svcomp2026-caat/sv-benchmarks/c/weaver/spaghetti.wvr.c
+Program Hash: 846F3FA2B3520D0013071E1A40D4401EEE84EAFE31E419BACC7C09BFB8ABAE71
+Source-Code Language: C
+Amount of Nodes: 2
+Amount of Edges: 1
+Amount of Invariants: 1
+Specification: CHECK( init(main()), LTL(G ! call(reach_error())) )
+
+
+witnesslint finished with exit code 0

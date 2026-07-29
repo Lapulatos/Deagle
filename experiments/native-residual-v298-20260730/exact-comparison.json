@@ -1,0 +1,40 @@
+{
+  "base": {
+    "correct": 700,
+    "cpu": 968.6572050000007,
+    "end": "2026-07-30T06:11:01.146282+08:00",
+    "memory": 26867920896,
+    "peak_memory": 3999997952,
+    "start": "2026-07-30T06:08:23.535759+08:00",
+    "unfinished": 22,
+    "wall": 1014.9598592408001,
+    "wrong": 3
+  },
+  "candidate": {
+    "correct": 701,
+    "cpu": 901.6218819999998,
+    "end": "2026-07-30T06:49:07.729408+08:00",
+    "memory": 26740121600,
+    "peak_memory": 3999997952,
+    "start": "2026-07-30T06:46:32.449466+08:00",
+    "unfinished": 21,
+    "wall": 941.3961547822692,
+    "wrong": 3
+  },
+  "changes": [
+    {
+      "after_category": "correct",
+      "after_status": "true",
+      "before_category": "error",
+      "before_status": "TIMEOUT",
+      "task": "spaghetti.wvr.yml"
+    }
+  ],
+  "new_wrong": [],
+  "old_correct_losses": [],
+  "percent_change": {
+    "cpu": -6.92043817503023,
+    "memory": -0.4756575564394572,
+    "wall": -7.247942250007533
+  }
+}

@@ -17655,6 +17655,305 @@ bool phase_boundary_cancellation_transform(
   return true;
 }
 
+namespace
+{
+struct terminal_overwrite_workert
+{
+  irep_idt function;
+  irep_idt object;
+  exprt object_expr;
+  exprt value;
+  mp_integer constant;
+};
+
+bool terminal_overwrite_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &function_id,
+  terminal_overwrite_workert &summary,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "terminal_overwrite_missing_worker";
+    return false;
+  }
+  const auto &program = function->second.body;
+  const auto semantic = semantic_instructions(program);
+  if(semantic.size() < 5)
+  {
+    reason = "terminal_overwrite_instruction_count";
+    return false;
+  }
+
+  irep_idt guard_value;
+  const exprt &guard_rhs =
+    semantic[0]->is_assign()
+      ? without_cast(semantic[0]->assign_rhs())
+      : nil_exprt();
+  if(
+    !semantic[0]->is_assign() ||
+    !direct_symbol(semantic[0]->assign_lhs(), guard_value) ||
+    guard_rhs.id() != ID_side_effect ||
+    to_side_effect_expr(guard_rhs).get_statement() != ID_nondet ||
+    !semantic[1]->is_goto() ||
+    semantic[1]->targets.size() != 1 ||
+    !negated_nonzero_symbol_test(
+      semantic[1]->condition(), guard_value) ||
+    semantic[1]->get_target() != semantic.back())
+  {
+    reason = "terminal_overwrite_nondet_guard";
+    return false;
+  }
+
+  const auto backedge = semantic[semantic.size() - 2];
+  auto backedge_target =
+    backedge->is_goto() && backedge->targets.size() == 1
+      ? backedge->get_target()
+      : program.instructions.end();
+  while(
+    backedge_target != program.instructions.end() &&
+    (backedge_target->is_skip() ||
+     backedge_target->is_location() ||
+     backedge_target->is_decl() ||
+     backedge_target->is_dead()))
+    ++backedge_target;
+  if(
+    !backedge->is_goto() || !backedge->condition().is_true() ||
+    backedge->targets.size() != 1 ||
+    backedge_target != semantic[0])
+  {
+    reason = "terminal_overwrite_backedge";
+    return false;
+  }
+
+  irep_idt object;
+  mp_integer final_value;
+  if(
+    !semantic.back()->is_assign() ||
+    !direct_symbol(semantic.back()->assign_lhs(), object) ||
+    !constant_eval(
+      semantic.back()->assign_rhs(), {}, final_value))
+  {
+    reason = "terminal_overwrite_final_store";
+    return false;
+  }
+  const symbolt *object_symbol = nullptr;
+  const symbolt *guard_symbol = nullptr;
+  if(
+    ns.lookup(object, object_symbol) ||
+    ns.lookup(guard_value, guard_symbol) ||
+    !object_symbol->is_static_lifetime ||
+    object_symbol->type.id() != ID_unsignedbv ||
+    !is_atomic_symbol(*object_symbol) ||
+    object_symbol->type.get_bool(ID_C_volatile) ||
+    guard_symbol->is_static_lifetime ||
+    guard_symbol->type.id() != ID_c_bool ||
+    guard_symbol->type.get_bool(ID_C_volatile))
+  {
+    reason = "terminal_overwrite_symbol_types";
+    return false;
+  }
+
+  for(std::size_t index = 2; index + 2 < semantic.size(); ++index)
+  {
+    const auto instruction = semantic[index];
+    irep_idt written;
+    if(
+      !instruction->is_assign() ||
+      !direct_symbol(instruction->assign_lhs(), written) ||
+      written != object ||
+      contains_side_effect(instruction->assign_lhs()))
+    {
+      reason = "terminal_overwrite_loop_effect";
+      return false;
+    }
+    const exprt &rhs = instruction->assign_rhs();
+    if(rhs.id() == ID_dereference)
+    {
+      reason = "terminal_overwrite_loop_dereference";
+      return false;
+    }
+    find_symbols_sett symbols;
+    find_symbols(rhs, symbols);
+    for(const auto &identifier : symbols)
+      if(identifier != object)
+      {
+        reason = "terminal_overwrite_loop_dependency";
+        return false;
+      }
+  }
+
+  for(const auto &instruction : program.instructions)
+  {
+    if(
+      instruction.is_assert() || instruction.is_assume() ||
+      instruction.is_function_call() ||
+      instruction.is_start_thread() ||
+      instruction.is_atomic_begin() ||
+      instruction.is_atomic_end() ||
+      contains_address_of_symbol(instruction.code(), {object}) ||
+      (instruction.has_condition() &&
+       contains_address_of_symbol(
+         instruction.condition(), {object})))
+    {
+      reason = "terminal_overwrite_worker_effect";
+      return false;
+    }
+  }
+
+  summary.function = function_id;
+  summary.object = object;
+  summary.object_expr =
+    symbol_exprt(object, object_symbol->type);
+  summary.value = semantic.back()->assign_rhs();
+  summary.constant = final_value;
+  return true;
+}
+
+bool terminal_overwrite_exclusive_state(
+  const goto_modelt &model,
+  const std::vector<terminal_overwrite_workert> &workers,
+  std::string &reason)
+{
+  std::set<irep_idt> objects;
+  std::set<irep_idt> worker_functions;
+  for(const auto &worker : workers)
+  {
+    objects.insert(worker.object);
+    worker_functions.insert(worker.function);
+  }
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(
+        contains_address_of_symbol(instruction.code(), objects) ||
+        (instruction.has_condition() &&
+         contains_address_of_symbol(
+           instruction.condition(), objects)))
+      {
+        reason = "terminal_overwrite_address_escape";
+        return false;
+      }
+      if(!instruction.is_assign())
+        continue;
+      irep_idt written;
+      if(
+        direct_symbol(instruction.assign_lhs(), written) &&
+        objects.count(written) != 0 &&
+        entry.first != "__CPROVER_initialize" &&
+        entry.first != "main" &&
+        worker_functions.count(entry.first) == 0)
+      {
+        reason = "terminal_overwrite_foreign_writer";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+} // namespace
+
+bool joined_terminal_overwrite_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  std::vector<create_recordt> creates;
+  std::vector<goto_programt::targett> joins;
+  std::string reason;
+  if(
+    !collect_lifecycle(goto_model, ns, creates, joins, reason) ||
+    !validate_main_region(
+      goto_model, ns, creates, joins, reason))
+  {
+    std::cout
+      << "NATIVE_JOINED_TERMINAL_OVERWRITE applied=0 reason="
+      << (reason.empty() ? "terminal_overwrite_lifecycle" : reason)
+      << '\n';
+    return false;
+  }
+
+  std::vector<terminal_overwrite_workert> workers;
+  std::map<irep_idt, std::pair<exprt, exprt>> replacements;
+  std::map<irep_idt, mp_integer> constants;
+  for(const auto &create : creates)
+  {
+    terminal_overwrite_workert worker;
+    if(!terminal_overwrite_worker(
+         goto_model, ns, create.worker, worker, reason))
+    {
+      std::cout
+        << "NATIVE_JOINED_TERMINAL_OVERWRITE applied=0 reason="
+        << reason << " worker=" << create.worker << '\n';
+      return false;
+    }
+    auto replacement = replacements.find(worker.object);
+    if(replacement == replacements.end())
+    {
+      replacements.emplace(
+        worker.object,
+        std::make_pair(worker.object_expr, worker.value));
+      constants.emplace(worker.object, worker.constant);
+    }
+    else
+    {
+      if(constants.at(worker.object) != worker.constant)
+      {
+        std::cout
+          << "NATIVE_JOINED_TERMINAL_OVERWRITE applied=0 reason="
+          << "terminal_overwrite_value_mismatch object="
+          << worker.object << '\n';
+        return false;
+      }
+    }
+    workers.push_back(std::move(worker));
+  }
+  if(
+    replacements.empty() ||
+    !terminal_overwrite_exclusive_state(
+      goto_model, workers, reason))
+  {
+    std::cout
+      << "NATIVE_JOINED_TERMINAL_OVERWRITE applied=0 reason="
+      << (reason.empty() ? "terminal_overwrite_empty" : reason)
+      << '\n';
+    return false;
+  }
+
+  auto main = goto_model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != goto_model.goto_functions.function_map.end(),
+    "terminal overwrite lifecycle found main");
+  const auto final_join = joins.back();
+  const auto location = final_join->source_location();
+  for(const auto &replacement : replacements)
+    main->second.body.insert_after(
+      final_join,
+      goto_programt::make_assignment(
+        replacement.second.first,
+        replacement.second.second,
+        location));
+  for(auto &create : creates)
+    create.instruction->turn_into_skip();
+  for(auto &join : joins)
+    join->turn_into_skip();
+  goto_model.goto_functions.update();
+
+  std::cout
+    << "NATIVE_JOINED_TERMINAL_OVERWRITE applied=1 workers="
+    << workers.size() << " objects=" << replacements.size() << '\n';
+  (void)message_handler;
+  return true;
+}
+
 bool homogeneous_spawn_witness_audit(
   const goto_modelt &goto_model,
   message_handlert &message_handler)
