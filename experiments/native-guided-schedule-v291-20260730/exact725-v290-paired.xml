@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<benchmark tool="benchexec.tools.deagle_benchexec" timelimit="60 s" memlimit="4 GB" cpuCores="1">
+  <rundefinition name="v290-paired-native-exact725">
+    <option>--deagle-experiment-direct</option>
+    <option>--native-adaptive-indexed-dispatch</option>
+    <option>--native-jces</option>
+    <option>--native-prefix-affine-envelope</option>
+    <option>--deagle-shallow-counterexample-prepass</option>
+    <option>--deagle-recursive-worker-prepass</option>
+    <option>--deagle-multi-template-worker-prepass</option>
+    <option>--deagle-lock-ego-prepass</option>
+    <option>--deagle-protocol-capacity-prepass</option>
+    <tasks name="Concurrency">
+      <includesfile>/home/lapulatos/deagle-experiments/v290-paired-exact725-r1/exact725.server.set</includesfile>
+      <propertyfile>/home/lapulatos/svcomp2026-caat/sv-benchmarks/c/properties/unreach-call.prp</propertyfile>
+    </tasks>
+  </rundefinition>
+</benchmark>

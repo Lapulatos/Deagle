@@ -1,0 +1,119 @@
+# Notes: V291 Native Guided Short-Schedule Search
+
+## V290 Residual Census
+
+- Six LDV Linux tasks stop quickly in front-end/native admission.
+- `elimination_backoff_stack` exhausts 4 GB.
+- Five tasks time out:
+  `safestack_relacy`, `workstealqueue_mutex-2`, `parallel-misc-5`,
+  `unroll-cond-3`, and `unroll-cond-5`.
+- Nine libvsync tasks return fast inconclusive results.
+
+## Excluded Simple Extensions
+
+- `parallel-misc-5` has unbounded signed increments and a reachable
+  wraparound boundary; an integer-only invariant is unsound.
+- `unroll-cond-3` and `unroll-cond-5` use unsigned subtractive guards that
+  wrap for small inputs.
+- The existing queue correspondence proof does not model homogeneous stealers.
+- The smallest explicit-create elimination-stack subset still has 3,868
+  property-relevant events and times out.
+
+## V291 Candidate Family
+
+The most defensible next experiment is a generic native bounded
+short-schedule search:
+
+1. derive loop-created worker classes and property-relevant shared objects
+   from GOTO;
+2. select a small representative worker subset and bounded iteration budget
+   without fixed task roles or values;
+3. run the reduced model only to obtain branch/nondeterministic/schedule
+   guidance;
+4. map the guide to the saved untransformed GOTO model;
+5. let Deagle independently solve the original model and export the final
+   GraphML;
+6. return inconclusive if any mapping or replay obligation fails.
+
+The V276 42-step schedule is evidence that a short execution exists, not a
+template that production code may encode.
+
+## Native Pure-Spin Admission Finding
+
+The corrected nine-task libvsync audit isolated a cheaper generic opportunity
+than bounded schedule search. A marked retry loop can be stuttering even when
+its inlined helper contains an assertion that is unreachable under a branch
+condition established before the loop. The accepted V290 checker started
+symbolic exploration at the loop head, so it discarded that prefix condition.
+
+The V291 candidate therefore:
+
+1. starts the existing bounded symbolic check at the containing function
+   entry;
+2. propagates equality facts selected by CFG branches;
+3. retains standard C truth semantics for constant conditions;
+4. computes reverse CFG reachability to the target loop head and drops prefix
+   branches that cannot enter the loop;
+5. resets write and loop-local effects on first loop entry, so only the retry
+   iteration is required to stutter;
+6. remains fail-closed on unknown assertions, calls, writes, state-budget
+   exhaustion, or ambiguous control flow.
+
+The production change contains no task path, benchmark name, expected verdict,
+source line, worker count, or distinguished constant.
+
+## Build Recovery
+
+The recorded `/data3/sujie` experiment mount was absent after the server
+restart. The existing dirty server repository was left untouched. A new source
+tree was streamed from accepted V290 commit
+`53cb46000b797b5122b25626437c05741a234d3e` to:
+
+`/home/lapulatos/deagle-v291-guided-short-schedule-r1-20260730`
+
+The source archive contained stale Git-tracked thin libraries. The first link
+failed because their untracked object members were absent. Running the project
+Makefile clean target followed by `make -C src cbmc.dir -j8` produced a clean
+unified binary. One temporary diagnostic include was initially incorrect
+(`from_expr` was not declared); it was corrected for diagnosis and all
+diagnostic output was then removed from the candidate.
+
+## BenchExec Recovery and Paired Baseline
+
+BenchExec's stock Deagle tool-info module for versions at least 2.2 omitted
+every XML option. The invalid Prior90 attempts are excluded. The
+experiment-local `deagle_benchexec.py` changes only command construction so
+that the declared options are forwarded; it performs no benchmark inspection,
+analysis, verdict, or witness work.
+
+The server user slice provides 8 physical cores, so both V290 and V291 were
+measured at 8 workers. The paired V290 source is accepted commit
+`53cb46000b797b5122b25626437c05741a234d3e`; its clean binary SHA-256 is
+`8a4e26c7f718031d42fdbb684c6ae6dac993d215dd07accdfbef65cb52ab592a`.
+The V290 and V291 tool packages differ only in `deagle_exe`.
+
+The paired Exact725 XML contains the same 725 task names. Its only
+status/category difference is:
+
+`libvsync/rec_ticketlock.yml: unknown/unknown -> true/correct`.
+
+Thus V291 has one gain, zero old-correct losses, and zero new wrong results.
+The nine additional timeouts relative to the historical 48-worker V290 run
+also occur in the paired V290 run and are not a V291 source regression.
+
+## Correctness Witness
+
+The final target correctness witness is:
+
+`/home/lapulatos/deagle-experiments/v291-rec-ticketlock-prefix-r15/witness.graphml`
+
+- Size: 3,457 bytes.
+- SHA-256:
+  `3563906d145cda0339d9e5eea1c1cc014108b243312db41ab333fe303d28a0f0`.
+- WitnessLint 2.1.3-dev source:
+  `5297b5889b936f5eff5a1f2b594230df9a28d1c5`.
+- WitnessLint format exit: 0.
+- `xmllint --noout` exit: 0.
+
+The witness is generated by native Deagle as a correctness witness; the
+wrapper only forwards the native option and exit status.
