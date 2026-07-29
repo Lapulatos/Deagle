@@ -47,7 +47,11 @@ protected:
     equalitiest equalities;
   };
 
-  typedef std::unordered_map<const typet, typestructt, irep_hash> typemapt;
+  // Equality constraints must be emitted in a stable type order. Iterating an
+  // unordered map here made the SAT formula depend on process-local irep
+  // intern numbers, which can change when an unrelated translation unit is
+  // linked into the executable.
+  typedef std::map<const typet, typestructt> typemapt;
 
   typemapt typemap;
 
