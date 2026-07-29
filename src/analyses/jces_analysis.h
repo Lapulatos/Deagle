@@ -220,6 +220,13 @@ bool nonnegative_oscillator_monitor_transform(
   goto_modelt &goto_model,
   message_handlert &message_handler);
 
+/// Replace fully joined bounded workers whose private phase alternates equal
+/// opposite atomic updates for an even number of steps. The shared transition
+/// word is exactly the identity; all unsupported shapes remain unchanged.
+bool bounded_alternating_cancellation_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 /// Audit finite homogeneous spawn loops whose worker has one composable
 /// affine scalar effect. This does not mutate the GOTO model.
 bool homogeneous_spawn_witness_audit(

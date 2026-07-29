@@ -1,0 +1,35 @@
+Running witnesslint version 2.1.3-dev
+
+--- Witness File Metadata ---
+Witness File: /data3/sujie/experiments/v296-bounded-alternating-witnesslint-r1/witness.graphml
+Witness Size in Bytes: 3460
+Witness Lines of Code: 65
+Witness Hash: b61488b9d086ef42e1e321074eb41c9cf951c6dab34c33ad53ca45de1333bc50
+
+--- Witness Information Before Linting ---
+Witness Version: 1.0
+
+--- Overview of analyzed program ---
+name: /data3/sujie/experiments/v296-bounded-alternating-witnesslint-r1/parallel-misc-2.wvr.c
+num_chars: 2279
+num_lines: 94
+sha256_hash: c558e00c0dd9b5f4cf40cba6e03e276a996696c71c282947f4c8d13390dc25bf
+function_names: []
+sucessfully_parsed: False
+
+--- Witness Content Information ---
+Witness Type: correctness_witness
+Witness Type-Match: Unknown
+Producer: Deagle 4.1.0
+Creation Time: 2026-07-30T05:29:06+08:00
+Architecture: 32bit
+Program File: /home/lapulatos/svcomp2026-caat/sv-benchmarks/c/weaver/parallel-misc-2.wvr.c
+Program Hash: C558E00C0DD9B5F4CF40CBA6E03E276A996696C71C282947F4C8D13390DC25BF
+Source-Code Language: C
+Amount of Nodes: 2
+Amount of Edges: 1
+Amount of Invariants: 1
+Specification: CHECK( init(main()), LTL(G ! call(reach_error())) )
+
+
+witnesslint finished with exit code 0

@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-29T21:16:06.901Z",
+  "generated_at": "2026-07-29T21:36:25.393Z",
   "comparison_protocol": {
     "tasks": 725,
     "workers": 48,
@@ -16,7 +16,7 @@
     "Optimization duration is an artifact-backed observed wall-clock interval covering research, implementation, experiments, analysis, and documentation; it is not pure model-compute time.",
     "V17-V20 and V168 share timestamp records with another version, while V37 and V91 lack independent records; their durations remain missing rather than being estimated.",
     "Some historical controls were reused across dates; cumulative baseline comparisons are useful for progress, not precise per-version causal attribution.",
-    "V291, V294, and V295 were measured after a server restart with 8 physical workers. Their coverage and resource claims use contemporaneous N8 paired controls; their raw totals are shown in the ledger but excluded from the historical 48-worker resource trend lines."
+    "V291 and V294-V296 were measured after a server restart with 8 physical workers. Their coverage and resource claims use contemporaneous N8 paired controls; their raw totals are shown in the ledger but excluded from the historical 48-worker resource trend lines."
   ],
   "rows": [
     {
@@ -14903,6 +14903,62 @@
       "wrapper_metrics": null,
       "extracted_evidence": {
         "correct": "Exact725 reaches 697 official / 709 adjudicated correct, changing only",
+        "cpu": null,
+        "wall": null,
+        "peak_memory": null,
+        "paired_memory": null
+      },
+      "exact_override": true,
+      "wrapper_exact_evidence": false
+    },
+    {
+      "version": 296,
+      "label": "V296",
+      "method": "Bounded Alternating Cancellation",
+      "status": "successful",
+      "scope": "exact725",
+      "contribution_class": "native_redo",
+      "description": "Native V296 derives fully joined workers whose private Boolean phase alternates equal opposite updates to one atomic scalar for an even unsigned step count. It replaces the proven identity transition word and leaves verdict and witness generation to the ordinary backend in one deagle_exe; the wrapper is byte-identical to V295. Under a contemporaneous N8 paired Exact725 comparison, only parallel-misc-2 changes from timeout to correct true, reaching 698 official / 710 adjudicated correct with zero old-correct losses and zero new wrong results. Prior90 remains 90/90, the 3,460-byte correctness witness passes WitnessLint's format check, and paired CPU, wall, and summed memory change -4.669%, -4.412%, and -0.746%.",
+      "source": "../../experiments/native-residual-v296-20260730/conclusion.md",
+      "source_notes": "../../experiments/native-residual-v296-20260730/notes.md",
+      "memory_sum_source": "/home/lapulatos/deagle-experiments/v296-paired-candidate-exact725-r1/results/exact725.server.2026-07-30_05-31-16.results.v296-native-bounded-alternating-exact725.Concurrency.xml.bz2",
+      "comparison_protocol_override": {
+        "tasks": 725,
+        "workers": 8,
+        "cores_per_task": 1,
+        "memory_per_task_gb": 4,
+        "time_limit_s": 60,
+        "paired_baseline_version": 295
+      },
+      "resource_comparable_with_historical_trend": false,
+      "timing": {
+        "version": 296,
+        "directory": "native-residual-v296-20260730",
+        "available": true,
+        "start_epoch_s": 1785360356,
+        "end_epoch_s": 1785361272,
+        "start_iso": "2026-07-29T21:19:36.000Z",
+        "end_iso": "2026-07-29T21:34:52.000Z",
+        "duration_minutes": 15.266666666666667,
+        "evidence_kind": "candidate_plan_birth_to_release_witness_gate"
+      },
+      "metrics": {
+        "correct": 710,
+        "cpu_s": 1093.065036,
+        "wall_s": 1134.9193168370984,
+        "memory_sum_b": 27417141248,
+        "paired_memory_delta_pct": null,
+        "correct_vs_baseline": 266,
+        "cpu_vs_baseline_pct": null,
+        "wall_vs_baseline_pct": null,
+        "memory_sum_vs_baseline_pct": null,
+        "correct_vs_previous_success": 1,
+        "cpu_vs_previous_success_pct": null,
+        "wall_vs_previous_success_pct": null
+      },
+      "wrapper_metrics": null,
+      "extracted_evidence": {
+        "correct": "Exact725 reaches 698 official / 710 adjudicated correct, changing only",
         "cpu": null,
         "wall": null,
         "peak_memory": null,

@@ -16572,6 +16572,298 @@ bool equality_implies(
   }
   return false;
 }
+
+struct bounded_alternating_workert
+{
+  irep_idt function;
+  irep_idt induction;
+  irep_idt phase;
+  irep_idt object;
+  exprt bound;
+  mp_integer weight;
+};
+
+bool even_unsigned_bound(
+  const exprt &src,
+  const typet &induction_type,
+  exprt &bound)
+{
+  bound = src;
+  if(bound.type() != induction_type)
+    return false;
+  mp_integer value;
+  if(constant_eval(without_cast(bound), {}, value))
+    return value >= 0 && value % 2 == 0;
+  const exprt &expr = without_cast(bound);
+  if(expr.id() != ID_mult || expr.operands().size() != 2)
+    return false;
+  mp_integer factor;
+  const bool first_constant =
+    constant_eval(expr.op0(), {}, factor);
+  const exprt &variable =
+    without_cast(first_constant ? expr.op1() : expr.op0());
+  if(
+    (!first_constant &&
+     !constant_eval(expr.op1(), {}, factor)) ||
+    variable.id() != ID_symbol)
+    return false;
+  return factor >= 0 && factor % 2 == 0;
+}
+
+bool bounded_alternating_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &function_id,
+  bounded_alternating_workert &summary,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "bounded_alternating_missing_worker";
+    return false;
+  }
+  const auto semantic = semantic_instructions(function->second.body);
+  if(semantic.size() != 8)
+  {
+    reason =
+      "bounded_alternating_instruction_count_" +
+      std::to_string(semantic.size());
+    return false;
+  }
+
+  irep_idt induction;
+  exprt parsed_bound;
+  if(
+    !parse_exit_guard(*semantic[0], induction, parsed_bound) ||
+    !semantic[7]->is_goto() ||
+    !semantic[7]->condition().is_true() ||
+    semantic[7]->targets.size() != 1 ||
+    semantic[7]->get_target() != semantic[0])
+  {
+    reason = "bounded_alternating_loop";
+    return false;
+  }
+
+  irep_idt phase;
+  if(
+    !semantic[1]->is_goto() ||
+    semantic[1]->targets.size() != 1 ||
+    !negated_nonzero_symbol_test(semantic[1]->condition(), phase) ||
+    semantic[1]->get_target() != semantic[4])
+  {
+    reason = "bounded_alternating_phase_guard";
+    return false;
+  }
+
+  irep_idt positive_object;
+  irep_idt negative_object;
+  mp_integer positive;
+  mp_integer negative;
+  if(
+    !oscillator_delta(
+      *semantic[2], positive_object, positive) ||
+    !semantic[3]->is_goto() ||
+    !semantic[3]->condition().is_true() ||
+    semantic[3]->targets.size() != 1 ||
+    semantic[3]->get_target() != semantic[5] ||
+    !oscillator_delta(
+      *semantic[4], negative_object, negative) ||
+    positive_object != negative_object ||
+    positive <= 0 || negative != -positive)
+  {
+    reason = "bounded_alternating_opposites";
+    return false;
+  }
+
+  irep_idt phase_lhs;
+  irep_idt phase_rhs;
+  irep_idt incremented;
+  if(
+    !semantic[5]->is_assign() ||
+    !direct_symbol(semantic[5]->assign_lhs(), phase_lhs) ||
+    phase_lhs != phase ||
+    !negated_nonzero_symbol_test(
+      semantic[5]->assign_rhs(), phase_rhs) ||
+    phase_rhs != phase ||
+    !parse_unit_increment(*semantic[6], incremented) ||
+    incremented != induction)
+  {
+    reason = "bounded_alternating_private_step";
+    return false;
+  }
+
+  const symbolt *induction_symbol = nullptr;
+  const symbolt *phase_symbol = nullptr;
+  const symbolt *object_symbol = nullptr;
+  exprt bound;
+  if(
+    ns.lookup(induction, induction_symbol) ||
+    ns.lookup(phase, phase_symbol) ||
+    ns.lookup(positive_object, object_symbol) ||
+    !induction_symbol->is_static_lifetime ||
+    induction_symbol->type.id() != ID_unsignedbv ||
+    induction_symbol->type.get_bool(ID_C_volatile) ||
+    !phase_symbol->is_static_lifetime ||
+    phase_symbol->type.id() != ID_c_bool ||
+    phase_symbol->type.get_bool(ID_C_volatile) ||
+    is_atomic_symbol(*phase_symbol) ||
+    !object_symbol->is_static_lifetime ||
+    (object_symbol->type.id() != ID_signedbv &&
+     object_symbol->type.id() != ID_unsignedbv) ||
+    !is_atomic_symbol(*object_symbol) ||
+    !even_unsigned_bound(
+      parsed_bound, induction_symbol->type, bound) ||
+    contains_symbol(
+      bound, {induction, phase, positive_object}))
+  {
+    reason = "bounded_alternating_types_or_parity";
+    return false;
+  }
+  find_symbols_sett bound_symbols;
+  find_symbols(bound, bound_symbols);
+  for(const auto &identifier : bound_symbols)
+  {
+    const symbolt *symbol = nullptr;
+    if(
+      ns.lookup(identifier, symbol) ||
+      !symbol->is_static_lifetime ||
+      symbol->is_type ||
+      (symbol->type.id() != ID_signedbv &&
+       symbol->type.id() != ID_unsignedbv) ||
+      symbol->type.get_bool(ID_C_volatile))
+    {
+      reason = "bounded_alternating_bound_symbol";
+      return false;
+    }
+  }
+
+  summary.function = function_id;
+  summary.induction = induction;
+  summary.phase = phase;
+  summary.object = positive_object;
+  summary.bound = std::move(bound);
+  summary.weight = positive;
+  return true;
+}
+
+bool bounded_alternating_exclusive_state(
+  const goto_modelt &model,
+  const std::vector<create_recordt> &creates,
+  const std::vector<bounded_alternating_workert> &workers,
+  std::string &reason)
+{
+  const auto main =
+    model.goto_functions.function_map.find("main");
+  if(
+    main == model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+  {
+    reason = "bounded_alternating_missing_main";
+    return false;
+  }
+
+  std::set<irep_idt> all_private;
+  std::set<irep_idt> objects;
+  std::set<irep_idt> bound_symbols;
+  for(const auto &worker : workers)
+  {
+    if(
+      !all_private.insert(worker.induction).second ||
+      !all_private.insert(worker.phase).second)
+    {
+      reason = "bounded_alternating_private_alias";
+      return false;
+    }
+    objects.insert(worker.object);
+    find_symbols_sett found_bound_symbols;
+    find_symbols(worker.bound, found_bound_symbols);
+    bound_symbols.insert(
+      found_bound_symbols.begin(), found_bound_symbols.end());
+  }
+  if(objects.size() != 1)
+  {
+    reason = "bounded_alternating_object_mismatch";
+    return false;
+  }
+
+  std::set<irep_idt> owner_functions;
+  for(const auto &worker : workers)
+    owner_functions.insert(worker.function);
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(
+      !entry.second.body_available() ||
+      entry.first == "main" ||
+      entry.first == "__CPROVER_initialize" ||
+      owner_functions.count(entry.first) != 0)
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(
+        instruction_mentions_any(
+          instruction, all_private) ||
+        instruction_mentions_any(
+          instruction, objects))
+      {
+        reason = "bounded_alternating_foreign_access";
+        return false;
+      }
+    }
+  }
+
+  for(std::size_t index = 0; index < workers.size(); ++index)
+  {
+    const auto &owner = workers[index];
+    const std::set<irep_idt> owner_private{
+      owner.induction, owner.phase};
+    for(std::size_t other = 0; other < workers.size(); ++other)
+    {
+      if(index == other)
+        continue;
+      const auto function =
+        model.goto_functions.function_map.find(
+          workers[other].function);
+      for(const auto &instruction :
+          function->second.body.instructions)
+      {
+        if(instruction_mentions_any(instruction, owner_private))
+        {
+          reason = "bounded_alternating_cross_worker_private";
+          return false;
+        }
+      }
+    }
+  }
+
+  bool after_first_create = false;
+  for(const auto &instruction : main->second.body.instructions)
+  {
+    if(&instruction == &*creates.front().instruction)
+      after_first_create = true;
+    if(
+      after_first_create &&
+      instruction_mentions_any(instruction, all_private))
+    {
+      reason = "bounded_alternating_observed_private";
+      return false;
+    }
+    if(
+      after_first_create && instruction.is_assign() &&
+      (contains_symbol(
+         instruction.assign_lhs(), bound_symbols) ||
+       contains_symbol(
+         instruction.assign_lhs(), objects)))
+    {
+      reason = "bounded_alternating_late_write";
+      return false;
+    }
+  }
+  return true;
+}
 } // namespace
 
 bool nonnegative_oscillator_monitor_transform(
@@ -16738,6 +17030,120 @@ bool nonnegative_oscillator_monitor_transform(
     << " position=" << position
     << " flag=" << flag
     << " weight_sum=" << weight_sum << '\n';
+  (void)message_handler;
+  return true;
+}
+
+bool bounded_alternating_cancellation_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  std::vector<create_recordt> creates;
+  std::vector<goto_programt::targett> joins;
+  std::string reason;
+  if(
+    !collect_lifecycle(goto_model, ns, creates, joins, reason) ||
+    creates.size() < 2 ||
+    !validate_main_region(
+      goto_model, ns, creates, joins, reason))
+  {
+    std::cout
+      << "NATIVE_BOUNDED_ALTERNATING_CANCELLATION applied=0 reason="
+      << (reason.empty() ? "bounded_alternating_lifecycle" : reason)
+      << '\n';
+    return false;
+  }
+
+  std::vector<bounded_alternating_workert> workers;
+  for(const auto &create : creates)
+  {
+    bounded_alternating_workert worker;
+    if(!bounded_alternating_worker(
+         goto_model,
+         ns,
+         create.worker,
+         worker,
+         reason))
+    {
+      std::cout
+        << "NATIVE_BOUNDED_ALTERNATING_CANCELLATION applied=0 reason="
+        << reason << " worker=" << create.worker << '\n';
+      return false;
+    }
+    workers.push_back(std::move(worker));
+  }
+
+  std::map<irep_idt, std::set<irep_idt>> equalities;
+  std::map<irep_idt, std::set<mp_integer>> constants;
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : main->second.body.instructions)
+    positions.emplace(&instruction, position++);
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != creates.front().instruction; ++instruction)
+  {
+    irep_idt callee;
+    if(
+      direct_call_identifier(*instruction, callee) &&
+      callee == "assume_abort_if_not" &&
+      instruction->call_arguments().size() == 1)
+    {
+      bool supported = false;
+      const auto control =
+        control_signature(
+          main->second.body,
+          positions,
+          positions.at(&*instruction),
+          supported);
+      if(supported && control.empty())
+        collect_constant_equalities(
+          instruction->call_arguments().front(),
+          equalities,
+          constants);
+    }
+  }
+  for(const auto &worker : workers)
+  {
+    if(!equality_implies(
+         worker.induction, 0, equalities, constants))
+    {
+      std::cout
+        << "NATIVE_BOUNDED_ALTERNATING_CANCELLATION applied=0"
+        << " reason=bounded_alternating_induction_initialization"
+        << " worker=" << worker.function << '\n';
+      return false;
+    }
+  }
+  if(
+    !bounded_alternating_exclusive_state(
+      goto_model, creates, workers, reason))
+  {
+    std::cout
+      << "NATIVE_BOUNDED_ALTERNATING_CANCELLATION applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+
+  for(const auto &worker : workers)
+  {
+    auto function =
+      goto_model.goto_functions.function_map.find(worker.function);
+    for(auto &instruction : function->second.body.instructions)
+    {
+      if(
+        !instruction.is_set_return_value() &&
+        !instruction.is_end_function())
+        instruction.turn_into_skip();
+    }
+  }
+  goto_model.goto_functions.update();
+  std::cout
+    << "NATIVE_BOUNDED_ALTERNATING_CANCELLATION applied=1"
+    << " workers=" << workers.size()
+    << " object=" << workers.front().object << '\n';
   (void)message_handler;
   return true;
 }

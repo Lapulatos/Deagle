@@ -1657,6 +1657,8 @@ int cbmc_parse_optionst::doit()
         goto_model, ui_message_handler) ||
       homogeneous_thread_local_cutoff_transform(
         goto_model, ui_message_handler) ||
+      bounded_alternating_cancellation_transform(
+        goto_model, ui_message_handler) ||
       predicate_stable_linearization_transform(
         goto_model, ui_message_handler) ||
       cas_linearization_stability_transform(

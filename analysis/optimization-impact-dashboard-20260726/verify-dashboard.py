@@ -941,6 +941,25 @@ assert "zero old-correct losses" in v295["description"].lower()
 assert "wrapper is byte-identical" in v295["description"].lower()
 assert "witnesslint" in v295["description"].lower()
 
+v296 = next(row for row in DATA["rows"] if row["version"] == 296)
+assert v296["status"] == "successful"
+assert v296["scope"] == "exact725"
+assert v296["contribution_class"] == "native_redo"
+assert v296["metrics"]["correct"] == 710
+assert v296["metrics"]["cpu_s"] == 1093.065036
+assert v296["metrics"]["wall_s"] == 1134.9193168370984
+assert v296["metrics"]["memory_sum_b"] == 27417141248
+assert v296["metrics"]["correct_vs_previous_success"] == 1
+assert v296["metrics"]["cpu_vs_previous_success_pct"] is None
+assert v296["metrics"]["wall_vs_previous_success_pct"] is None
+assert v296["resource_comparable_with_historical_trend"] is False
+assert v296["comparison_protocol_override"]["workers"] == 8
+assert v296["comparison_protocol_override"]["paired_baseline_version"] == 295
+assert v296["timing"]["start_epoch_s"] > v295["timing"]["end_epoch_s"]
+assert "zero old-correct losses" in v296["description"].lower()
+assert "wrapper is byte-identical" in v296["description"].lower()
+assert "witnesslint" in v296["description"].lower()
+
 timing_expected = {
     264: 3.121307483333333,
     265: 6.578901950000001,
@@ -969,6 +988,7 @@ timing_expected = {
     293: 10.85,
     294: 32.3,
     295: 16.983333333333334,
+    296: 15.266666666666667,
 }
 for version, duration in timing_expected.items():
     row = next(row for row in DATA["rows"] if row["version"] == version)
@@ -983,6 +1003,7 @@ assert v292["timing"]["start_epoch_s"] > v291["timing"]["end_epoch_s"]
 assert v293["timing"]["start_epoch_s"] > v292["timing"]["end_epoch_s"]
 assert v294["timing"]["start_epoch_s"] > v293["timing"]["end_epoch_s"]
 assert v295["timing"]["start_epoch_s"] > v294["timing"]["end_epoch_s"]
+assert v296["timing"]["start_epoch_s"] > v295["timing"]["end_epoch_s"]
 
 
 with sync_playwright() as playwright:
@@ -998,9 +1019,9 @@ with sync_playwright() as playwright:
     page.goto(HTML.as_uri())
     page.wait_for_load_state("networkidle")
 
-    assert "V1–V295" in page.title()
-    assert page.locator("#rangeMax").get_attribute("max") == "295"
-    assert page.locator("#rangeMax").input_value() == "295"
+    assert "V1–V296" in page.title()
+    assert page.locator("#rangeMax").get_attribute("max") == "296"
+    assert page.locator("#rangeMax").input_value() == "296"
     for version, correct in (
         (259, 687), (260, 688), (261, 689), (262, 690), (263, 691),
         (266, 692), (267, 694), (268, 695), (270, 696),
@@ -1038,6 +1059,9 @@ with sync_playwright() as playwright:
     assert "成功" in page.locator("#row-295").inner_text()
     assert "709" in page.locator("#row-295").inner_text()
     assert "16.98 min" in page.locator("#row-295").inner_text()
+    assert "成功" in page.locator("#row-296").inner_text()
+    assert "710" in page.locator("#row-296").inner_text()
+    assert "15.27 min" in page.locator("#row-296").inner_text()
     assert page.locator(".point[data-version='258']").count() >= 1
     assert "686" in page.locator("#row-258").inner_text()
     for version in (256, 257):
@@ -1045,8 +1069,8 @@ with sync_playwright() as playwright:
         assert "685" in page.locator(f"#row-{version}").inner_text()
     assert page.locator(".point[data-version='254']").count() >= 1
     assert page.locator("#chart .point").count() >= 200
-    # One header, Baseline, and V1--V295.
-    assert page.locator("#ledger .ledger-row").count() == 297
+    # One header, Baseline, and V1--V296.
+    assert page.locator("#ledger .ledger-row").count() == 298
     for version, duration_text in (
         (264, "3.12 min"),
         (265, "6.58 min"),
@@ -1075,6 +1099,7 @@ with sync_playwright() as playwright:
         (293, "10.85 min"),
         (294, "32.3 min"),
         (295, "16.98 min"),
+        (296, "15.27 min"),
     ):
         row_text = page.locator(f"#row-{version}").inner_text()
         assert "时间不可确定" not in row_text
