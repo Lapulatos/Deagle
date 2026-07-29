@@ -33,7 +33,8 @@ witness generation.
 - [x] Implement only if the strategy does not encode the known schedule.
 - [x] Run target, mutation, natural-control, Prior90, Exact725, and resource
   gates.
-- [ ] Commit, push, and publish only if every gate passes.
+- [x] Commit and push only after every release gate passes.
+- [x] Publish the accepted V291 dashboard row and verify the standalone HTML.
 
 ## Current Decision
 
@@ -50,9 +51,11 @@ resource comparison, and WitnessLint now pass.
 
 ## Status
 
-All release gates have passed. The production and experiment diff is under
-final review before the accepted V291 commit is pushed. Nothing from V291 has
-yet been published or pushed.
+All release gates passed. Accepted native commit
+`c3031379673085b40f7b34e3d485ef4ddb3e854b` is pushed to
+`origin/deagle-dev`. The V291 dashboard row is generated with an explicit N8
+paired-protocol boundary; standalone-page verification reports 293 ledger
+rows including the header and zero console errors.
 
 ## Errors Encountered
 

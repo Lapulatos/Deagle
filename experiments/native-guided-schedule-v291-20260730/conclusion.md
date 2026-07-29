@@ -1,6 +1,7 @@
 # Conclusion: V291 Native Prefix-Aware Retry Admission
 
-V291 is accepted for publication.
+V291 is accepted and its native implementation is published as commit
+`c3031379673085b40f7b34e3d485ef4ddb3e854b` on `origin/deagle-dev`.
 
 The native pure-spin checker now retains function-prefix equality facts and
 prunes prefix CFG branches that cannot reach the marked retry loop. This lets

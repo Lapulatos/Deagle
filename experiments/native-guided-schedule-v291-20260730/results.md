@@ -114,3 +114,9 @@ historical evidence, not used for the N8 performance delta.
 V291 passes target, natural-control, mutation, wrapper-boundary, Prior90,
 Exact725, no-loss, no-new-wrong, resource, build, and witness-format gates.
 It is eligible for an accepted native commit after final diff review.
+
+Accepted native commit:
+`c3031379673085b40f7b34e3d485ef4ddb3e854b`.
+
+The remote `origin/deagle-dev` SHA was read back and matched the accepted
+commit.

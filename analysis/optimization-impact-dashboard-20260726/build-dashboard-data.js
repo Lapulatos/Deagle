@@ -703,6 +703,7 @@ const methodOverrides = {
   288: "Single-Worker Initialization Counterexample",
   289: "Shortened-Trace Projection Attempt",
   290: "Original-GOTO Guided Replay",
+  291: "Prefix-Aware Retry Admission",
 };
 
 const statusOverrides = {
@@ -925,6 +926,7 @@ const statusOverrides = {
   288: "successful",
   289: "failed",
   290: "successful",
+  291: "successful",
 };
 
 // These versions changed only the Python wrapper and left the production C++
@@ -936,7 +938,7 @@ const wrapperEvidenceVersions = new Set([
 ]);
 const nativeRedoVersions = new Set([
   256, 257, 258, 259, 260, 261, 262, 263, 266, 267, 268, 270, 271,
-  281, 282, 283, 284, 285, 286, 287, 288, 289, 290,
+  281, 282, 283, 284, 285, 286, 287, 288, 289, 290, 291,
 ]);
 const nativeRedoMemorySources = {
   256: "/data3/sujie/experiments/native-redo-v256-v263-20260728/v256/full-v256-native-depth-results/full-v256-native.2026-07-27_17-26-19.results.v255-conserved-sum.Concurrency.xml.bz2",
@@ -962,6 +964,7 @@ const nativeRedoMemorySources = {
   288: "/data3/sujie/experiments/v288-native-single-worker-exact725-r1/results/exact725.2026-07-29_13-34-25.results.accepted-native-integration-exact725.Concurrency.xml.bz2",
   289: "/data3/sujie/experiments/v289-evilcollapse-exact725-r1/results/exact725.2026-07-29_14-32-37.results.accepted-native-integration-exact725.Concurrency.xml.bz2",
   290: "/data3/sujie/experiments/v290-original-goto-replay-exact725-r2/results/exact725.2026-07-29_18-15-31.results.accepted-native-integration-exact725.Concurrency.xml.bz2",
+  291: "/home/lapulatos/deagle-experiments/v291-exact725-r1/results-n8exact725.server.2026-07-30_03-09-49.results.v291-native-prefix-reachability-exact725.Concurrency.xml.bz2",
 };
 const wrapperMetricOverrides = {
   256: {
@@ -1139,6 +1142,7 @@ const exactOverrides = {
   288: { correct: 701, cpu: 865.0478599520001, wall: 908.7999609876424, peak: 3999997952 },
   289: { correct: 701, cpu: 948.0651588590009, wall: 984.282939416822, peak: 3999641600 },
   290: { correct: 701, cpu: 894.0097913300003, wall: 938.8530091892462, peak: 3999997952 },
+  291: { correct: 693, cpu: 1383.8831540000003, wall: 1421.6679298453964, peak: 3999997952 },
 };
 
 // The public YAML for task82 is mechanically derived from a Goblint UNKNOWN
@@ -1202,6 +1206,7 @@ const adjudicatedCorrectOverrides = {
   288: 703,
   289: 703,
   290: 704,
+  291: 705,
 };
 
 // Sum of BenchExec's per-task `memory` column over all 725 tasks. These values
@@ -1333,6 +1338,7 @@ const memorySumOverrides = {
   288: 25715208192,
   289: 25412145152,
   290: 26493808640,
+  291: 28949061632,
 };
 
 // Paired-memory reporting used several textual forms that are unsafe to parse
@@ -1386,7 +1392,7 @@ for (const directory of fs.readdirSync(recordsRoot)) {
   const full = path.join(recordsRoot, directory);
   if (!fs.statSync(full).isDirectory()) continue;
   const version = lastVersion(directory);
-  if (version === null || version < 1 || version > 290) continue;
+  if (version === null || version < 1 || version > 291) continue;
   if (!directoriesByVersion.has(version)) directoriesByVersion.set(version, []);
   directoriesByVersion.get(version).push(directory);
 }
@@ -1404,7 +1410,7 @@ for (const localExperimentsRoot of localExperimentsRoots) {
     const full = path.join(localExperimentsRoot, directory);
     if (!fs.statSync(full).isDirectory()) continue;
     const version = lastVersion(directory);
-    if (version === null || version < 1 || version > 290) continue;
+    if (version === null || version < 1 || version > 291) continue;
     if (!directoriesByVersion.has(version))
       directoriesByVersion.set(version, []);
     if (!directoriesByVersion.get(version).includes(directory))
@@ -1590,6 +1596,9 @@ directoriesByVersion.set(289, [
 directoriesByVersion.set(290, [
   "native-witness-v290-20260729",
 ]);
+directoriesByVersion.set(291, [
+  "native-guided-schedule-v291-20260730",
+]);
 
 const descriptionOverrides = {
   17: "Linear Reason Merge replaced repeated reason-vector unions. The targeted gate regressed CPU to 1.0044x, so the candidate was rejected.",
@@ -1695,9 +1704,21 @@ const descriptionOverrides = {
   288: "Native V288 derives two nested initialization domains and one homogeneous worker class from the GOTO model, retains domains 0 and 1, fully initializes the retained inner domain, and materializes one representative worker fixed to domain 1. One deagle_exe performs admission, counterexample search, verdict, and witness generation; the byte-identical wrapper performs bounded routing and argument selection only. Exact725 changes only expected-true 28-race_reach_91-arrayloop2_racefree from ERROR to false(unreach-call): official correct remains 701, while semantic adjudication rises from 702 to 703 because the source initializes a retained slot-1 node with nonzero datum and the worker's zero assertion is reachable. There are zero V287-correct losses and no other new wrong results; task93 remains unknown. Prior90 is 90/90, six premise-breaking mutations reject, and the 219,691-byte violation witness passes WitnessLint as a format gate. CPU, summed wall, and summed memory change -0.171%, -0.228%, and +0.351% against V287.",
   289: "Native V289 relaxed one structural admission boundary and changed only task93 from ERROR to false(unreach-call), while Prior90 remained 90/90. The emitted GraphML still used the shortened outer-initialization projection and was not an execution of the original program, so the candidate failed the semantic witness gate. Its four-line source change was not committed or pushed. The displayed interval ends at the contemporaneous V288 control completion; later documentation mtimes are excluded so V290 begins strictly afterward.",
   290: "Unified native V290 treats the reduced execution only as a guide, then processes and solves the untransformed original GOTO model inside the same deagle_exe. Verdict and GraphML come only from that second solve; replay fails closed on missing choices or property mismatch. Exact725 remains 701 official and rises from 703 to 704 adjudicated correct by changing only task93 from ERROR to false(unreach-call), with zero V288-correct losses and zero new genuine wrong results. Prior90 is 90/90. Aggregate CPU, wall, and summed memory change +3.35%, +3.31%, and +3.03% against V288. The wrapper is unchanged and production code contains no benchmark identifier, expected label, or target source-line condition.",
+  291: "Native V291 retains function-prefix equality facts during pure-spin retry admission and prunes prefix CFG branches that cannot reach the marked loop. One unified deagle_exe performs admission, proof, verdict, and correctness-witness generation; the wrapper is unchanged. Under a contemporaneous N8 paired Exact725 comparison, the only status change is libvsync/rec_ticketlock from unknown to true(correct), with zero V290-correct losses and zero new wrong results. Prior90 is 90/90 and the 3,457-byte witness passes WitnessLint. Against the paired V290 control, CPU changes +0.867%, summed wall +0.807%, and summed memory -1.122%. Because the restarted server exposes 8 physical cores rather than the historical 48-worker environment, V291 raw resource totals are displayed but deliberately disconnected from historical resource trend comparisons.",
 };
 
 const timingOverrides = {
+  291: {
+    version: 291,
+    directory: "native-guided-schedule-v291-20260730",
+    available: true,
+    start_epoch_s: 1785349999,
+    end_epoch_s: 1785353611,
+    start_iso: "2026-07-29T18:33:19.000Z",
+    end_iso: "2026-07-29T19:33:31.000Z",
+    duration_minutes: 60.2,
+    evidence_kind: "candidate_worktree_birth_to_accepted_remote_commit",
+  },
   290: {
     version: 290,
     directory: "native-witness-v290-20260729",
@@ -2841,7 +2862,7 @@ const rows = [
   },
 ];
 
-for (let version = 1; version <= 290; ++version) {
+for (let version = 1; version <= 291; ++version) {
   const directories = directoriesByVersion.get(version) || [];
   const primary =
     preferredDirectories[version] ||
@@ -2965,6 +2986,19 @@ for (let version = 1; version <= 290; ++version) {
     memory_sum_source: nativeRedoVersions.has(version)
       ? nativeRedoMemorySources[version]
       : memoryEvidence?.source_xml ?? null,
+    ...(version === 291
+      ? {
+          comparison_protocol_override: {
+          tasks: 725,
+          workers: 8,
+          cores_per_task: 1,
+          memory_per_task_gb: 4,
+          time_limit_s: 60,
+          paired_baseline_version: 290,
+          },
+          resource_comparable_with_historical_trend: false,
+        }
+      : {}),
     timing,
     metrics: {
       correct: wrapperOnly ? null : rawCorrect,
@@ -3012,6 +3046,11 @@ for (const row of rows) {
   metrics.memory_sum_vs_baseline_pct = metrics.memory_sum_b == null
     ? null
     : ((metrics.memory_sum_b / baseline.memory_sum_b) - 1) * 100;
+  if (row.resource_comparable_with_historical_trend === false) {
+    metrics.cpu_vs_baseline_pct = null;
+    metrics.wall_vs_baseline_pct = null;
+    metrics.memory_sum_vs_baseline_pct = null;
+  }
   if (row.version !== 0 && row.scope === "exact725") {
     const previous = previousSuccessful.metrics;
     metrics.correct_vs_previous_success = metrics.correct - previous.correct;
@@ -3019,6 +3058,10 @@ for (const row of rows) {
       ((metrics.cpu_s / previous.cpu_s) - 1) * 100;
     metrics.wall_vs_previous_success_pct =
       ((metrics.wall_s / previous.wall_s) - 1) * 100;
+    if (row.resource_comparable_with_historical_trend === false) {
+      metrics.cpu_vs_previous_success_pct = null;
+      metrics.wall_vs_previous_success_pct = null;
+    }
   } else {
     metrics.correct_vs_previous_success = null;
     metrics.cpu_vs_previous_success_pct = null;
@@ -3046,6 +3089,7 @@ const output = {
     "Optimization duration is an artifact-backed observed wall-clock interval covering research, implementation, experiments, analysis, and documentation; it is not pure model-compute time.",
     "V17-V20 and V168 share timestamp records with another version, while V37 and V91 lack independent records; their durations remain missing rather than being estimated.",
     "Some historical controls were reused across dates; cumulative baseline comparisons are useful for progress, not precise per-version causal attribution.",
+    "V291 was measured after a server restart with 8 physical workers. Its coverage is paired against V290 under the same N8 protocol; its raw CPU, wall, and summed-memory totals are shown in the ledger but excluded from the historical 48-worker resource trend lines.",
   ],
   rows,
 };

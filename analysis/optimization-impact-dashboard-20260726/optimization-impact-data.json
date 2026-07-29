@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-29T18:26:27.952Z",
+  "generated_at": "2026-07-29T19:39:34.992Z",
   "comparison_protocol": {
     "tasks": 725,
     "workers": 48,
@@ -15,7 +15,8 @@
     "Paired per-task geometric-mean memory change is retained as a secondary distribution-sensitive view; it is not substituted for total memory.",
     "Optimization duration is an artifact-backed observed wall-clock interval covering research, implementation, experiments, analysis, and documentation; it is not pure model-compute time.",
     "V17-V20 and V168 share timestamp records with another version, while V37 and V91 lack independent records; their durations remain missing rather than being estimated.",
-    "Some historical controls were reused across dates; cumulative baseline comparisons are useful for progress, not precise per-version causal attribution."
+    "Some historical controls were reused across dates; cumulative baseline comparisons are useful for progress, not precise per-version causal attribution.",
+    "V291 was measured after a server restart with 8 physical workers. Its coverage is paired against V290 under the same N8 protocol; its raw CPU, wall, and summed-memory totals are shown in the ledger but excluded from the historical 48-worker resource trend lines."
   ],
   "rows": [
     {
@@ -14643,6 +14644,62 @@
         "cpu": null,
         "wall": null,
         "peak_memory": "938.853009189 seconds, and 26,493,808,640 bytes summed peak memory.",
+        "paired_memory": null
+      },
+      "exact_override": true,
+      "wrapper_exact_evidence": false
+    },
+    {
+      "version": 291,
+      "label": "V291",
+      "method": "Prefix-Aware Retry Admission",
+      "status": "successful",
+      "scope": "exact725",
+      "contribution_class": "native_redo",
+      "description": "Native V291 retains function-prefix equality facts during pure-spin retry admission and prunes prefix CFG branches that cannot reach the marked loop. One unified deagle_exe performs admission, proof, verdict, and correctness-witness generation; the wrapper is unchanged. Under a contemporaneous N8 paired Exact725 comparison, the only status change is libvsync/rec_ticketlock from unknown to true(correct), with zero V290-correct losses and zero new wrong results. Prior90 is 90/90 and the 3,457-byte witness passes WitnessLint. Against the paired V290 control, CPU changes +0.867%, summed wall +0.807%, and summed memory -1.122%. Because the restarted server exposes 8 physical cores rather than the historical 48-worker environment, V291 raw resource totals are displayed but deliberately disconnected from historical resource trend comparisons.",
+      "source": "../../experiments/native-guided-schedule-v291-20260730/conclusion.md",
+      "source_notes": "../../experiments/native-guided-schedule-v291-20260730/notes.md",
+      "memory_sum_source": "/home/lapulatos/deagle-experiments/v291-exact725-r1/results-n8exact725.server.2026-07-30_03-09-49.results.v291-native-prefix-reachability-exact725.Concurrency.xml.bz2",
+      "comparison_protocol_override": {
+        "tasks": 725,
+        "workers": 8,
+        "cores_per_task": 1,
+        "memory_per_task_gb": 4,
+        "time_limit_s": 60,
+        "paired_baseline_version": 290
+      },
+      "resource_comparable_with_historical_trend": false,
+      "timing": {
+        "version": 291,
+        "directory": "native-guided-schedule-v291-20260730",
+        "available": true,
+        "start_epoch_s": 1785349999,
+        "end_epoch_s": 1785353611,
+        "start_iso": "2026-07-29T18:33:19.000Z",
+        "end_iso": "2026-07-29T19:33:31.000Z",
+        "duration_minutes": 60.2,
+        "evidence_kind": "candidate_worktree_birth_to_accepted_remote_commit"
+      },
+      "metrics": {
+        "correct": 705,
+        "cpu_s": 1383.8831540000003,
+        "wall_s": 1421.6679298453964,
+        "memory_sum_b": 28949061632,
+        "paired_memory_delta_pct": null,
+        "correct_vs_baseline": 261,
+        "cpu_vs_baseline_pct": null,
+        "wall_vs_baseline_pct": null,
+        "memory_sum_vs_baseline_pct": null,
+        "correct_vs_previous_success": 1,
+        "cpu_vs_previous_success_pct": null,
+        "wall_vs_previous_success_pct": null
+      },
+      "wrapper_metrics": null,
+      "extracted_evidence": {
+        "correct": null,
+        "cpu": null,
+        "wall": null,
+        "peak_memory": null,
         "paired_memory": null
       },
       "exact_override": true,

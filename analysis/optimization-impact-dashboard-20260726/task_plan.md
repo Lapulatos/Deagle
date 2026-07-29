@@ -39,8 +39,8 @@ failed, and audit-only versions.
 
 ## Status
 
-**Updated through V290.** The dashboard has 291 embedded data rows (baseline
-plus V1–V290). V256–V257 are successful rows for one
+**Updated through V291.** The dashboard has 292 embedded data rows (baseline
+plus V1–V291). V256–V257 are successful rows for one
 consolidated native redo endpoint: both display adjudicated coverage 685 and
 the shared gain is not accumulated twice. V258–V263 are successful native-redo
 rows with verifier metrics and core chart points; their historical wrapper
@@ -59,6 +59,10 @@ therefore does not reach natural8 or exact725.
 V289 is preserved as a failed native projection attempt; its source was not
 published. V290 records the accepted original-GOTO guided replay and uses
 strictly increasing V288–V290 development windows.
+V291 records the accepted prefix-aware retry admission and extends the timing
+sequence strictly after V290. Its restarted-server release evidence uses an
+8-worker paired V290/V291 comparison; raw V291 resource totals are shown in
+the ledger but excluded from historical 48-worker resource trend lines.
 V211 tests cyclic GOTO seeds, retains one proof with fewer predicates, but
 loses the other proof because an acyclic branch is essential.
 V212 tests assertion-symbol overlap and loses both proofs because the lowered

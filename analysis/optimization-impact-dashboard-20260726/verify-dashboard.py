@@ -862,6 +862,23 @@ assert "untransformed original goto model" in v290["description"].lower()
 assert "zero v288-correct losses" in v290["description"].lower()
 assert "wrapper is unchanged" in v290["description"].lower()
 
+v291 = next(row for row in DATA["rows"] if row["version"] == 291)
+assert v291["status"] == "successful"
+assert v291["scope"] == "exact725"
+assert v291["contribution_class"] == "native_redo"
+assert v291["metrics"]["correct"] == 705
+assert v291["metrics"]["cpu_s"] == 1383.8831540000003
+assert v291["metrics"]["wall_s"] == 1421.6679298453964
+assert v291["metrics"]["memory_sum_b"] == 28949061632
+assert v291["metrics"]["correct_vs_previous_success"] == 1
+assert v291["metrics"]["cpu_vs_previous_success_pct"] is None
+assert v291["metrics"]["wall_vs_previous_success_pct"] is None
+assert v291["resource_comparable_with_historical_trend"] is False
+assert v291["comparison_protocol_override"]["workers"] == 8
+assert "zero v290-correct losses" in v291["description"].lower()
+assert "wrapper is unchanged" in v291["description"].lower()
+assert "witnesslint" in v291["description"].lower()
+
 timing_expected = {
     264: 3.121307483333333,
     265: 6.578901950000001,
@@ -885,6 +902,7 @@ timing_expected = {
     288: 19.4,
     289: 41.37385373333333,
     290: 213.93333333333334,
+    291: 60.2,
 }
 for version, duration in timing_expected.items():
     row = next(row for row in DATA["rows"] if row["version"] == version)
@@ -894,6 +912,7 @@ for version, duration in timing_expected.items():
     assert row["timing"]["end_iso"]
 assert v289["timing"]["start_epoch_s"] > v288["timing"]["end_epoch_s"]
 assert v290["timing"]["start_epoch_s"] > v289["timing"]["end_epoch_s"]
+assert v291["timing"]["start_epoch_s"] > v290["timing"]["end_epoch_s"]
 
 
 with sync_playwright() as playwright:
@@ -909,9 +928,9 @@ with sync_playwright() as playwright:
     page.goto(HTML.as_uri())
     page.wait_for_load_state("networkidle")
 
-    assert "V1–V290" in page.title()
-    assert page.locator("#rangeMax").get_attribute("max") == "290"
-    assert page.locator("#rangeMax").input_value() == "290"
+    assert "V1–V291" in page.title()
+    assert page.locator("#rangeMax").get_attribute("max") == "291"
+    assert page.locator("#rangeMax").input_value() == "291"
     for version, correct in (
         (259, 687), (260, 688), (261, 689), (262, 690), (263, 691),
         (266, 692), (267, 694), (268, 695), (270, 696),
@@ -937,6 +956,8 @@ with sync_playwright() as playwright:
     assert "703" in page.locator("#row-289").inner_text()
     assert "成功" in page.locator("#row-290").inner_text()
     assert "704" in page.locator("#row-290").inner_text()
+    assert "成功" in page.locator("#row-291").inner_text()
+    assert "705" in page.locator("#row-291").inner_text()
     assert page.locator(".point[data-version='258']").count() >= 1
     assert "686" in page.locator("#row-258").inner_text()
     for version in (256, 257):
@@ -944,8 +965,8 @@ with sync_playwright() as playwright:
         assert "685" in page.locator(f"#row-{version}").inner_text()
     assert page.locator(".point[data-version='254']").count() >= 1
     assert page.locator("#chart .point").count() >= 200
-    # One header, Baseline, and V1--V290.
-    assert page.locator("#ledger .ledger-row").count() == 292
+    # One header, Baseline, and V1--V291.
+    assert page.locator("#ledger .ledger-row").count() == 293
     for version, duration_text in (
         (264, "3.12 min"),
         (265, "6.58 min"),
@@ -969,6 +990,7 @@ with sync_playwright() as playwright:
         (288, "19.4 min"),
         (289, "41.37 min"),
         (290, "213.93 min"),
+        (291, "60.2 min"),
     ):
         row_text = page.locator(f"#row-{version}").inner_text()
         assert "时间不可确定" not in row_text

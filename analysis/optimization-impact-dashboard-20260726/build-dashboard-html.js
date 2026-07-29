@@ -271,7 +271,7 @@ const html = String.raw`<!doctype html>
       </div>
       <aside class="protocol">
         <strong>可比全量实验口径</strong>
-        <code>725 tasks · 48 workers<br>1 core/task · 4 GB/task<br>60 s/task · 1 development round</code>
+        <code>历史：725 tasks · 48 workers<br>V291：paired N8 control/method<br>1 core/task · 4 GB/task · 60 s/task</code>
       </aside>
     </header>
 
@@ -303,7 +303,7 @@ const html = String.raw`<!doctype html>
           <span class="baseline">基线</span><span class="success">成功/已接受</span>
           <span class="failure">失败/已拒绝</span><span class="audit">审计或门禁</span>
         </div>
-        <div>上方为可比全量指标；下方窄轨道保留所有方法版本。</div>
+        <div>上方为可比全量指标；V291 的 N8 资源值仅列入明细，不连接历史 N48 资源趋势。</div>
       </div>
     </section>
 
@@ -351,6 +351,10 @@ const html = String.raw`<!doctype html>
         return state.mode==="absolute" && row.timing.available
           ? row.timing.duration_minutes
           : null;
+      if (
+        row.resource_comparable_with_historical_trend === false &&
+        ["cpu", "wall", "memory", "totalMemory"].includes(state.metric)
+      ) return null;
       if (state.mode==="absolute") {
         const raw=m[def.field];
         return state.metric==="totalMemory" && raw!=null ? raw/1e9 : raw;
@@ -402,7 +406,7 @@ const html = String.raw`<!doctype html>
           <dt>优化结束</dt><dd>\${fmtTime(row.timing.end_iso)}</dd>
           <dt>研发与验收墙钟跨度</dt><dd>\${row.timing.available?fmt(row.timing.duration_minutes,2)+" min":row.timing.in_progress?"进行中":"不可确定"}</dd>
           <dt>相对最初基线</dt><dd>\${signed(m.correct_vs_baseline,0)} 项 · CPU \${signed(m.cpu_vs_baseline_pct)}%</dd>
-          <dt>证据范围</dt><dd>\${row.scope==="exact725"?"exact725":"目标门禁/审计"}</dd>
+          <dt>证据范围</dt><dd>\${row.scope==="exact725"?(row.comparison_protocol_override?\`exact725 · \${row.comparison_protocol_override.workers} workers paired\`:"exact725"):"目标门禁/审计"}</dd>
         </dl>\`;
       q("#tooltip").classList.add("visible"); moveTooltip(event);
     }
