@@ -294,3 +294,4 @@ version,label,method,status,scope,correct,cpu_s,wall_s,memory_sum_b,paired_memor
 292,V292,Native Residual Feasibility,failed,target_or_audit,,,,,,2026-07-29T19:43:10.000Z,2026-07-29T19:55:13.000Z,12.05,,,,../../experiments/native-residual-v292-20260730/conclusion.md
 293,V293,Affine and RF Selector Feasibility,failed,target_or_audit,,,,,,2026-07-29T19:59:21.000Z,2026-07-29T20:10:12.000Z,10.85,,,,../../experiments/native-affine-nontermination-v293-20260730/conclusion.md
 294,V294,Native Modular Loop Summary,successful,exact725,708,1206.378017999999,1247.4008251582272,28088336384,,2026-07-29T20:18:29.000Z,2026-07-29T20:50:47.000Z,32.3,264,,,../../experiments/native-modular-loop-summary-v294-20260730/conclusion.md
+295,V295,Arbitrary-Initial Local Clamp Acceleration,successful,exact725,709,1146.603572,1187.2987553104758,27623301120,,2026-07-29T20:57:07.000Z,2026-07-29T21:14:06.000Z,16.983333333333334,265,,,../../experiments/native-residual-v295-20260730/conclusion.md

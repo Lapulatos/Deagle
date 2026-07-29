@@ -7176,26 +7176,7 @@ bool event_free_local_counting_loop(
   }
   if(increments != 1)
     return false;
-
-  bool zero_initialized = false;
-  auto last_semantic = program.instructions.end();
-  for(auto instruction = program.instructions.begin(); instruction != head;
-      ++instruction)
-  {
-    if(!instruction->is_skip() && !instruction->is_location())
-      last_semantic = instruction;
-    if(
-      instruction->is_assign() &&
-      without_cast(instruction->assign_lhs()).id() == ID_symbol &&
-      to_symbol_expr(without_cast(instruction->assign_lhs()))
-          .get_identifier() == induction)
-      zero_initialized =
-        parse_zero_initialization(*instruction, induction);
-  }
-  return
-    zero_initialized &&
-    last_semantic != program.instructions.end() &&
-    parse_zero_initialization(*last_semantic, induction);
+  return true;
 }
 
 struct homogeneous_spawn_witnesst
@@ -17013,17 +16994,23 @@ bool local_loop_acceleration_transform(
       INVARIANT(
         !ns.lookup(induction, symbol),
         "accepted local induction symbol exists");
-      exprt count = exact_count(bound, symbol->type);
-      INVARIANT(
-        !count.is_nil(),
-        "accepted local induction has exact bit-vector count");
+      exprt converted_bound = bound;
+      if(converted_bound.type() != symbol->type)
+        converted_bound =
+          typecast_exprt(converted_bound, symbol->type);
+      symbol_exprt current(induction, symbol->type);
+      exprt terminal = if_exprt(
+        binary_relation_exprt(
+          current, ID_lt, converted_bound),
+        converted_bound,
+        current);
       const auto head = backedge->get_target();
       const auto location = head->source_location();
       program.insert_before(
         head,
         goto_programt::make_assignment(
-          symbol_exprt(induction, symbol->type),
-          std::move(count),
+          current,
+          std::move(terminal),
           location));
       for(auto instruction = head; instruction != std::next(backedge);
           ++instruction)

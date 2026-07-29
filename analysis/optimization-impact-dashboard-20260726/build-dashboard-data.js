@@ -707,6 +707,7 @@ const methodOverrides = {
   292: "Native Residual Feasibility",
   293: "Affine and RF Selector Feasibility",
   294: "Native Modular Loop Summary",
+  295: "Arbitrary-Initial Local Clamp Acceleration",
 };
 
 const statusOverrides = {
@@ -933,6 +934,7 @@ const statusOverrides = {
   292: "failed",
   293: "failed",
   294: "successful",
+  295: "successful",
 };
 
 // These versions changed only the Python wrapper and left the production C++
@@ -944,7 +946,7 @@ const wrapperEvidenceVersions = new Set([
 ]);
 const nativeRedoVersions = new Set([
   256, 257, 258, 259, 260, 261, 262, 263, 266, 267, 268, 270, 271,
-  281, 282, 283, 284, 285, 286, 287, 288, 289, 290, 291, 294,
+  281, 282, 283, 284, 285, 286, 287, 288, 289, 290, 291, 294, 295,
 ]);
 const nativeRedoMemorySources = {
   256: "/data3/sujie/experiments/native-redo-v256-v263-20260728/v256/full-v256-native-depth-results/full-v256-native.2026-07-27_17-26-19.results.v255-conserved-sum.Concurrency.xml.bz2",
@@ -972,6 +974,7 @@ const nativeRedoMemorySources = {
   290: "/data3/sujie/experiments/v290-original-goto-replay-exact725-r2/results/exact725.2026-07-29_18-15-31.results.accepted-native-integration-exact725.Concurrency.xml.bz2",
   291: "/home/lapulatos/deagle-experiments/v291-exact725-r1/results-n8exact725.server.2026-07-30_03-09-49.results.v291-native-prefix-reachability-exact725.Concurrency.xml.bz2",
   294: "/home/lapulatos/deagle-experiments/v294-paired-candidate-exact725-r1/results/exact725.server.2026-07-30_04-41-12.results.v294-native-modular-loop-exact725.Concurrency.xml.bz2",
+  295: "/home/lapulatos/deagle-experiments/v295-paired-candidate-exact725-r1/resultsexact725.server.2026-07-30_05-08-14.results.v295-native-local-clamp-exact725.Concurrency.xml.bz2",
 };
 const wrapperMetricOverrides = {
   256: {
@@ -1151,6 +1154,7 @@ const exactOverrides = {
   290: { correct: 701, cpu: 894.0097913300003, wall: 938.8530091892462, peak: 3999997952 },
   291: { correct: 693, cpu: 1383.8831540000003, wall: 1421.6679298453964, peak: 3999997952 },
   294: { correct: 696, cpu: 1206.378017999999, wall: 1247.4008251582272, peak: 3999997952 },
+  295: { correct: 697, cpu: 1146.603572, wall: 1187.2987553104758, peak: 3999997952 },
 };
 
 // The public YAML for task82 is mechanically derived from a Goblint UNKNOWN
@@ -1216,6 +1220,7 @@ const adjudicatedCorrectOverrides = {
   290: 704,
   291: 705,
   294: 708,
+  295: 709,
 };
 
 // Sum of BenchExec's per-task `memory` column over all 725 tasks. These values
@@ -1349,6 +1354,7 @@ const memorySumOverrides = {
   290: 26493808640,
   291: 28949061632,
   294: 28088336384,
+  295: 27623301120,
 };
 
 // Paired-memory reporting used several textual forms that are unsafe to parse
@@ -1402,7 +1408,7 @@ for (const directory of fs.readdirSync(recordsRoot)) {
   const full = path.join(recordsRoot, directory);
   if (!fs.statSync(full).isDirectory()) continue;
   const version = lastVersion(directory);
-  if (version === null || version < 1 || version > 294) continue;
+  if (version === null || version < 1 || version > 295) continue;
   if (!directoriesByVersion.has(version)) directoriesByVersion.set(version, []);
   directoriesByVersion.get(version).push(directory);
 }
@@ -1420,7 +1426,7 @@ for (const localExperimentsRoot of localExperimentsRoots) {
     const full = path.join(localExperimentsRoot, directory);
     if (!fs.statSync(full).isDirectory()) continue;
     const version = lastVersion(directory);
-    if (version === null || version < 1 || version > 294) continue;
+    if (version === null || version < 1 || version > 295) continue;
     if (!directoriesByVersion.has(version))
       directoriesByVersion.set(version, []);
     if (!directoriesByVersion.get(version).includes(directory))
@@ -1618,6 +1624,9 @@ directoriesByVersion.set(293, [
 directoriesByVersion.set(294, [
   "native-modular-loop-summary-v294-20260730",
 ]);
+directoriesByVersion.set(295, [
+  "native-residual-v295-20260730",
+]);
 
 const descriptionOverrides = {
   17: "Linear Reason Merge replaced repeated reason-vector unions. The targeted gate regressed CPU to 1.0044x, so the candidate was rejected.",
@@ -1727,9 +1736,21 @@ const descriptionOverrides = {
   292: "V292 tested two native residual directions and rejected both before release testing. Generalizing the exactly-one pure-read admission allowed four more libvsync tasks into Deagle, but all still exceeded 45 seconds. A bounded-progress feasibility study on SafeStack likewise exceeded 90 seconds after supplying bound 3 and 9-11 object bits. The six LDV front-end residuals contain real x86 instructions and were not lowered as empty barriers. Coverage gain is zero; production C++ and the wrapper remain unchanged, so Prior90 and Exact725 were not run.",
   293: "V293 rejected two native directions before release testing. An affine nontermination proof was unsound under signed bit-vector wraparound and was not implemented. A generic high-fan-in read-from selector built in one deagle_exe, but the corrected elimination-backoff target still exhausted 4 GB and changed CPU, wall, and peak RSS by +3.46%, +3.50%, and +0.64% against the identical V291 baseline. Coverage gain is zero; production C++ and the wrapper remain unchanged, so Prior90 and Exact725 were not run.",
   294: "Native V294 applies an exact modular closed form to fail-closed unsigned accumulation loops only after native commuting sequentialization has removed the concurrent lifecycle. One unified deagle_exe owns admission, transformation, proof, verdict, and witness generation; the wrapper is byte-identical to V291. Under a contemporaneous N8 paired Exact725 comparison, only mult-comm, mult-dist, and mult-flipped-dist change from timeout to correct true, reaching 696 official / 708 adjudicated correct with zero old-correct losses and zero new wrong results. Prior90 remains 90/90, all three GraphML witnesses pass WitnessLint's format check, and paired CPU, wall, and summed memory change -13.216%, -12.726%, and -3.138%.",
+  295: "Native V295 generalizes the exact event-free local unit-increment acceleration from zero initialization to arbitrary local initial values using the closed form x < bound ? bound : x. One unified deagle_exe owns admission, transformation, backend proof, verdict, and witness generation; the wrapper is byte-identical to V294. Under a contemporaneous N8 paired Exact725 comparison, only test-easy11 changes from timeout to correct true, reaching 697 official / 709 adjudicated correct with zero old-correct losses and zero new wrong results. Prior90 remains 90/90, the 3,452-byte correctness witness passes WitnessLint's format check, and paired CPU, wall, and summed memory change -4.955%, -4.818%, and -1.656%.",
 };
 
 const timingOverrides = {
+  295: {
+    version: 295,
+    directory: "native-residual-v295-20260730",
+    available: true,
+    start_epoch_s: 1785358627,
+    end_epoch_s: 1785360026,
+    start_iso: "2026-07-29T20:57:07.000Z",
+    end_iso: "2026-07-29T21:14:06.000Z",
+    duration_minutes: 16.983333333333334,
+    evidence_kind: "candidate_plan_birth_to_release_witness_gate",
+  },
   294: {
     version: 294,
     directory: "native-modular-loop-summary-v294-20260730",
@@ -2917,7 +2938,7 @@ const rows = [
   },
 ];
 
-for (let version = 1; version <= 294; ++version) {
+for (let version = 1; version <= 295; ++version) {
   const directories = directoriesByVersion.get(version) || [];
   const primary =
     preferredDirectories[version] ||
@@ -3041,7 +3062,7 @@ for (let version = 1; version <= 294; ++version) {
     memory_sum_source: nativeRedoVersions.has(version)
       ? nativeRedoMemorySources[version]
       : memoryEvidence?.source_xml ?? null,
-    ...(version === 291 || version === 294
+    ...([291, 294, 295].includes(version)
       ? {
           comparison_protocol_override: {
           tasks: 725,
@@ -3049,7 +3070,8 @@ for (let version = 1; version <= 294; ++version) {
           cores_per_task: 1,
           memory_per_task_gb: 4,
           time_limit_s: 60,
-          paired_baseline_version: version === 291 ? 290 : 291,
+          paired_baseline_version:
+            version === 291 ? 290 : version === 294 ? 291 : 294,
           },
           resource_comparable_with_historical_trend: false,
         }
@@ -3144,7 +3166,7 @@ const output = {
     "Optimization duration is an artifact-backed observed wall-clock interval covering research, implementation, experiments, analysis, and documentation; it is not pure model-compute time.",
     "V17-V20 and V168 share timestamp records with another version, while V37 and V91 lack independent records; their durations remain missing rather than being estimated.",
     "Some historical controls were reused across dates; cumulative baseline comparisons are useful for progress, not precise per-version causal attribution.",
-    "V291 and V294 were measured after a server restart with 8 physical workers. Their coverage and resource claims use contemporaneous N8 paired controls; their raw totals are shown in the ledger but excluded from the historical 48-worker resource trend lines.",
+    "V291, V294, and V295 were measured after a server restart with 8 physical workers. Their coverage and resource claims use contemporaneous N8 paired controls; their raw totals are shown in the ledger but excluded from the historical 48-worker resource trend lines.",
   ],
   rows,
 };

@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-29T20:55:38.239Z",
+  "generated_at": "2026-07-29T21:16:06.901Z",
   "comparison_protocol": {
     "tasks": 725,
     "workers": 48,
@@ -16,7 +16,7 @@
     "Optimization duration is an artifact-backed observed wall-clock interval covering research, implementation, experiments, analysis, and documentation; it is not pure model-compute time.",
     "V17-V20 and V168 share timestamp records with another version, while V37 and V91 lack independent records; their durations remain missing rather than being estimated.",
     "Some historical controls were reused across dates; cumulative baseline comparisons are useful for progress, not precise per-version causal attribution.",
-    "V291 and V294 were measured after a server restart with 8 physical workers. Their coverage and resource claims use contemporaneous N8 paired controls; their raw totals are shown in the ledger but excluded from the historical 48-worker resource trend lines."
+    "V291, V294, and V295 were measured after a server restart with 8 physical workers. Their coverage and resource claims use contemporaneous N8 paired controls; their raw totals are shown in the ledger but excluded from the historical 48-worker resource trend lines."
   ],
   "rows": [
     {
@@ -14452,7 +14452,7 @@
       },
       "wrapper_metrics": null,
       "extracted_evidence": {
-        "correct": "- Accepted V285 exact result: 700 official / 701 adjudicated correct.",
+        "correct": "- Baseline: accepted V285, 700 official / 701 adjudicated correct.",
         "cpu": null,
         "wall": null,
         "peak_memory": null,
@@ -14499,7 +14499,7 @@
       },
       "wrapper_metrics": null,
       "extracted_evidence": {
-        "correct": "- Accepted baseline: V285, 700 official / 701 adjudicated correct.",
+        "correct": "`libvsync/cnalock.yml`, reaching 701 official / 702 adjudicated correct with",
         "cpu": null,
         "wall": null,
         "peak_memory": null,
@@ -14643,7 +14643,7 @@
         "correct": null,
         "cpu": null,
         "wall": null,
-        "peak_memory": null,
+        "peak_memory": "938.853009189 seconds, and 26,493,808,640 bytes summed peak memory.",
         "paired_memory": null
       },
       "exact_override": true,
@@ -14847,6 +14847,62 @@
       "wrapper_metrics": null,
       "extracted_evidence": {
         "correct": null,
+        "cpu": null,
+        "wall": null,
+        "peak_memory": null,
+        "paired_memory": null
+      },
+      "exact_override": true,
+      "wrapper_exact_evidence": false
+    },
+    {
+      "version": 295,
+      "label": "V295",
+      "method": "Arbitrary-Initial Local Clamp Acceleration",
+      "status": "successful",
+      "scope": "exact725",
+      "contribution_class": "native_redo",
+      "description": "Native V295 generalizes the exact event-free local unit-increment acceleration from zero initialization to arbitrary local initial values using the closed form x < bound ? bound : x. One unified deagle_exe owns admission, transformation, backend proof, verdict, and witness generation; the wrapper is byte-identical to V294. Under a contemporaneous N8 paired Exact725 comparison, only test-easy11 changes from timeout to correct true, reaching 697 official / 709 adjudicated correct with zero old-correct losses and zero new wrong results. Prior90 remains 90/90, the 3,452-byte correctness witness passes WitnessLint's format check, and paired CPU, wall, and summed memory change -4.955%, -4.818%, and -1.656%.",
+      "source": "../../experiments/native-residual-v295-20260730/conclusion.md",
+      "source_notes": "../../experiments/native-residual-v295-20260730/notes.md",
+      "memory_sum_source": "/home/lapulatos/deagle-experiments/v295-paired-candidate-exact725-r1/resultsexact725.server.2026-07-30_05-08-14.results.v295-native-local-clamp-exact725.Concurrency.xml.bz2",
+      "comparison_protocol_override": {
+        "tasks": 725,
+        "workers": 8,
+        "cores_per_task": 1,
+        "memory_per_task_gb": 4,
+        "time_limit_s": 60,
+        "paired_baseline_version": 294
+      },
+      "resource_comparable_with_historical_trend": false,
+      "timing": {
+        "version": 295,
+        "directory": "native-residual-v295-20260730",
+        "available": true,
+        "start_epoch_s": 1785358627,
+        "end_epoch_s": 1785360026,
+        "start_iso": "2026-07-29T20:57:07.000Z",
+        "end_iso": "2026-07-29T21:14:06.000Z",
+        "duration_minutes": 16.983333333333334,
+        "evidence_kind": "candidate_plan_birth_to_release_witness_gate"
+      },
+      "metrics": {
+        "correct": 709,
+        "cpu_s": 1146.603572,
+        "wall_s": 1187.2987553104758,
+        "memory_sum_b": 27623301120,
+        "paired_memory_delta_pct": null,
+        "correct_vs_baseline": 265,
+        "cpu_vs_baseline_pct": null,
+        "wall_vs_baseline_pct": null,
+        "memory_sum_vs_baseline_pct": null,
+        "correct_vs_previous_success": 1,
+        "cpu_vs_previous_success_pct": null,
+        "wall_vs_previous_success_pct": null
+      },
+      "wrapper_metrics": null,
+      "extracted_evidence": {
+        "correct": "Exact725 reaches 697 official / 709 adjudicated correct, changing only",
         "cpu": null,
         "wall": null,
         "peak_memory": null,
