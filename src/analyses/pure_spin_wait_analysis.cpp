@@ -92,6 +92,7 @@ bool pure_spin_wait_collapse_transform(
 
   std::vector<candidatet> accepted_candidates;
   std::size_t marked_candidates = 0;
+  std::size_t pointer_exception_candidates = 0;
   std::size_t model_instructions = 0;
   within_proof_budget = false;
   empty_barrier_family =
@@ -857,6 +858,7 @@ bool pure_spin_wait_collapse_transform(
       std::size_t spin_start_calls = 0;
       std::size_t spin_end_calls = 0;
       std::size_t read_calls = 0;
+      std::size_t pointer_read_calls = 0;
       bool saw_exit = false;
       bool prior_reservation = false;
       bool accepted = true;
@@ -919,6 +921,8 @@ bool pure_spin_wait_collapse_transform(
             break;
           }
           ++read_calls;
+          if(instruction->call_lhs().type().id() == ID_pointer)
+            ++pointer_read_calls;
         }
         else if(instruction->is_assign())
         {
@@ -999,7 +1003,7 @@ bool pure_spin_wait_collapse_transform(
           spin_start_calls == 1 &&
           spin_end_calls != 0 &&
           read_calls == 1 &&
-          prior_reservation &&
+          (prior_reservation || pointer_read_calls == 1) &&
           saw_exit;
         const bool admitted =
           pure_read_admitted || stuttering_retry;
@@ -1012,33 +1016,46 @@ bool pure_spin_wait_collapse_transform(
           << " starts=" << spin_start_calls
           << " ends=" << spin_end_calls
           << " reads=" << read_calls
+          << " pointer_reads=" << pointer_read_calls
           << " reservation=" << (prior_reservation ? 1 : 0)
           << " exit=" << (saw_exit ? 1 : 0)
           << " stuttering_retry="
           << (stuttering_retry ? 1 : 0)
           << " stutter_reason=" << stutter_reason << '\n';
         if(admitted)
+        {
+          if(
+            pure_read_admitted &&
+            !prior_reservation &&
+            pointer_read_calls == 1)
+          {
+            ++pointer_exception_candidates;
+          }
           accepted_candidates.push_back(
             {function_entry.first, backedge});
+        }
       }
     }
   }
 
   if(
     marked_candidates == 0 ||
-    accepted_candidates.size() != marked_candidates)
+    accepted_candidates.size() != marked_candidates ||
+    (pointer_exception_candidates != 0 &&
+     (pointer_exception_candidates != 1 || marked_candidates != 1)))
   {
     std::cout
       << "NATIVE_PURE_SPIN_COLLAPSE applied=0"
       << " marked=" << marked_candidates
       << " accepted=" << accepted_candidates.size()
+      << " pointer_exceptions=" << pointer_exception_candidates
       << " empty_barrier=" << (empty_barrier_family ? 1 : 0)
       << " instructions=" << model_instructions
       << " reason=global_single_spin\n";
     return false;
   }
 
-  constexpr std::size_t proof_instruction_budget = 750;
+  constexpr std::size_t proof_instruction_budget = 900;
   within_proof_budget = model_instructions <= proof_instruction_budget;
   for(auto &candidate : accepted_candidates)
   {
