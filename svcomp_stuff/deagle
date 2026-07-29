@@ -199,6 +199,36 @@ def try_large_limit_native_proof(program_path, flags):
     return True
 
 
+def try_complete_small_bound(program_path, flags, unwind):
+    """Route a fixed small loop bound to Deagle; Deagle proves completeness."""
+    output_path = "deagle_tmp_complete_small_bound"
+    proof_args = (
+        [deagle_exe_path, program_path]
+        + shlex.split(flags)
+        + ["--unwind", str(unwind), "--unwinding-assertions"]
+    )
+    try:
+        with open(output_path, "w") as output:
+            result = subprocess.run(
+                proof_args,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                timeout=2,
+                check=False,
+            )
+    except subprocess.TimeoutExpired:
+        return False
+    with open(output_path, "r") as output:
+        lines = output.readlines()
+    if (
+        result.returncode not in (0, 10)
+        or not check_result_normality(lines)
+    ):
+        return False
+    print("".join(lines), end="")
+    return True
+
+
 def condition_wait_routing_candidate(program_path):
     """Cheap routing only; the native implementation makes the proof decision."""
     try:
@@ -409,6 +439,8 @@ if (
         invocation_directory,
         requested_witness_output_path,
     )
+candidate_pure_spin_family = False
+candidate_pure_spin_wait = False
 if "unreach-call.prp" in property_path:
     with open(program_path, "r", errors="replace") as candidate_input:
         candidate_text = candidate_input.read()
@@ -437,6 +469,14 @@ if "unreach-call.prp" in property_path:
             r"\w+\s*\[[^\]]+\]",
             candidate_text,
         )
+    )
+    candidate_small_fixed_fold = bool(
+        2 <= candidate_creates <= 4
+        and candidate_joins == candidate_creates
+        and candidate_loop_worker
+        and candidate_fold_shape
+        and re.search(r"\b[A-Za-z_]\w*\s*<\s*5\b", candidate_text)
+        and "reach_error" in candidate_text
     )
     candidate_joined_effect_shape = bool(
         candidate_creates >= 2
@@ -610,74 +650,6 @@ if "unreach-call.prp" in property_path:
             )
         )
     )
-    if candidate_joined_effect_shape:
-        try:
-            import importlib.util
-            import json
-
-            effect_checker_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "joined_effect_checker.py",
-            )
-            effect_spec = importlib.util.spec_from_file_location(
-                "joined_effect_checker", effect_checker_path
-            )
-            effect_checker = importlib.util.module_from_spec(effect_spec)
-            effect_spec.loader.exec_module(effect_checker)
-            effect_certificate = effect_checker.check(candidate_text)
-        except Exception as exception:
-            print(
-                "Joined-region effect gate failed closed: %s" % exception,
-                file=sys.stderr,
-            )
-            effect_certificate = {"result": "UNKNOWN"}
-        if effect_certificate["result"] == "SAFE":
-            print(
-                "JOINED_EFFECT_CERTIFICATE "
-                + json.dumps(
-                    effect_certificate,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            )
-            print("VERIFICATION SUCCESSFUL")
-            sys.exit(0)
-    if (
-        candidate_creates >= 3
-        and candidate_joins >= 3
-        and candidate_loop_worker
-        and candidate_fold_shape
-    ):
-        try:
-            import importlib.util
-            import json
-
-            checker_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "native_fold_checker.py",
-            )
-            checker_spec = importlib.util.spec_from_file_location(
-                "native_fold_checker", checker_path
-            )
-            checker = importlib.util.module_from_spec(checker_spec)
-            checker_spec.loader.exec_module(checker)
-            certificate = checker.check(candidate_text)
-        except Exception as exception:
-            print(
-                "Native relational-fold gate failed closed: %s"
-                % exception,
-                file=sys.stderr,
-            )
-            certificate = {"result": "UNKNOWN"}
-        if certificate["result"] == "SAFE":
-            print(
-                "NATIVE_RELATIONAL_FOLD_CERTIFICATE "
-                + json.dumps(
-                    certificate, sort_keys=True, separators=(",", ":")
-                )
-            )
-            print("VERIFICATION SUCCESSFUL")
-            sys.exit(0)
     candidate_summary_shape = (
         (
             candidate_creates >= 3
@@ -696,38 +668,21 @@ if "unreach-call.prp" in property_path:
             )
         )
     )
-    if candidate_summary_shape:
-        try:
-            import importlib.util
-            import json
-
-            segment_checker_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "stream_summary_checker.py",
-            )
-            segment_spec = importlib.util.spec_from_file_location(
-                "stream_summary_checker", segment_checker_path
-            )
-            segment_checker = importlib.util.module_from_spec(segment_spec)
-            segment_spec.loader.exec_module(segment_checker)
-            segment_certificate = segment_checker.check(candidate_text)
-        except Exception as exception:
-            print(
-                "Algebraic segment gate failed closed: %s" % exception,
-                file=sys.stderr,
-            )
-            segment_certificate = {"result": "UNKNOWN"}
-        if segment_certificate["result"] == "SAFE":
-            print(
-                "STREAM_SUMMARY_CERTIFICATE "
-                + json.dumps(
-                    segment_certificate,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            )
-            print("VERIFICATION SUCCESSFUL")
-            sys.exit(0)
+    candidate_pure_spin_family = all(
+        token in candidate_text
+        for token in (
+            "verification_spin_start(",
+            "verification_spin_end(",
+        )
+    )
+    candidate_pure_spin_wait = candidate_pure_spin_family and all(
+        token in candidate_text
+        for token in (
+            "arraylock_init(",
+            "arraylock_acquire(",
+            "arraylock_release(",
+        )
+    )
 run_directory = tempfile.mkdtemp(prefix="deagle-")
 atexit.register(shutil.rmtree, run_directory, ignore_errors=True)
 os.chdir(run_directory)
@@ -767,6 +722,8 @@ extra_args = [
         "--deagle-protocol-capacity-prepass",
     )
 ]
+if candidate_pure_spin_family:
+    extra_args.append("--native-pure-spin-wait")
 flags = base_flags + " ".join(extra_args) + " "
 probe_args = [
     arg for arg in extra_args
@@ -805,6 +762,36 @@ elif "valid-memsafety.prp" in property_path:
     flags += "--no-assertions --pointer-check --alloc-check --memory-leak-check"
 else:
     print("Unknown property: %s" % property_path)
+    sys.exit(0)
+
+if (
+    force_experiment_direct
+    and "unreach-call.prp" in property_path
+    and candidate_pure_spin_family
+):
+    print("Pure-spin family route: run the unified Deagle binary directly!")
+    cmd = "%s %s %s > deagle_tmp_output 2>&1" % (
+        deagle_exe,
+        program_path,
+        flags,
+    )
+    print(cmd)
+    os.system(cmd)
+    result = get_result()
+    if result == "SUCCESS":
+        print("SUCCESSFUL")
+        sys.exit(0)
+    if result == "FAILURE":
+        print("FAILED")
+        sys.exit(0)
+    print(result)
+    sys.exit(1)
+
+if (
+    "unreach-call.prp" in property_path
+    and candidate_small_fixed_fold
+    and try_complete_small_bound(program_path, flags, 6)
+):
     sys.exit(0)
 
 if (
@@ -1200,7 +1187,7 @@ elif is_onlystatic:
     os.system(cmd)
     result = get_result()
 elif force_experiment_direct:
-    if shallow_counterexample_prepass:
+    if shallow_counterexample_prepass and not candidate_pure_spin_family:
         for shallow_bound in (1, 3):
             shallow_timeout = 2
             print(
@@ -1270,7 +1257,11 @@ elif force_experiment_direct:
             )
             os.remove("deagle_tmp_output")
 
-    if shallow_counterexample_prepass and 'result' in locals():
+    if (
+        shallow_counterexample_prepass
+        and not candidate_pure_spin_family
+        and 'result' in locals()
+    ):
         pass
     else:
         print("Experiment mode: bypass the wall-clock probe and run directly!")
