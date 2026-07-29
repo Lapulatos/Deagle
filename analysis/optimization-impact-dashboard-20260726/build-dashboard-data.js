@@ -705,6 +705,7 @@ const methodOverrides = {
   290: "Original-GOTO Guided Replay",
   291: "Prefix-Aware Retry Admission",
   292: "Native Residual Feasibility",
+  293: "Affine and RF Selector Feasibility",
 };
 
 const statusOverrides = {
@@ -929,6 +930,7 @@ const statusOverrides = {
   290: "successful",
   291: "successful",
   292: "failed",
+  293: "failed",
 };
 
 // These versions changed only the Python wrapper and left the production C++
@@ -1394,7 +1396,7 @@ for (const directory of fs.readdirSync(recordsRoot)) {
   const full = path.join(recordsRoot, directory);
   if (!fs.statSync(full).isDirectory()) continue;
   const version = lastVersion(directory);
-  if (version === null || version < 1 || version > 292) continue;
+  if (version === null || version < 1 || version > 293) continue;
   if (!directoriesByVersion.has(version)) directoriesByVersion.set(version, []);
   directoriesByVersion.get(version).push(directory);
 }
@@ -1412,7 +1414,7 @@ for (const localExperimentsRoot of localExperimentsRoots) {
     const full = path.join(localExperimentsRoot, directory);
     if (!fs.statSync(full).isDirectory()) continue;
     const version = lastVersion(directory);
-    if (version === null || version < 1 || version > 292) continue;
+    if (version === null || version < 1 || version > 293) continue;
     if (!directoriesByVersion.has(version))
       directoriesByVersion.set(version, []);
     if (!directoriesByVersion.get(version).includes(directory))
@@ -1604,6 +1606,9 @@ directoriesByVersion.set(291, [
 directoriesByVersion.set(292, [
   "native-residual-v292-20260730",
 ]);
+directoriesByVersion.set(293, [
+  "native-affine-nontermination-v293-20260730",
+]);
 
 const descriptionOverrides = {
   17: "Linear Reason Merge replaced repeated reason-vector unions. The targeted gate regressed CPU to 1.0044x, so the candidate was rejected.",
@@ -1711,9 +1716,21 @@ const descriptionOverrides = {
   290: "Unified native V290 treats the reduced execution only as a guide, then processes and solves the untransformed original GOTO model inside the same deagle_exe. Verdict and GraphML come only from that second solve; replay fails closed on missing choices or property mismatch. Exact725 remains 701 official and rises from 703 to 704 adjudicated correct by changing only task93 from ERROR to false(unreach-call), with zero V288-correct losses and zero new genuine wrong results. Prior90 is 90/90. Aggregate CPU, wall, and summed memory change +3.35%, +3.31%, and +3.03% against V288. The wrapper is unchanged and production code contains no benchmark identifier, expected label, or target source-line condition.",
   291: "Native V291 retains function-prefix equality facts during pure-spin retry admission and prunes prefix CFG branches that cannot reach the marked loop. One unified deagle_exe performs admission, proof, verdict, and correctness-witness generation; the wrapper is unchanged. Under a contemporaneous N8 paired Exact725 comparison, the only status change is libvsync/rec_ticketlock from unknown to true(correct), with zero V290-correct losses and zero new wrong results. Prior90 is 90/90 and the 3,457-byte witness passes WitnessLint. Against the paired V290 control, CPU changes +0.867%, summed wall +0.807%, and summed memory -1.122%. Because the restarted server exposes 8 physical cores rather than the historical 48-worker environment, V291 raw resource totals are displayed but deliberately disconnected from historical resource trend comparisons.",
   292: "V292 tested two native residual directions and rejected both before release testing. Generalizing the exactly-one pure-read admission allowed four more libvsync tasks into Deagle, but all still exceeded 45 seconds. A bounded-progress feasibility study on SafeStack likewise exceeded 90 seconds after supplying bound 3 and 9-11 object bits. The six LDV front-end residuals contain real x86 instructions and were not lowered as empty barriers. Coverage gain is zero; production C++ and the wrapper remain unchanged, so Prior90 and Exact725 were not run.",
+  293: "V293 rejected two native directions before release testing. An affine nontermination proof was unsound under signed bit-vector wraparound and was not implemented. A generic high-fan-in read-from selector built in one deagle_exe, but the corrected elimination-backoff target still exhausted 4 GB and changed CPU, wall, and peak RSS by +3.46%, +3.50%, and +0.64% against the identical V291 baseline. Coverage gain is zero; production C++ and the wrapper remain unchanged, so Prior90 and Exact725 were not run.",
 };
 
 const timingOverrides = {
+  293: {
+    version: 293,
+    directory: "native-affine-nontermination-v293-20260730",
+    available: true,
+    start_epoch_s: 1785355161,
+    end_epoch_s: 1785355812,
+    start_iso: "2026-07-29T19:59:21.000Z",
+    end_iso: "2026-07-29T20:10:12.000Z",
+    duration_minutes: 10.85,
+    evidence_kind: "candidate_plan_birth_to_paired_feasibility_rejection",
+  },
   292: {
     version: 292,
     directory: "native-residual-v292-20260730",
@@ -2879,7 +2896,7 @@ const rows = [
   },
 ];
 
-for (let version = 1; version <= 292; ++version) {
+for (let version = 1; version <= 293; ++version) {
   const directories = directoriesByVersion.get(version) || [];
   const primary =
     preferredDirectories[version] ||

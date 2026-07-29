@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-29T19:57:05.022Z",
+  "generated_at": "2026-07-29T20:13:26.241Z",
   "comparison_protocol": {
     "tasks": 725,
     "workers": 48,
@@ -14726,6 +14726,53 @@
         "end_iso": "2026-07-29T19:55:13.000Z",
         "duration_minutes": 12.05,
         "evidence_kind": "candidate_directory_birth_to_feasibility_rejection"
+      },
+      "metrics": {
+        "correct": null,
+        "cpu_s": null,
+        "wall_s": null,
+        "memory_sum_b": null,
+        "paired_memory_delta_pct": null,
+        "correct_vs_baseline": null,
+        "cpu_vs_baseline_pct": null,
+        "wall_vs_baseline_pct": null,
+        "memory_sum_vs_baseline_pct": null,
+        "correct_vs_previous_success": null,
+        "cpu_vs_previous_success_pct": null,
+        "wall_vs_previous_success_pct": null
+      },
+      "wrapper_metrics": null,
+      "extracted_evidence": {
+        "correct": null,
+        "cpu": null,
+        "wall": null,
+        "peak_memory": null,
+        "paired_memory": null
+      },
+      "exact_override": false,
+      "wrapper_exact_evidence": false
+    },
+    {
+      "version": 293,
+      "label": "V293",
+      "method": "Affine and RF Selector Feasibility",
+      "status": "failed",
+      "scope": "target_or_audit",
+      "contribution_class": "verifier_or_audit",
+      "description": "V293 rejected two native directions before release testing. An affine nontermination proof was unsound under signed bit-vector wraparound and was not implemented. A generic high-fan-in read-from selector built in one deagle_exe, but the corrected elimination-backoff target still exhausted 4 GB and changed CPU, wall, and peak RSS by +3.46%, +3.50%, and +0.64% against the identical V291 baseline. Coverage gain is zero; production C++ and the wrapper remain unchanged, so Prior90 and Exact725 were not run.",
+      "source": "../../experiments/native-affine-nontermination-v293-20260730/conclusion.md",
+      "source_notes": "../../experiments/native-affine-nontermination-v293-20260730/notes.md",
+      "memory_sum_source": null,
+      "timing": {
+        "version": 293,
+        "directory": "native-affine-nontermination-v293-20260730",
+        "available": true,
+        "start_epoch_s": 1785355161,
+        "end_epoch_s": 1785355812,
+        "start_iso": "2026-07-29T19:59:21.000Z",
+        "end_iso": "2026-07-29T20:10:12.000Z",
+        "duration_minutes": 10.85,
+        "evidence_kind": "candidate_plan_birth_to_paired_feasibility_rejection"
       },
       "metrics": {
         "correct": null,

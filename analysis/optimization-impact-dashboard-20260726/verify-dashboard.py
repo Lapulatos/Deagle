@@ -891,6 +891,18 @@ assert v292["timing"]["start_epoch_s"] > v291["timing"]["end_epoch_s"]
 assert "coverage gain is zero" in v292["description"].lower()
 assert "wrapper remain unchanged" in v292["description"].lower()
 
+v293 = next(row for row in DATA["rows"] if row["version"] == 293)
+assert v293["status"] == "failed"
+assert v293["scope"] == "target_or_audit"
+assert v293["contribution_class"] == "verifier_or_audit"
+assert v293["metrics"]["correct"] is None
+assert v293["metrics"]["cpu_s"] is None
+assert v293["metrics"]["wall_s"] is None
+assert v293["metrics"]["memory_sum_b"] is None
+assert v293["timing"]["start_epoch_s"] > v292["timing"]["end_epoch_s"]
+assert "coverage gain is zero" in v293["description"].lower()
+assert "wrapper remain unchanged" in v293["description"].lower()
+
 timing_expected = {
     264: 3.121307483333333,
     265: 6.578901950000001,
@@ -941,9 +953,9 @@ with sync_playwright() as playwright:
     page.goto(HTML.as_uri())
     page.wait_for_load_state("networkidle")
 
-    assert "V1–V292" in page.title()
-    assert page.locator("#rangeMax").get_attribute("max") == "292"
-    assert page.locator("#rangeMax").input_value() == "292"
+    assert "V1–V293" in page.title()
+    assert page.locator("#rangeMax").get_attribute("max") == "293"
+    assert page.locator("#rangeMax").input_value() == "293"
     for version, correct in (
         (259, 687), (260, 688), (261, 689), (262, 690), (263, 691),
         (266, 692), (267, 694), (268, 695), (270, 696),
@@ -973,6 +985,8 @@ with sync_playwright() as playwright:
     assert "705" in page.locator("#row-291").inner_text()
     assert "失败" in page.locator("#row-292").inner_text()
     assert "12.05 min" in page.locator("#row-292").inner_text()
+    assert "失败" in page.locator("#row-293").inner_text()
+    assert "10.85 min" in page.locator("#row-293").inner_text()
     assert page.locator(".point[data-version='258']").count() >= 1
     assert "686" in page.locator("#row-258").inner_text()
     for version in (256, 257):
@@ -980,8 +994,8 @@ with sync_playwright() as playwright:
         assert "685" in page.locator(f"#row-{version}").inner_text()
     assert page.locator(".point[data-version='254']").count() >= 1
     assert page.locator("#chart .point").count() >= 200
-    # One header, Baseline, and V1--V292.
-    assert page.locator("#ledger .ledger-row").count() == 294
+    # One header, Baseline, and V1--V293.
+    assert page.locator("#ledger .ledger-row").count() == 295
     for version, duration_text in (
         (264, "3.12 min"),
         (265, "6.58 min"),
