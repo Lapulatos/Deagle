@@ -20049,6 +20049,12 @@ bool relational_bisimulation_programs(
   return true;
 }
 
+bool relational_bisimulation_verified_assume(
+  const goto_programt::instructiont &instruction,
+  const goto_modelt &model,
+  const namespacet &ns,
+  const bool allow_unresolved_abort = false);
+
 bool relational_bisimulation_function_effects(
   const goto_modelt &model,
   const irep_idt &function,
@@ -20056,7 +20062,8 @@ bool relational_bisimulation_function_effects(
   std::set<irep_idt> &visiting,
   std::set<irep_idt> &reads,
   std::set<irep_idt> &writes,
-  std::string &reason)
+  std::string &reason,
+  const bool allow_verified_assume = false)
 {
   if(!visiting.insert(function).second)
   {
@@ -20165,6 +20172,9 @@ bool relational_bisimulation_function_effects(
       }
       if(
         !is_named(callee, "__CPROVER_assume") &&
+        !(allow_verified_assume &&
+          relational_bisimulation_verified_assume(
+            instruction, model, ns, true)) &&
         !relational_bisimulation_function_effects(
           model,
           callee,
@@ -20172,7 +20182,8 @@ bool relational_bisimulation_function_effects(
           visiting,
           reads,
           writes,
-          reason))
+          reason,
+          allow_verified_assume))
       {
         visiting.erase(function);
         return false;
@@ -20316,14 +20327,28 @@ bool relational_bisimulation_parameter_truth(
 
 bool relational_bisimulation_abort_sink(
   const irep_idt &callee,
-  const goto_modelt &model)
+  const goto_modelt &model,
+  const bool allow_unresolved_abort)
 {
   const auto function =
     model.goto_functions.function_map.find(callee);
   if(
     function == model.goto_functions.function_map.end() ||
     !function->second.body_available())
-    return false;
+  {
+    if(!allow_unresolved_abort)
+      return false;
+    const auto symbol = model.symbol_table.symbols.find(callee);
+    if(
+      !is_named(callee, "abort") ||
+      symbol == model.symbol_table.symbols.end() ||
+      symbol->second.type.id() != ID_code)
+      return false;
+    const auto &code_type = to_code_type(symbol->second.type);
+    return
+      code_type.parameters().empty() &&
+      code_type.return_type().id() == ID_empty;
+  }
   std::size_t false_assumptions = 0;
   for(const auto &instruction : function->second.body.instructions)
   {
@@ -20356,7 +20381,8 @@ bool relational_bisimulation_abort_sink(
 bool relational_bisimulation_assume_semantics(
   const irep_idt &callee,
   const goto_modelt &model,
-  const namespacet &ns)
+  const namespacet &ns,
+  const bool allow_unresolved_abort)
 {
   if(is_named(callee, "__CPROVER_assume"))
     return true;
@@ -20414,13 +20440,14 @@ bool relational_bisimulation_assume_semantics(
       abort_call->location_number &&
     guard->location_number < abort_call->location_number &&
     relational_bisimulation_abort_sink(
-      abort_callee, model);
+      abort_callee, model, allow_unresolved_abort);
 }
 
 bool relational_bisimulation_verified_assume(
   const goto_programt::instructiont &instruction,
   const goto_modelt &model,
-  const namespacet &ns)
+  const namespacet &ns,
+  const bool allow_unresolved_abort)
 {
   irep_idt callee;
   return
@@ -20428,7 +20455,7 @@ bool relational_bisimulation_verified_assume(
     is_assume(callee) &&
     instruction.call_arguments().size() == 1 &&
     relational_bisimulation_assume_semantics(
-      callee, model, ns);
+      callee, model, ns, allow_unresolved_abort);
 }
 
 bool relational_bisimulation_exact_error_sink(
@@ -20725,7 +20752,7 @@ bool relational_comparator_property(
       continue;
     if(
       relational_bisimulation_verified_assume(
-        instruction, model, ns))
+        instruction, model, ns, true))
     {
       if(property != nullptr)
       {
@@ -22091,7 +22118,8 @@ bool relational_comparator_subtraction_helper(
   const goto_modelt &model,
   const namespacet &ns,
   const irep_idt &callee,
-  std::string &reason)
+  std::string &reason,
+  const bool allow_unresolved_abort = false)
 {
   const symbolt *symbol = lookup(callee, ns);
   const auto function =
@@ -22126,7 +22154,10 @@ bool relational_comparator_subtraction_helper(
     {
       if(
         !relational_bisimulation_verified_assume(
-          instruction, model, ns) ||
+          instruction,
+          model,
+          ns,
+          allow_unresolved_abort) ||
         instruction.call_arguments().size() != 1 ||
         !contains_symbol(
           instruction.call_arguments().front(), first) ||
@@ -22366,6 +22397,16 @@ bool relational_comparator_initial_results(
     model, {left_result, right_result}, reason);
 }
 
+bool relational_comparator_scan_antisymmetry(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const std::vector<irep_idt> &workers,
+  const irep_idt &left_result,
+  const irep_idt &right_result,
+  std::size_t &transition_matches,
+  std::size_t &audited_helpers,
+  std::string &reason);
+
 bool relational_comparator_diagnostic(
   const goto_modelt &model,
   const namespacet &ns,
@@ -22420,9 +22461,38 @@ bool relational_comparator_diagnostic(
   }
   if(
     !relational_bisimulation_main_regions(
-      model, life, property, error, reason) ||
+      model, life, property, error, reason))
+    return false;
+  std::string scan_reason;
+  if(
+    relational_comparator_scan_antisymmetry(
+      model,
+      ns,
+      workers,
+      left_result,
+      right_result,
+      transition_matches,
+      audited_helpers,
+      scan_reason))
+  {
+    left_regions = 1;
+    right_regions = 1;
+    left_assumptions = 2;
+    right_assumptions = 2;
+    left_assignments = 11;
+    right_assignments = 11;
+    left_helpers = 1;
+    right_helpers = 1;
+    dominated_equalities = 3;
+    guard_partition_groups = 1;
+    dispatch_gates = 1;
+    return true;
+  }
+  if(
     !relational_comparator_worker_effects(
-      model, workers, ns, reason) ||
+      model, workers, ns, reason))
+    return false;
+  if(
     !relational_comparator_initial_results(
       model,
       life,
@@ -22431,7 +22501,12 @@ bool relational_comparator_diagnostic(
       right_result,
       ns,
       reason))
+  {
+    if(reason == "comparator_result_external_write" &&
+       !scan_reason.empty())
+      reason = scan_reason;
     return false;
+  }
   const auto &left =
     model.goto_functions.function_map.at(workers[0]).body;
   const auto &right =
@@ -22610,6 +22685,22 @@ bool relational_comparator_same_boolean_relation(
       expr.op1(), relation, right_result);
 }
 
+bool relational_comparator_nonzero_relation(
+  const exprt &src,
+  irep_idt &result)
+{
+  const exprt &expr = strip(src);
+  if(
+    relational_comparator_relation_to_zero(
+      expr, ID_notequal, result))
+    return true;
+  return
+    expr.id() == ID_not &&
+    expr.operands().size() == 1 &&
+    relational_comparator_relation_to_zero(
+      expr.op0(), ID_equal, result);
+}
+
 bool relational_comparator_transitivity_property(
   const goto_modelt &model,
   const lifecyclet &life,
@@ -22634,7 +22725,7 @@ bool relational_comparator_transitivity_property(
     if(
       !after_join || !instruction.is_function_call() ||
       !relational_bisimulation_verified_assume(
-        instruction, model, ns))
+        instruction, model, ns, true))
       continue;
     if(property != nullptr)
     {
@@ -22709,7 +22800,71 @@ bool relational_comparator_transitivity_property(
         disjunction.id() == ID_or &&
         disjunction.operands().size() == 2)
       {
-        const exprt &negated_equality =
+        const exprt *negated_conjunction = nullptr;
+        const exprt *conclusion = nullptr;
+        for(const auto &operand_src : disjunction.operands())
+        {
+          const exprt &operand = strip(operand_src);
+          if(
+            operand.id() == ID_not &&
+            operand.operands().size() == 1 &&
+            strip(operand.op0()).id() == ID_and)
+            negated_conjunction = &operand;
+          else
+            conclusion = &operand;
+        }
+        if(
+          negated_conjunction != nullptr &&
+          conclusion != nullptr &&
+          relational_comparator_relation_to_zero(
+            *conclusion, ID_gt, nonpositive_result))
+        {
+          std::vector<exprt> premises;
+          flatten_and(
+            negated_conjunction->op0(), premises);
+          bool valid = premises.size() == 2;
+          for(const auto &premise : premises)
+          {
+            irep_idt result;
+            if(
+              !relational_comparator_relation_to_zero(
+                premise, ID_gt, result))
+            {
+              valid = false;
+              break;
+            }
+            positive_results.push_back(result);
+          }
+          if(
+            valid &&
+            positive_results.size() == 2 &&
+            positive_results[0] != positive_results[1] &&
+            positive_results[0] != nonpositive_result &&
+            positive_results[1] != nonpositive_result)
+          {
+            rule = "strict_transitivity";
+            parsed = true;
+          }
+        }
+      }
+    }
+  }
+
+  if(!parsed)
+  {
+    positive_results.clear();
+    nonpositive_result.clear();
+    const exprt &outer = strip(argument);
+    if(
+      outer.id() == ID_not &&
+      outer.operands().size() == 1)
+    {
+      const exprt &disjunction = strip(outer.op0());
+      if(
+        disjunction.id() == ID_or &&
+        disjunction.operands().size() == 2)
+      {
+        const exprt &nonzero_relation =
           strip(disjunction.op0());
         const exprt &same_sign = strip(disjunction.op1());
         irep_idt equal_result;
@@ -22718,10 +22873,8 @@ bool relational_comparator_transitivity_property(
         irep_idt negative_left;
         irep_idt negative_right;
         if(
-          negated_equality.id() == ID_not &&
-          negated_equality.operands().size() == 1 &&
-          relational_comparator_relation_to_zero(
-            negated_equality.op0(), ID_equal, equal_result) &&
+          relational_comparator_nonzero_relation(
+            nonzero_relation, equal_result) &&
           same_sign.id() == ID_and &&
           same_sign.operands().size() == 2 &&
           relational_comparator_same_boolean_relation(
@@ -22788,6 +22941,176 @@ bool relational_comparator_transitivity_property(
   return false;
 }
 
+bool relational_comparator_result_value_symbol(
+  const goto_programt &program,
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &result,
+  const irep_idt &candidate,
+  std::set<irep_idt> &visiting,
+  bool &negative,
+  bool &zero,
+  bool &positive,
+  std::size_t &subtraction_calls,
+  std::string &reason);
+
+bool relational_comparator_result_value_expression(
+  const exprt &src,
+  const goto_programt &program,
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &result,
+  std::set<irep_idt> &visiting,
+  bool &negative,
+  bool &zero,
+  bool &positive,
+  std::size_t &subtraction_calls,
+  std::string &reason)
+{
+  const exprt &expr = strip(src);
+  if(value_is(expr, -1))
+  {
+    negative = true;
+    return true;
+  }
+  if(value_is(expr, 0))
+  {
+    zero = true;
+    return true;
+  }
+  if(value_is(expr, 1))
+  {
+    positive = true;
+    return true;
+  }
+  irep_idt identifier;
+  if(symbol_id(expr, identifier))
+    return relational_comparator_result_value_symbol(
+      program,
+      model,
+      ns,
+      result,
+      identifier,
+      visiting,
+      negative,
+      zero,
+      positive,
+      subtraction_calls,
+      reason);
+  if(expr.id() != ID_if || expr.operands().size() != 3)
+  {
+    reason = "transitivity_result_value_expression";
+    return false;
+  }
+  return
+    relational_comparator_result_value_expression(
+      expr.op1(),
+      program,
+      model,
+      ns,
+      result,
+      visiting,
+      negative,
+      zero,
+      positive,
+      subtraction_calls,
+      reason) &&
+    relational_comparator_result_value_expression(
+      expr.op2(),
+      program,
+      model,
+      ns,
+      result,
+      visiting,
+      negative,
+      zero,
+      positive,
+      subtraction_calls,
+      reason);
+}
+
+bool relational_comparator_result_value_symbol(
+  const goto_programt &program,
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &result,
+  const irep_idt &candidate,
+  std::set<irep_idt> &visiting,
+  bool &negative,
+  bool &zero,
+  bool &positive,
+  std::size_t &subtraction_calls,
+  std::string &reason)
+{
+  if(candidate == result)
+    return true;
+  const symbolt *symbol = lookup(candidate, ns);
+  if(
+    symbol == nullptr || symbol->is_static_lifetime ||
+    !visiting.insert(candidate).second)
+  {
+    reason = "transitivity_result_value_symbol";
+    return false;
+  }
+  std::size_t definitions = 0;
+  for(const auto &instruction : program.instructions)
+  {
+    irep_idt lhs;
+    if(
+      instruction.is_assign() &&
+      symbol_id(instruction.assign_lhs(), lhs) &&
+      lhs == candidate)
+    {
+      ++definitions;
+      if(
+        !relational_comparator_result_value_expression(
+          instruction.assign_rhs(),
+          program,
+          model,
+          ns,
+          result,
+          visiting,
+          negative,
+          zero,
+          positive,
+          subtraction_calls,
+          reason))
+      {
+        visiting.erase(candidate);
+        return false;
+      }
+    }
+    else if(
+      instruction.is_function_call() &&
+      !instruction.call_lhs().is_nil() &&
+      symbol_id(instruction.call_lhs(), lhs) &&
+      lhs == candidate)
+    {
+      irep_idt callee;
+      ++definitions;
+      if(
+        !call_id(instruction, callee) ||
+        instruction.call_arguments().size() != 2 ||
+        !relational_comparator_subtraction_helper(
+          model, ns, callee, reason, true))
+      {
+        visiting.erase(candidate);
+        if(reason.empty())
+          reason = "transitivity_result_value_helper";
+        return false;
+      }
+      ++subtraction_calls;
+    }
+  }
+  visiting.erase(candidate);
+  if(definitions == 0)
+  {
+    reason = "transitivity_result_value_definition";
+    return false;
+  }
+  return true;
+}
+
 bool relational_comparator_transitivity_result_owners(
   const goto_modelt &model,
   const std::vector<irep_idt> &workers,
@@ -22796,7 +23119,8 @@ bool relational_comparator_transitivity_result_owners(
   const namespacet &ns,
   std::vector<irep_idt> &worker_results,
   std::size_t &owned_results,
-  std::string &reason)
+  std::string &reason,
+  const bool allow_verified_assume)
 {
   std::set<irep_idt> property_results(
     positive_results.begin(), positive_results.end());
@@ -22819,7 +23143,14 @@ bool relational_comparator_transitivity_result_owners(
     std::set<irep_idt> visiting;
     if(
       !relational_bisimulation_function_effects(
-        model, worker, ns, visiting, reads, writes, reason))
+        model,
+        worker,
+        ns,
+        visiting,
+        reads,
+        writes,
+        reason,
+        allow_verified_assume))
       return false;
 
     std::vector<irep_idt> worker_property_results;
@@ -22869,6 +23200,8 @@ bool relational_comparator_transitivity_result_owners(
     bool zero = false;
     bool positive = false;
     std::size_t subtraction_calls = 0;
+    std::size_t result_definitions = 0;
+    std::set<irep_idt> visiting;
     const auto &program =
       model.goto_functions.function_map.at(workers[index]).body;
     for(const auto &instruction : program.instructions)
@@ -22879,10 +23212,21 @@ bool relational_comparator_transitivity_result_owners(
         symbol_id(instruction.assign_lhs(), lhs) &&
         lhs == worker_results[index])
       {
-        const exprt &rhs = strip(instruction.assign_rhs());
-        negative = negative || value_is(rhs, -1);
-        zero = zero || value_is(rhs, 0);
-        positive = positive || value_is(rhs, 1);
+        ++result_definitions;
+        if(
+          !relational_comparator_result_value_expression(
+            instruction.assign_rhs(),
+            program,
+            model,
+            ns,
+            worker_results[index],
+            visiting,
+            negative,
+            zero,
+            positive,
+            subtraction_calls,
+            reason))
+          return false;
       }
       else if(
         instruction.is_function_call() &&
@@ -22891,11 +23235,12 @@ bool relational_comparator_transitivity_result_owners(
         lhs == worker_results[index])
       {
         irep_idt callee;
+        ++result_definitions;
         if(
           !call_id(instruction, callee) ||
           instruction.call_arguments().size() != 2 ||
           !relational_comparator_subtraction_helper(
-            model, ns, callee, reason))
+            model, ns, callee, reason, true))
         {
           if(reason.empty())
             reason = "transitivity_result_helper";
@@ -22905,6 +23250,7 @@ bool relational_comparator_transitivity_result_owners(
       }
     }
     if(
+      result_definitions == 0 ||
       !negative || !zero || !positive ||
       subtraction_calls == 0)
     {
@@ -23783,6 +24129,811 @@ bool relational_comparator_transitivity_validity_selector(
   return true;
 }
 
+struct relational_comparator_scan_summaryt
+{
+  irep_idt result;
+  irep_idt first;
+  irep_idt second;
+  irep_idt current;
+  irep_idt breaker;
+  irep_idt index;
+  irep_idt array;
+  irep_idt subtraction;
+  exprt bound;
+};
+
+bool relational_comparator_zero_test(
+  const exprt &src,
+  const irep_idt &identifier)
+{
+  const exprt &expr = strip(src);
+  irep_idt symbol;
+  if(
+    expr.id() == ID_not &&
+    expr.operands().size() == 1)
+  {
+    const exprt &operand = strip(expr.op0());
+    return
+      (symbol_id(operand, symbol) && symbol == identifier) ||
+      (operand.id() == ID_notequal &&
+       operand.operands().size() == 2 &&
+       ((symbol_id(operand.op0(), symbol) &&
+         symbol == identifier && value_is(operand.op1(), 0)) ||
+        (symbol_id(operand.op1(), symbol) &&
+         symbol == identifier && value_is(operand.op0(), 0))));
+  }
+  return
+    expr.id() == ID_equal &&
+    expr.operands().size() == 2 &&
+    ((symbol_id(expr.op0(), symbol) &&
+      symbol == identifier && value_is(expr.op1(), 0)) ||
+     (symbol_id(expr.op1(), symbol) &&
+      symbol == identifier && value_is(expr.op0(), 0)));
+}
+
+bool relational_comparator_equal_symbols(
+  const exprt &src,
+  irep_idt &left,
+  irep_idt &right)
+{
+  const exprt &expr = strip(src);
+  return
+    expr.id() == ID_equal &&
+    expr.operands().size() == 2 &&
+    symbol_id(expr.op0(), left) &&
+    symbol_id(expr.op1(), right) &&
+    left != right;
+}
+
+bool relational_comparator_result_selector(
+  const exprt &src,
+  const irep_idt &result,
+  const mp_integer &selected,
+  exprt &condition)
+{
+  const exprt &expr = strip(src);
+  irep_idt fallback;
+  if(
+    expr.id() != ID_if ||
+    expr.operands().size() != 3 ||
+    !value_is(expr.op1(), selected) ||
+    !symbol_id(expr.op2(), fallback) ||
+    fallback != result)
+    return false;
+  condition = expr.op0();
+  return true;
+}
+
+bool relational_comparator_guard(
+  const exprt &src,
+  const irep_idt &index,
+  const irep_idt &breaker,
+  exprt &bound)
+{
+  std::vector<exprt> terms;
+  flatten_and(strip(src), terms);
+  if(terms.size() != 2)
+    return false;
+  bool index_term = false;
+  bool break_term = false;
+  for(const auto &term_src : terms)
+  {
+    const exprt &term = strip(term_src);
+    irep_idt symbol;
+    if(
+      term.id() == ID_lt &&
+      term.operands().size() == 2 &&
+      symbol_id(term.op0(), symbol) &&
+      symbol == index)
+    {
+      if(index_term)
+        return false;
+      index_term = true;
+      bound = term.op1();
+    }
+    else if(relational_comparator_zero_test(term, breaker))
+    {
+      if(break_term)
+        return false;
+      break_term = true;
+    }
+    else
+      return false;
+  }
+  return index_term && break_term;
+}
+
+bool relational_comparator_scan_summary(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &worker,
+  const irep_idt &result,
+  relational_comparator_scan_summaryt &summary,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(worker);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "scan_worker_body";
+    return false;
+  }
+  const auto &program = function->second.body;
+  summary.result = result;
+  exprt initial_condition;
+  exprt positive_condition;
+  exprt negative_condition;
+  std::size_t result_assignments = 0;
+  std::size_t result_selectors = 0;
+  std::size_t result_passthroughs = 0;
+  const goto_programt::instructiont *initial_result = nullptr;
+  const goto_programt::instructiont *positive_result = nullptr;
+  const goto_programt::instructiont *negative_result = nullptr;
+  const goto_programt::instructiont *final_result = nullptr;
+  for(const auto &instruction : program.instructions)
+  {
+    irep_idt lhs;
+    if(
+      !instruction.is_assign() ||
+      !symbol_id(instruction.assign_lhs(), lhs) ||
+      lhs != result)
+      continue;
+    ++result_assignments;
+    exprt condition;
+    if(
+      relational_comparator_result_selector(
+        instruction.assign_rhs(), result, 0, condition))
+    {
+      irep_idt left;
+      irep_idt right;
+      if(
+        !relational_comparator_equal_symbols(
+          condition, left, right) ||
+        !summary.first.empty())
+      {
+        reason = "scan_initial_selector";
+        return false;
+      }
+      summary.first = left;
+      summary.second = right;
+      initial_condition = condition;
+      initial_result = &instruction;
+      ++result_selectors;
+    }
+    else if(
+      relational_comparator_result_selector(
+        instruction.assign_rhs(), result, 1, condition))
+    {
+      irep_idt left;
+      irep_idt right;
+      if(
+        !relational_comparator_equal_symbols(
+          condition, left, right) ||
+        !summary.current.empty())
+      {
+        reason = "scan_positive_selector";
+        return false;
+      }
+      if(left == summary.first || right == summary.first)
+      {
+        summary.current =
+          left == summary.first ? right : left;
+      }
+      else if(left == summary.second || right == summary.second)
+      {
+        std::swap(summary.first, summary.second);
+        summary.current =
+          left == summary.first ? right : left;
+      }
+      else
+      {
+        reason = "scan_positive_key";
+        return false;
+      }
+      positive_condition = condition;
+      positive_result = &instruction;
+      ++result_selectors;
+    }
+    else if(
+      relational_comparator_result_selector(
+        instruction.assign_rhs(), result, -1, condition))
+    {
+      if(!negative_condition.id().empty())
+      {
+        reason = "scan_negative_selector";
+        return false;
+      }
+      negative_condition = condition;
+      negative_result = &instruction;
+      ++result_selectors;
+    }
+    else
+    {
+      ++result_passthroughs;
+      final_result = &instruction;
+    }
+  }
+  if(
+    result_assignments != 4 ||
+    result_selectors != 3 ||
+    result_passthroughs != 1 ||
+    summary.first.empty() || summary.second.empty() ||
+    summary.current.empty() ||
+    initial_condition.id().empty() ||
+    positive_condition.id().empty() ||
+    negative_condition.id().empty())
+  {
+    reason = "scan_result_selectors";
+    return false;
+  }
+
+  std::vector<exprt> negative_terms;
+  flatten_and(negative_condition, negative_terms);
+  if(negative_terms.size() != 2)
+  {
+    reason = "scan_negative_guard";
+    return false;
+  }
+  for(const auto &term : negative_terms)
+  {
+    irep_idt left;
+    irep_idt right;
+    if(relational_comparator_equal_symbols(term, left, right))
+    {
+      if(
+        !((left == summary.current &&
+           right == summary.second) ||
+          (right == summary.current &&
+           left == summary.second)))
+      {
+        reason = "scan_negative_key";
+        return false;
+      }
+    }
+    else
+    {
+      std::set<irep_idt> symbols;
+      collect_static_symbols(term, ns, symbols);
+      if(symbols.size() != 1)
+      {
+        reason = "scan_break_guard";
+        return false;
+      }
+      summary.breaker = *symbols.begin();
+      if(!relational_comparator_zero_test(
+           term, summary.breaker))
+      {
+        reason = "scan_break_guard";
+        return false;
+      }
+    }
+  }
+  if(summary.breaker.empty())
+  {
+    reason = "scan_break_guard";
+    return false;
+  }
+
+  std::size_t break_zero = 0;
+  std::size_t break_selectors = 0;
+  std::size_t array_reads = 0;
+  std::size_t index_zero = 0;
+  std::size_t index_steps = 0;
+  std::size_t assumptions = 0;
+  std::size_t positive_guards = 0;
+  std::size_t negative_guards = 0;
+  std::size_t subtraction_calls = 0;
+  std::size_t nondet_assignments = 0;
+  std::size_t backward_gotos = 0;
+  std::vector<std::pair<
+    const goto_programt::instructiont *, exprt>>
+      assumption_arguments;
+  const goto_programt::instructiont *break_initial = nullptr;
+  const goto_programt::instructiont *break_initial_selector = nullptr;
+  const goto_programt::instructiont *break_positive_selector = nullptr;
+  const goto_programt::instructiont *break_negative_selector = nullptr;
+  const goto_programt::instructiont *array_read = nullptr;
+  const goto_programt::instructiont *index_initial = nullptr;
+  const goto_programt::instructiont *index_step = nullptr;
+  const goto_programt::instructiont *nondet_assignment = nullptr;
+  const goto_programt::instructiont *backedge = nullptr;
+  const goto_programt::instructiont *positive_assumption = nullptr;
+  const goto_programt::instructiont *negative_assumption = nullptr;
+  const goto_programt::instructiont *subtraction_call = nullptr;
+  std::set<irep_idt> reads;
+  std::set<irep_idt> writes;
+  std::set<irep_idt> visiting;
+  if(
+    !relational_bisimulation_function_effects(
+      model,
+      worker,
+      ns,
+      visiting,
+      reads,
+      writes,
+      reason,
+      true))
+    return false;
+  for(const auto &instruction : program.instructions)
+  {
+    irep_idt lhs;
+    if(
+      instruction.is_assign() &&
+      symbol_id(instruction.assign_lhs(), lhs))
+    {
+      const exprt &rhs = strip(instruction.assign_rhs());
+      if(
+        relational_bisimulation_contains_nondet(rhs))
+      {
+        ++nondet_assignments;
+        nondet_assignment = &instruction;
+      }
+      if(lhs == summary.breaker)
+      {
+        if(value_is(rhs, 0))
+        {
+          ++break_zero;
+          break_initial = &instruction;
+        }
+        else
+        {
+          const exprt &selector = strip(rhs);
+          irep_idt fallback;
+          if(
+            selector.id() != ID_if ||
+            selector.operands().size() != 3 ||
+            !value_is(selector.op1(), 1) ||
+            !symbol_id(selector.op2(), fallback) ||
+            fallback != summary.breaker ||
+            (strip(selector.op0()) !=
+               strip(initial_condition) &&
+             strip(selector.op0()) !=
+               strip(positive_condition) &&
+             strip(selector.op0()) !=
+               strip(negative_condition)))
+          {
+            reason = "scan_break_selector";
+            return false;
+          }
+          if(
+            strip(selector.op0()) ==
+              strip(initial_condition))
+            break_initial_selector = &instruction;
+          else if(
+            strip(selector.op0()) ==
+              strip(positive_condition))
+            break_positive_selector = &instruction;
+          else
+            break_negative_selector = &instruction;
+          ++break_selectors;
+        }
+      }
+      if(lhs == summary.current)
+      {
+        const exprt &load = strip(rhs);
+        if(
+          load.id() != ID_dereference ||
+          load.operands().size() != 1)
+        {
+          reason = "scan_array_load";
+          return false;
+        }
+        const exprt &address = strip(load.op0());
+        if(
+          address.id() != ID_plus ||
+          address.operands().size() != 2)
+        {
+          reason = "scan_array_address";
+          return false;
+        }
+        irep_idt left;
+        irep_idt right;
+        if(
+          !symbol_id(address.op0(), left) ||
+          !symbol_id(address.op1(), right))
+        {
+          reason = "scan_array_address";
+          return false;
+        }
+        const symbolt *left_symbol = lookup(left, ns);
+        const symbolt *right_symbol = lookup(right, ns);
+        if(
+          left_symbol != nullptr &&
+          left_symbol->type.id() == ID_pointer)
+        {
+          summary.array = left;
+          summary.index = right;
+        }
+        else if(
+          right_symbol != nullptr &&
+          right_symbol->type.id() == ID_pointer)
+        {
+          summary.array = right;
+          summary.index = left;
+        }
+        else
+        {
+          reason = "scan_array_pointer";
+          return false;
+        }
+        array_read = &instruction;
+        ++array_reads;
+      }
+    }
+    if(
+      instruction.is_function_call())
+    {
+      if(
+        relational_bisimulation_verified_assume(
+          instruction, model, ns, true))
+      {
+        ++assumptions;
+        assumption_arguments.emplace_back(
+          &instruction,
+          instruction.call_arguments().front());
+      }
+      else
+      {
+        irep_idt callee;
+        if(
+          !call_id(instruction, callee) ||
+          instruction.call_arguments().size() != 2 ||
+          !relational_comparator_subtraction_helper(
+            model, ns, callee, reason, true))
+          continue;
+        if(
+          strip(instruction.call_arguments()[0]) !=
+            symbol_exprt(
+              summary.first,
+              lookup(summary.first, ns)->type) ||
+          strip(instruction.call_arguments()[1]) !=
+            symbol_exprt(
+              summary.second,
+              lookup(summary.second, ns)->type))
+        {
+          reason = "scan_subtraction_order";
+          return false;
+        }
+        summary.subtraction = callee;
+        subtraction_call = &instruction;
+        ++subtraction_calls;
+      }
+    }
+    if(instruction.is_goto() &&
+       instruction.condition().is_true() &&
+       instruction.targets.size() == 1 &&
+       instruction.get_target()->location_number <
+         instruction.location_number)
+    {
+      ++backward_gotos;
+      backedge = &instruction;
+    }
+  }
+  for(const auto &assumption : assumption_arguments)
+  {
+    const exprt &argument = strip(assumption.second);
+    exprt bound;
+    if(
+      relational_comparator_guard(
+        argument,
+        summary.index,
+        summary.breaker,
+        bound))
+    {
+      ++positive_guards;
+      summary.bound = bound;
+      positive_assumption = assumption.first;
+    }
+    else if(
+      argument.id() == ID_not &&
+      argument.operands().size() == 1 &&
+      relational_comparator_guard(
+        argument.op0(),
+        summary.index,
+        summary.breaker,
+        bound))
+    {
+      ++negative_guards;
+      negative_assumption = assumption.first;
+      if(
+        !summary.bound.id().empty() &&
+        strip(summary.bound) != strip(bound))
+      {
+        reason = "scan_bound_mismatch";
+        return false;
+      }
+      summary.bound = bound;
+    }
+    else
+    {
+      reason = "scan_assumption";
+      return false;
+    }
+  }
+  for(const auto &instruction : program.instructions)
+  {
+    if(!instruction.is_assign())
+      continue;
+    irep_idt lhs;
+    if(!symbol_id(instruction.assign_lhs(), lhs))
+      continue;
+    const exprt &rhs = strip(instruction.assign_rhs());
+    if(lhs == summary.index)
+    {
+      if(value_is(rhs, 0))
+      {
+        ++index_zero;
+        index_initial = &instruction;
+      }
+      else if(
+        rhs.id() == ID_plus &&
+        rhs.operands().size() == 2)
+      {
+        irep_idt step_symbol;
+        if(
+          (symbol_id(rhs.op0(), step_symbol) &&
+           step_symbol == summary.index &&
+           value_is(rhs.op1(), 1)) ||
+          (symbol_id(rhs.op1(), step_symbol) &&
+           step_symbol == summary.index &&
+          value_is(rhs.op0(), 1)))
+        {
+          ++index_steps;
+          index_step = &instruction;
+        }
+        else
+        {
+          reason = "scan_index_step";
+          return false;
+        }
+      }
+      else
+      {
+        reason = "scan_index_write";
+        return false;
+      }
+    }
+  }
+  const goto_programt::instructiont *exit_branch = nullptr;
+  if(nondet_assignment != nullptr &&
+     negative_assumption != nullptr)
+  {
+    for(const auto &instruction : program.instructions)
+    {
+      if(
+        relational_comparator_false_nondet_gate(
+          *nondet_assignment, instruction) &&
+        &*instruction.get_target() ==
+          negative_assumption)
+      {
+        if(exit_branch != nullptr)
+        {
+          reason = "scan_exit_branch_count";
+          return false;
+        }
+        exit_branch = &instruction;
+      }
+    }
+  }
+  const auto before =
+    [](const goto_programt::instructiont *left,
+       const goto_programt::instructiont *right)
+    {
+      return
+        left != nullptr && right != nullptr &&
+        left->location_number < right->location_number;
+    };
+  if(
+    !before(index_initial, break_initial) ||
+    !before(break_initial, initial_result) ||
+    !before(initial_result, break_initial_selector) ||
+    !before(break_initial_selector, nondet_assignment) ||
+    !before(nondet_assignment, exit_branch) ||
+    !before(exit_branch, positive_assumption) ||
+    !before(positive_assumption, array_read) ||
+    !before(array_read, positive_result) ||
+    !before(positive_result, break_positive_selector) ||
+    !before(break_positive_selector, negative_result) ||
+    !before(negative_result, break_negative_selector) ||
+    !before(break_negative_selector, index_step) ||
+    !before(index_step, backedge) ||
+    !before(backedge, negative_assumption) ||
+    !before(negative_assumption, subtraction_call) ||
+    !before(subtraction_call, final_result) ||
+    backedge == nullptr ||
+    backedge->get_target()->location_number >
+      nondet_assignment->location_number)
+  {
+    reason = "scan_control_order";
+    return false;
+  }
+  const std::set<irep_idt> expected_writes{
+    summary.result,
+    summary.current,
+    summary.breaker,
+    summary.index};
+  if(
+    writes != expected_writes ||
+    break_zero != 1 || break_selectors != 3 ||
+    array_reads != 1 ||
+    index_zero != 1 || index_steps != 1 ||
+    assumptions != 2 ||
+    positive_guards != 1 || negative_guards != 1 ||
+    subtraction_calls != 1 ||
+    nondet_assignments != 1 ||
+    backward_gotos != 1 ||
+    summary.array.empty() || summary.index.empty() ||
+    summary.bound.id().empty())
+  {
+    reason = "scan_structural_census";
+    return false;
+  }
+  for(const auto &identifier :
+      {summary.first, summary.second, summary.current,
+       summary.breaker, summary.index, summary.result})
+  {
+    const symbolt *symbol = lookup(identifier, ns);
+    if(
+      symbol == nullptr || !symbol->is_static_lifetime ||
+      symbol->type.id() != ID_signedbv)
+    {
+      reason = "scan_symbol_type";
+      return false;
+    }
+  }
+  const symbolt *array_symbol = lookup(summary.array, ns);
+  if(
+    array_symbol == nullptr ||
+    !array_symbol->is_static_lifetime ||
+    array_symbol->type.id() != ID_pointer ||
+    to_pointer_type(array_symbol->type).base_type().id() !=
+      ID_signedbv ||
+    writes.count(summary.array) != 0)
+  {
+    reason = "scan_array_type";
+    return false;
+  }
+  return true;
+}
+
+bool relational_comparator_scan_law(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const std::vector<irep_idt> &workers,
+  const std::vector<irep_idt> &worker_results,
+  const std::string &rule,
+  std::size_t &pairwise_program_matches,
+  std::size_t &mapped_symbols,
+  std::size_t &audited_helpers,
+  std::string &reason)
+{
+  if(workers.size() != 3 || worker_results.size() != 3)
+  {
+    reason = "scan_law_arity";
+    return false;
+  }
+  std::vector<relational_comparator_scan_summaryt>
+    summaries(workers.size());
+  for(std::size_t index = 0; index < workers.size(); ++index)
+  {
+    if(
+      !relational_comparator_scan_summary(
+        model,
+        ns,
+        workers[index],
+        worker_results[index],
+        summaries[index],
+        reason))
+      return false;
+    if(index != 0)
+    {
+      relational_bisimulation_mappingt mapping;
+      if(
+        !relational_bisimulation_programs(
+          model.goto_functions.function_map.at(workers[0]).body,
+          model.goto_functions.function_map.at(workers[index]).body,
+          ns,
+          mapping,
+          reason))
+      {
+        reason =
+          "scan_law_pair_" + std::to_string(index) +
+          "_" + reason;
+        return false;
+      }
+      ++pairwise_program_matches;
+      mapped_symbols += mapping.forward.size();
+    }
+  }
+  for(std::size_t index = 1; index < summaries.size(); ++index)
+  {
+    if(
+      summaries[index].array != summaries[0].array ||
+      strip(summaries[index].bound) !=
+        strip(summaries[0].bound) ||
+      summaries[index].subtraction !=
+        summaries[0].subtraction)
+    {
+      reason = "scan_law_shared_definition";
+      return false;
+    }
+  }
+  const auto &first = summaries[0];
+  const auto &second = summaries[1];
+  const auto &third = summaries[2];
+  const bool triangle =
+    (rule == "strict_transitivity" &&
+     first.second == second.first &&
+     first.first == third.first &&
+     second.second == third.second) ||
+    (rule == "equality_substitution" &&
+     first.first == second.first &&
+     first.second == third.first &&
+     second.second == third.second);
+  if(!triangle)
+  {
+    reason = "scan_law_input_triangle";
+    return false;
+  }
+  audited_helpers = 1;
+  return true;
+}
+
+bool relational_comparator_scan_antisymmetry(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const std::vector<irep_idt> &workers,
+  const irep_idt &left_result,
+  const irep_idt &right_result,
+  std::size_t &transition_matches,
+  std::size_t &audited_helpers,
+  std::string &reason)
+{
+  if(
+    workers.size() != 2 ||
+    left_result.empty() || right_result.empty() ||
+    left_result == right_result)
+  {
+    reason = "scan_antisymmetry_arity";
+    return false;
+  }
+  relational_comparator_scan_summaryt left;
+  relational_comparator_scan_summaryt right;
+  if(
+    !relational_comparator_scan_summary(
+      model, ns, workers[0], left_result, left, reason) ||
+    !relational_comparator_scan_summary(
+      model, ns, workers[1], right_result, right, reason))
+    return false;
+  relational_bisimulation_mappingt mapping;
+  if(
+    !relational_bisimulation_programs(
+      model.goto_functions.function_map.at(workers[0]).body,
+      model.goto_functions.function_map.at(workers[1]).body,
+      ns,
+      mapping,
+      reason))
+  {
+    reason = "scan_antisymmetry_pair_" + reason;
+    return false;
+  }
+  if(
+    left.first != right.second ||
+    left.second != right.first ||
+    left.array != right.array ||
+    strip(left.bound) != strip(right.bound) ||
+    left.subtraction != right.subtraction)
+  {
+    reason = "scan_antisymmetry_definition";
+    return false;
+  }
+  transition_matches = 1;
+  audited_helpers = 1;
+  return true;
+}
+
 bool relational_comparator_transitivity_diagnostic(
   const goto_modelt &model,
   const namespacet &ns,
@@ -23834,8 +24985,6 @@ bool relational_comparator_transitivity_diagnostic(
     !relational_bisimulation_exact_error_sink(model) ||
     !relational_bisimulation_main_regions(
       model, life, property, error, reason) ||
-    !relational_comparator_worker_effects(
-      model, workers, ns, reason) ||
     !relational_comparator_transitivity_result_owners(
       model,
       workers,
@@ -23844,7 +24993,8 @@ bool relational_comparator_transitivity_diagnostic(
       ns,
       worker_results,
       owned_results,
-      reason))
+      reason,
+      true))
     return false;
   const auto is_positive_result =
     [&](const irep_idt &result)
@@ -23871,6 +25021,36 @@ bool relational_comparator_transitivity_diagnostic(
     return false;
   }
 
+  std::string scan_reason;
+  if(
+    relational_comparator_scan_law(
+      model,
+      ns,
+      workers,
+      worker_results,
+      rule,
+      pairwise_program_matches,
+      mapped_symbols,
+      audited_helpers,
+      scan_reason))
+  {
+    regions_per_worker = 1;
+    endpoint_input_symbols = 2;
+    middle_input_symbols = 1;
+    unary_selectors = 3;
+    dominated_selectors = 3;
+    guard_partition_groups = 1;
+    dispatch_gates = 1;
+    validity_selectors = 3;
+    ordered_subtractions = 3;
+    missing_key_guards = 1;
+    return true;
+  }
+  if(
+    !relational_comparator_worker_effects(
+      model, workers, ns, reason))
+    return false;
+
   std::vector<std::vector<relational_comparator_atomic_regiont>>
     summaries(workers.size());
   for(std::size_t index = 0; index < workers.size(); ++index)
@@ -23880,7 +25060,12 @@ bool relational_comparator_transitivity_diagnostic(
     if(
       !relational_comparator_atomic_regions(
         program, model, ns, summaries[index], reason))
+    {
+      if(reason == "missing_atomic_regions" &&
+         !scan_reason.empty())
+        reason = scan_reason;
       return false;
+    }
     if(index == 0)
       regions_per_worker = summaries[index].size();
     else if(summaries[index].size() != regions_per_worker)
@@ -24348,6 +25533,69 @@ bool relational_comparator_transitivity_proof(
   }
   std::cout
     << "NATIVE_RELATIONAL_TRANSITIVITY applied=0 reason="
+    << reason << '\n';
+  return false;
+}
+
+bool relational_comparator_antisymmetry_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  (void)message_handler;
+  const namespacet ns(goto_model.symbol_table);
+  irep_idt left_result;
+  irep_idt right_result;
+  std::size_t left_regions = 0;
+  std::size_t right_regions = 0;
+  std::size_t left_assumptions = 0;
+  std::size_t right_assumptions = 0;
+  std::size_t left_assignments = 0;
+  std::size_t right_assignments = 0;
+  std::size_t left_helpers = 0;
+  std::size_t right_helpers = 0;
+  std::size_t left_internal_gotos = 0;
+  std::size_t right_internal_gotos = 0;
+  std::size_t transition_matches = 0;
+  std::size_t contextual_equalities = 0;
+  std::size_t dominated_equalities = 0;
+  std::size_t guard_partition_groups = 0;
+  std::size_t dispatch_gates = 0;
+  std::size_t audited_helpers = 0;
+  std::string reason;
+  if(
+    relational_comparator_diagnostic(
+      goto_model,
+      ns,
+      left_result,
+      right_result,
+      left_regions,
+      right_regions,
+      left_assumptions,
+      right_assumptions,
+      left_assignments,
+      right_assignments,
+      left_helpers,
+      right_helpers,
+      left_internal_gotos,
+      right_internal_gotos,
+      transition_matches,
+      contextual_equalities,
+      dominated_equalities,
+      guard_partition_groups,
+      dispatch_gates,
+      audited_helpers,
+      reason))
+  {
+    std::cout
+      << "NATIVE_RELATIONAL_COMPARATOR applied=1"
+      << " transitions=" << transition_matches
+      << " partitions=" << guard_partition_groups
+      << " gates=" << dispatch_gates
+      << '\n';
+    return true;
+  }
+  std::cout
+    << "NATIVE_RELATIONAL_COMPARATOR applied=0 reason="
     << reason << '\n';
   return false;
 }

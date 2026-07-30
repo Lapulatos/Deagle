@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-30T00:03:28.926Z",
+  "generated_at": "2026-07-30T02:24:10.566Z",
   "comparison_protocol": {
     "tasks": 725,
     "workers": 48,
@@ -16,7 +16,7 @@
     "Optimization duration is an artifact-backed observed wall-clock interval covering research, implementation, experiments, analysis, and documentation; it is not pure model-compute time.",
     "V17-V20 and V168 share timestamp records with another version, while V37 and V91 lack independent records; their durations remain missing rather than being estimated.",
     "Some historical controls were reused across dates; cumulative baseline comparisons are useful for progress, not precise per-version causal attribution.",
-    "V291 and V294-V299 were measured after a server restart with 8 physical workers. Their coverage and resource claims use contemporaneous N8 paired controls; their raw totals are shown in the ledger but excluded from the historical 48-worker resource trend lines. V299 additionally uses the currently available /data3 benchmark tree only for paired deltas because the accepted /home benchmark tree is no longer present."
+    "V291 and V294-V300 were measured after a server restart with 8 physical workers. Their coverage and resource claims use contemporaneous N8 paired controls; their raw totals are shown in the ledger but excluded from the historical 48-worker resource trend lines. V299-V300 additionally use the currently available /data3 benchmark tree only for paired deltas because the accepted /home benchmark tree is no longer present."
   ],
   "rows": [
     {
@@ -14880,7 +14880,7 @@
         "directory": "native-residual-v295-20260730",
         "available": true,
         "start_epoch_s": 1785358627,
-        "end_epoch_s": 1785360026,
+        "end_epoch_s": 1785359646,
         "start_iso": "2026-07-29T20:57:07.000Z",
         "end_iso": "2026-07-29T21:14:06.000Z",
         "duration_minutes": 16.983333333333334,
@@ -14935,8 +14935,8 @@
         "version": 296,
         "directory": "native-residual-v296-20260730",
         "available": true,
-        "start_epoch_s": 1785360356,
-        "end_epoch_s": 1785361272,
+        "start_epoch_s": 1785359976,
+        "end_epoch_s": 1785360892,
         "start_iso": "2026-07-29T21:19:36.000Z",
         "end_iso": "2026-07-29T21:34:52.000Z",
         "duration_minutes": 15.266666666666667,
@@ -15130,6 +15130,62 @@
         "cpu": null,
         "wall": null,
         "peak_memory": "1419.671 s to 1426.350 s (+0.47%), and summed peak memory from 100.921 GB to",
+        "paired_memory": null
+      },
+      "exact_override": true,
+      "wrapper_exact_evidence": false
+    },
+    {
+      "version": 300,
+      "label": "V300",
+      "method": "Comparator Scan Laws",
+      "status": "successful",
+      "scope": "exact725",
+      "contribution_class": "native_redo",
+      "description": "Native V300 proves three comparator scan laws through one generic structural analysis in the unified deagle_exe. The byte-identical wrapper performs no proof or verdict work. The first candidate was rejected after it incorrectly changed two negative controls from false to true; the accepted implementation scopes standard-abort and verified-assume handling to the fully audited comparator-scan path. Against the same-machine V299 control, paired Exact725 changes only three comparator scan tasks from timeout to correct true, reaching 705 official / 717 adjudicated correct with zero old-correct losses and zero new wrong results. CPU, wall, and summed memory improve by 15.672%, 15.605%, and 0.204%. Prior90 changes only the same three targets, all 14 structural mutations reject, all three native correctness witnesses pass WitnessLint's format gate, and two independent object-free builds are byte-identical.",
+      "source": "../../experiments/native-residual-v300-20260730/conclusion.md",
+      "source_notes": "../../experiments/native-residual-v300-20260730/notes.md",
+      "memory_sum_source": "../../experiments/native-residual-v300-20260730/results/exact725-v300-final.xml.bz2",
+      "comparison_protocol_override": {
+        "tasks": 725,
+        "workers": 8,
+        "cores_per_task": 1,
+        "memory_per_task_gb": 4,
+        "time_limit_s": 60,
+        "paired_baseline_version": 299
+      },
+      "resource_comparable_with_historical_trend": false,
+      "timing": {
+        "version": 300,
+        "directory": "native-residual-v300-20260730",
+        "available": true,
+        "start_epoch_s": 1785373480,
+        "end_epoch_s": 1785376836,
+        "start_iso": "2026-07-30T01:04:40.000Z",
+        "end_iso": "2026-07-30T02:00:36.000Z",
+        "duration_minutes": 55.93333333333333,
+        "evidence_kind": "accepted_source_birth_to_independent_clean_build_gate"
+      },
+      "metrics": {
+        "correct": 717,
+        "cpu_s": 1184.183775598,
+        "wall_s": 1203.763371123,
+        "memory_sum_b": 100948676608,
+        "paired_memory_delta_pct": null,
+        "correct_vs_baseline": 273,
+        "cpu_vs_baseline_pct": null,
+        "wall_vs_baseline_pct": null,
+        "memory_sum_vs_baseline_pct": null,
+        "correct_vs_previous_success": 3,
+        "cpu_vs_previous_success_pct": null,
+        "wall_vs_previous_success_pct": null
+      },
+      "wrapper_metrics": null,
+      "extracted_evidence": {
+        "correct": "raising accepted adjudicated coverage from 714 to 717 with zero old-correct",
+        "cpu": null,
+        "wall": null,
+        "peak_memory": null,
         "paired_memory": null
       },
       "exact_override": true,

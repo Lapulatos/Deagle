@@ -1,0 +1,35 @@
+Running witnesslint version 2.1.3-dev
+
+--- Witness File Metadata ---
+Witness File: /data3/sujie/experiments/v300-comparator-wrapper-family-final-r7/trans/witness.graphml
+Witness Size in Bytes: 3474
+Witness Lines of Code: 65
+Witness Hash: 95df7c3f65ff39a0e9535eb7c7d1c3ffc65a883cef06021830c0654001e0b3bb
+
+--- Witness Information Before Linting ---
+Witness Version: 1.0
+
+--- Overview of analyzed program ---
+name: /data3/sujie/svcomp2026-caat/sv-benchmarks/c/weaver/chl-name-comparator-trans.wvr.c
+num_chars: 5303
+num_lines: 162
+sha256_hash: 362ca5c35cce683744d8d619a442f154ce469608d45ae43ff282ddf886694959
+function_names: []
+sucessfully_parsed: False
+
+--- Witness Content Information ---
+Witness Type: correctness_witness
+Witness Type-Match: True
+Producer: Deagle 4.1.0
+Creation Time: 2026-07-30T09:37:09+08:00
+Architecture: 32bit
+Program File: /data3/sujie/svcomp2026-caat/sv-benchmarks/c/weaver/chl-name-comparator-trans.wvr.c
+Program Hash: 362CA5C35CCE683744D8D619A442F154CE469608D45AE43FF282DDF886694959
+Source-Code Language: C
+Amount of Nodes: 2
+Amount of Edges: 1
+Amount of Invariants: 1
+Specification: CHECK( init(main()), LTL(G ! call(reach_error())) )
+
+
+witnesslint finished with exit code 0

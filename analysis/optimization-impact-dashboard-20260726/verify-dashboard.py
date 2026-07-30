@@ -960,6 +960,37 @@ assert "zero old-correct losses" in v296["description"].lower()
 assert "wrapper is byte-identical" in v296["description"].lower()
 assert "witnesslint" in v296["description"].lower()
 
+v297 = next(row for row in DATA["rows"] if row["version"] == 297)
+v298 = next(row for row in DATA["rows"] if row["version"] == 298)
+v299 = next(row for row in DATA["rows"] if row["version"] == 299)
+v300 = next(row for row in DATA["rows"] if row["version"] == 300)
+for row, expected_correct, expected_baseline in (
+    (v297, 712, 296),
+    (v298, 713, 297),
+    (v299, 714, 298),
+    (v300, 717, 299),
+):
+    assert row["status"] == "successful"
+    assert row["scope"] == "exact725"
+    assert row["contribution_class"] == "native_redo"
+    assert row["metrics"]["correct"] == expected_correct
+    assert row["resource_comparable_with_historical_trend"] is False
+    assert row["comparison_protocol_override"]["workers"] == 8
+    assert (
+        row["comparison_protocol_override"]["paired_baseline_version"]
+        == expected_baseline
+    )
+assert v300["metrics"]["cpu_s"] == 1184.183775598
+assert v300["metrics"]["wall_s"] == 1203.763371123
+assert v300["metrics"]["memory_sum_b"] == 100948676608
+assert v300["metrics"]["correct_vs_previous_success"] == 3
+assert v300["timing"]["start_epoch_s"] > v299["timing"]["end_epoch_s"]
+assert v300["timing"]["duration_minutes"] == 55.93333333333333
+assert "zero old-correct losses" in v300["description"].lower()
+assert "zero new wrong results" in v300["description"].lower()
+assert "byte-identical wrapper" in v300["description"].lower()
+assert "two independent object-free builds" in v300["description"].lower()
+
 timing_expected = {
     264: 3.121307483333333,
     265: 6.578901950000001,
@@ -989,6 +1020,10 @@ timing_expected = {
     294: 32.3,
     295: 16.983333333333334,
     296: 15.266666666666667,
+    297: 33.083333333333336,
+    298: 28.1,
+    299: 61.43333333333333,
+    300: 55.93333333333333,
 }
 for version, duration in timing_expected.items():
     row = next(row for row in DATA["rows"] if row["version"] == version)
@@ -1004,6 +1039,10 @@ assert v293["timing"]["start_epoch_s"] > v292["timing"]["end_epoch_s"]
 assert v294["timing"]["start_epoch_s"] > v293["timing"]["end_epoch_s"]
 assert v295["timing"]["start_epoch_s"] > v294["timing"]["end_epoch_s"]
 assert v296["timing"]["start_epoch_s"] > v295["timing"]["end_epoch_s"]
+assert v297["timing"]["start_epoch_s"] > v296["timing"]["end_epoch_s"]
+assert v298["timing"]["start_epoch_s"] > v297["timing"]["end_epoch_s"]
+assert v299["timing"]["start_epoch_s"] > v298["timing"]["end_epoch_s"]
+assert v300["timing"]["start_epoch_s"] > v299["timing"]["end_epoch_s"]
 
 
 with sync_playwright() as playwright:
@@ -1019,9 +1058,9 @@ with sync_playwright() as playwright:
     page.goto(HTML.as_uri())
     page.wait_for_load_state("networkidle")
 
-    assert "V1–V296" in page.title()
-    assert page.locator("#rangeMax").get_attribute("max") == "296"
-    assert page.locator("#rangeMax").input_value() == "296"
+    assert "V1–V300" in page.title()
+    assert page.locator("#rangeMax").get_attribute("max") == "300"
+    assert page.locator("#rangeMax").input_value() == "300"
     for version, correct in (
         (259, 687), (260, 688), (261, 689), (262, 690), (263, 691),
         (266, 692), (267, 694), (268, 695), (270, 696),
@@ -1069,8 +1108,8 @@ with sync_playwright() as playwright:
         assert "685" in page.locator(f"#row-{version}").inner_text()
     assert page.locator(".point[data-version='254']").count() >= 1
     assert page.locator("#chart .point").count() >= 200
-    # One header, Baseline, and V1--V296.
-    assert page.locator("#ledger .ledger-row").count() == 298
+    # One header, Baseline, and V1--V300.
+    assert page.locator("#ledger .ledger-row").count() == 302
     for version, duration_text in (
         (264, "3.12 min"),
         (265, "6.58 min"),

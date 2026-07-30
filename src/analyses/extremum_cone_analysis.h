@@ -14,6 +14,10 @@ bool relational_comparator_transitivity_proof(
   const goto_modelt &goto_model,
   message_handlert &message_handler);
 
+bool relational_comparator_antisymmetry_proof(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 bool extremum_cone_proof(
   const goto_modelt &goto_model,
   message_handlert &message_handler);

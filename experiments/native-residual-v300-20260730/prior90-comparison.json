@@ -1,0 +1,54 @@
+{
+  "base": {
+    "correct": 57,
+    "cpu": 475.5140420090001,
+    "end": "2026-07-30T08:50:13.691207+08:00",
+    "memory": 38572122112,
+    "peak_memory": 3999997952,
+    "start": "2026-07-30T08:41:40.970278+08:00",
+    "unfinished": 20,
+    "wall": 477.28573521622457,
+    "wrong": 13
+  },
+  "candidate": {
+    "correct": 60,
+    "cpu": 290.15305245800016,
+    "end": "2026-07-30T09:11:34.660007+08:00",
+    "memory": 37635727360,
+    "peak_memory": 3999997952,
+    "start": "2026-07-30T09:06:08.729573+08:00",
+    "unfinished": 17,
+    "wall": 291.67382770217955,
+    "wrong": 13
+  },
+  "changes": [
+    {
+      "after_category": "correct",
+      "after_status": "true",
+      "before_category": "error",
+      "before_status": "TIMEOUT",
+      "task": "chl-name-comparator-subst.wvr.yml"
+    },
+    {
+      "after_category": "correct",
+      "after_status": "true",
+      "before_category": "error",
+      "before_status": "TIMEOUT",
+      "task": "chl-name-comparator-symm.wvr.yml"
+    },
+    {
+      "after_category": "correct",
+      "after_status": "true",
+      "before_category": "error",
+      "before_status": "TIMEOUT",
+      "task": "chl-name-comparator-trans.wvr.yml"
+    }
+  ],
+  "new_wrong": [],
+  "old_correct_losses": [],
+  "percent_change": {
+    "cpu": -38.98118103260799,
+    "memory": -2.427646447040266,
+    "wall": -38.889054044315266
+  }
+}

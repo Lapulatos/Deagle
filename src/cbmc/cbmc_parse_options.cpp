@@ -1514,8 +1514,10 @@ int cbmc_parse_optionst::doit()
 
   if(
     !cmdline.isset("unwind-suggest") &&
-    relational_comparator_transitivity_proof(
-      goto_model, ui_message_handler) &&
+    (relational_comparator_transitivity_proof(
+       goto_model, ui_message_handler) ||
+     relational_comparator_antisymmetry_proof(
+       goto_model, ui_message_handler)) &&
     output_native_correctness_witness(
       goto_model, options, native_witness_assertions))
   {
