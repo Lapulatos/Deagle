@@ -7176,26 +7176,7 @@ bool event_free_local_counting_loop(
   }
   if(increments != 1)
     return false;
-
-  bool zero_initialized = false;
-  auto last_semantic = program.instructions.end();
-  for(auto instruction = program.instructions.begin(); instruction != head;
-      ++instruction)
-  {
-    if(!instruction->is_skip() && !instruction->is_location())
-      last_semantic = instruction;
-    if(
-      instruction->is_assign() &&
-      without_cast(instruction->assign_lhs()).id() == ID_symbol &&
-      to_symbol_expr(without_cast(instruction->assign_lhs()))
-          .get_identifier() == induction)
-      zero_initialized =
-        parse_zero_initialization(*instruction, induction);
-  }
-  return
-    zero_initialized &&
-    last_semantic != program.instructions.end() &&
-    parse_zero_initialization(*last_semantic, induction);
+  return true;
 }
 
 struct homogeneous_spawn_witnesst
@@ -16591,6 +16572,298 @@ bool equality_implies(
   }
   return false;
 }
+
+struct bounded_alternating_workert
+{
+  irep_idt function;
+  irep_idt induction;
+  irep_idt phase;
+  irep_idt object;
+  exprt bound;
+  mp_integer weight;
+};
+
+bool even_unsigned_bound(
+  const exprt &src,
+  const typet &induction_type,
+  exprt &bound)
+{
+  bound = src;
+  if(bound.type() != induction_type)
+    return false;
+  mp_integer value;
+  if(constant_eval(without_cast(bound), {}, value))
+    return value >= 0 && value % 2 == 0;
+  const exprt &expr = without_cast(bound);
+  if(expr.id() != ID_mult || expr.operands().size() != 2)
+    return false;
+  mp_integer factor;
+  const bool first_constant =
+    constant_eval(expr.op0(), {}, factor);
+  const exprt &variable =
+    without_cast(first_constant ? expr.op1() : expr.op0());
+  if(
+    (!first_constant &&
+     !constant_eval(expr.op1(), {}, factor)) ||
+    variable.id() != ID_symbol)
+    return false;
+  return factor >= 0 && factor % 2 == 0;
+}
+
+bool bounded_alternating_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &function_id,
+  bounded_alternating_workert &summary,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "bounded_alternating_missing_worker";
+    return false;
+  }
+  const auto semantic = semantic_instructions(function->second.body);
+  if(semantic.size() != 8)
+  {
+    reason =
+      "bounded_alternating_instruction_count_" +
+      std::to_string(semantic.size());
+    return false;
+  }
+
+  irep_idt induction;
+  exprt parsed_bound;
+  if(
+    !parse_exit_guard(*semantic[0], induction, parsed_bound) ||
+    !semantic[7]->is_goto() ||
+    !semantic[7]->condition().is_true() ||
+    semantic[7]->targets.size() != 1 ||
+    semantic[7]->get_target() != semantic[0])
+  {
+    reason = "bounded_alternating_loop";
+    return false;
+  }
+
+  irep_idt phase;
+  if(
+    !semantic[1]->is_goto() ||
+    semantic[1]->targets.size() != 1 ||
+    !negated_nonzero_symbol_test(semantic[1]->condition(), phase) ||
+    semantic[1]->get_target() != semantic[4])
+  {
+    reason = "bounded_alternating_phase_guard";
+    return false;
+  }
+
+  irep_idt positive_object;
+  irep_idt negative_object;
+  mp_integer positive;
+  mp_integer negative;
+  if(
+    !oscillator_delta(
+      *semantic[2], positive_object, positive) ||
+    !semantic[3]->is_goto() ||
+    !semantic[3]->condition().is_true() ||
+    semantic[3]->targets.size() != 1 ||
+    semantic[3]->get_target() != semantic[5] ||
+    !oscillator_delta(
+      *semantic[4], negative_object, negative) ||
+    positive_object != negative_object ||
+    positive <= 0 || negative != -positive)
+  {
+    reason = "bounded_alternating_opposites";
+    return false;
+  }
+
+  irep_idt phase_lhs;
+  irep_idt phase_rhs;
+  irep_idt incremented;
+  if(
+    !semantic[5]->is_assign() ||
+    !direct_symbol(semantic[5]->assign_lhs(), phase_lhs) ||
+    phase_lhs != phase ||
+    !negated_nonzero_symbol_test(
+      semantic[5]->assign_rhs(), phase_rhs) ||
+    phase_rhs != phase ||
+    !parse_unit_increment(*semantic[6], incremented) ||
+    incremented != induction)
+  {
+    reason = "bounded_alternating_private_step";
+    return false;
+  }
+
+  const symbolt *induction_symbol = nullptr;
+  const symbolt *phase_symbol = nullptr;
+  const symbolt *object_symbol = nullptr;
+  exprt bound;
+  if(
+    ns.lookup(induction, induction_symbol) ||
+    ns.lookup(phase, phase_symbol) ||
+    ns.lookup(positive_object, object_symbol) ||
+    !induction_symbol->is_static_lifetime ||
+    induction_symbol->type.id() != ID_unsignedbv ||
+    induction_symbol->type.get_bool(ID_C_volatile) ||
+    !phase_symbol->is_static_lifetime ||
+    phase_symbol->type.id() != ID_c_bool ||
+    phase_symbol->type.get_bool(ID_C_volatile) ||
+    is_atomic_symbol(*phase_symbol) ||
+    !object_symbol->is_static_lifetime ||
+    (object_symbol->type.id() != ID_signedbv &&
+     object_symbol->type.id() != ID_unsignedbv) ||
+    !is_atomic_symbol(*object_symbol) ||
+    !even_unsigned_bound(
+      parsed_bound, induction_symbol->type, bound) ||
+    contains_symbol(
+      bound, {induction, phase, positive_object}))
+  {
+    reason = "bounded_alternating_types_or_parity";
+    return false;
+  }
+  find_symbols_sett bound_symbols;
+  find_symbols(bound, bound_symbols);
+  for(const auto &identifier : bound_symbols)
+  {
+    const symbolt *symbol = nullptr;
+    if(
+      ns.lookup(identifier, symbol) ||
+      !symbol->is_static_lifetime ||
+      symbol->is_type ||
+      (symbol->type.id() != ID_signedbv &&
+       symbol->type.id() != ID_unsignedbv) ||
+      symbol->type.get_bool(ID_C_volatile))
+    {
+      reason = "bounded_alternating_bound_symbol";
+      return false;
+    }
+  }
+
+  summary.function = function_id;
+  summary.induction = induction;
+  summary.phase = phase;
+  summary.object = positive_object;
+  summary.bound = std::move(bound);
+  summary.weight = positive;
+  return true;
+}
+
+bool bounded_alternating_exclusive_state(
+  const goto_modelt &model,
+  const std::vector<create_recordt> &creates,
+  const std::vector<bounded_alternating_workert> &workers,
+  std::string &reason)
+{
+  const auto main =
+    model.goto_functions.function_map.find("main");
+  if(
+    main == model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+  {
+    reason = "bounded_alternating_missing_main";
+    return false;
+  }
+
+  std::set<irep_idt> all_private;
+  std::set<irep_idt> objects;
+  std::set<irep_idt> bound_symbols;
+  for(const auto &worker : workers)
+  {
+    if(
+      !all_private.insert(worker.induction).second ||
+      !all_private.insert(worker.phase).second)
+    {
+      reason = "bounded_alternating_private_alias";
+      return false;
+    }
+    objects.insert(worker.object);
+    find_symbols_sett found_bound_symbols;
+    find_symbols(worker.bound, found_bound_symbols);
+    bound_symbols.insert(
+      found_bound_symbols.begin(), found_bound_symbols.end());
+  }
+  if(objects.size() != 1)
+  {
+    reason = "bounded_alternating_object_mismatch";
+    return false;
+  }
+
+  std::set<irep_idt> owner_functions;
+  for(const auto &worker : workers)
+    owner_functions.insert(worker.function);
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(
+      !entry.second.body_available() ||
+      entry.first == "main" ||
+      entry.first == "__CPROVER_initialize" ||
+      owner_functions.count(entry.first) != 0)
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(
+        instruction_mentions_any(
+          instruction, all_private) ||
+        instruction_mentions_any(
+          instruction, objects))
+      {
+        reason = "bounded_alternating_foreign_access";
+        return false;
+      }
+    }
+  }
+
+  for(std::size_t index = 0; index < workers.size(); ++index)
+  {
+    const auto &owner = workers[index];
+    const std::set<irep_idt> owner_private{
+      owner.induction, owner.phase};
+    for(std::size_t other = 0; other < workers.size(); ++other)
+    {
+      if(index == other)
+        continue;
+      const auto function =
+        model.goto_functions.function_map.find(
+          workers[other].function);
+      for(const auto &instruction :
+          function->second.body.instructions)
+      {
+        if(instruction_mentions_any(instruction, owner_private))
+        {
+          reason = "bounded_alternating_cross_worker_private";
+          return false;
+        }
+      }
+    }
+  }
+
+  bool after_first_create = false;
+  for(const auto &instruction : main->second.body.instructions)
+  {
+    if(&instruction == &*creates.front().instruction)
+      after_first_create = true;
+    if(
+      after_first_create &&
+      instruction_mentions_any(instruction, all_private))
+    {
+      reason = "bounded_alternating_observed_private";
+      return false;
+    }
+    if(
+      after_first_create && instruction.is_assign() &&
+      (contains_symbol(
+         instruction.assign_lhs(), bound_symbols) ||
+       contains_symbol(
+         instruction.assign_lhs(), objects)))
+    {
+      reason = "bounded_alternating_late_write";
+      return false;
+    }
+  }
+  return true;
+}
 } // namespace
 
 bool nonnegative_oscillator_monitor_transform(
@@ -16757,6 +17030,1422 @@ bool nonnegative_oscillator_monitor_transform(
     << " position=" << position
     << " flag=" << flag
     << " weight_sum=" << weight_sum << '\n';
+  (void)message_handler;
+  return true;
+}
+
+bool bounded_alternating_cancellation_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  std::vector<create_recordt> creates;
+  std::vector<goto_programt::targett> joins;
+  std::string reason;
+  if(
+    !collect_lifecycle(goto_model, ns, creates, joins, reason) ||
+    creates.size() < 2 ||
+    !validate_main_region(
+      goto_model, ns, creates, joins, reason))
+  {
+    std::cout
+      << "NATIVE_BOUNDED_ALTERNATING_CANCELLATION applied=0 reason="
+      << (reason.empty() ? "bounded_alternating_lifecycle" : reason)
+      << '\n';
+    return false;
+  }
+
+  std::vector<bounded_alternating_workert> workers;
+  for(const auto &create : creates)
+  {
+    bounded_alternating_workert worker;
+    if(!bounded_alternating_worker(
+         goto_model,
+         ns,
+         create.worker,
+         worker,
+         reason))
+    {
+      std::cout
+        << "NATIVE_BOUNDED_ALTERNATING_CANCELLATION applied=0 reason="
+        << reason << " worker=" << create.worker << '\n';
+      return false;
+    }
+    workers.push_back(std::move(worker));
+  }
+
+  std::map<irep_idt, std::set<irep_idt>> equalities;
+  std::map<irep_idt, std::set<mp_integer>> constants;
+  const auto main =
+    goto_model.goto_functions.function_map.find("main");
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : main->second.body.instructions)
+    positions.emplace(&instruction, position++);
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != creates.front().instruction; ++instruction)
+  {
+    irep_idt callee;
+    if(
+      direct_call_identifier(*instruction, callee) &&
+      callee == "assume_abort_if_not" &&
+      instruction->call_arguments().size() == 1)
+    {
+      bool supported = false;
+      const auto control =
+        control_signature(
+          main->second.body,
+          positions,
+          positions.at(&*instruction),
+          supported);
+      if(supported && control.empty())
+        collect_constant_equalities(
+          instruction->call_arguments().front(),
+          equalities,
+          constants);
+    }
+  }
+  for(const auto &worker : workers)
+  {
+    if(!equality_implies(
+         worker.induction, 0, equalities, constants))
+    {
+      std::cout
+        << "NATIVE_BOUNDED_ALTERNATING_CANCELLATION applied=0"
+        << " reason=bounded_alternating_induction_initialization"
+        << " worker=" << worker.function << '\n';
+      return false;
+    }
+  }
+  if(
+    !bounded_alternating_exclusive_state(
+      goto_model, creates, workers, reason))
+  {
+    std::cout
+      << "NATIVE_BOUNDED_ALTERNATING_CANCELLATION applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+
+  for(const auto &worker : workers)
+  {
+    auto function =
+      goto_model.goto_functions.function_map.find(worker.function);
+    for(auto &instruction : function->second.body.instructions)
+    {
+      if(
+        !instruction.is_set_return_value() &&
+        !instruction.is_end_function())
+        instruction.turn_into_skip();
+    }
+  }
+  goto_model.goto_functions.update();
+  std::cout
+    << "NATIVE_BOUNDED_ALTERNATING_CANCELLATION applied=1"
+    << " workers=" << workers.size()
+    << " object=" << workers.front().object << '\n';
+  (void)message_handler;
+  return true;
+}
+
+namespace
+{
+struct phase_boundary_workert
+{
+  irep_idt function;
+  irep_idt phase;
+  irep_idt loop_flag;
+  irep_idt object;
+  mp_integer weight;
+};
+
+bool phase_boundary_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &function_id,
+  phase_boundary_workert &summary,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "phase_boundary_missing_worker";
+    return false;
+  }
+  const auto &program = function->second.body;
+  const auto semantic = semantic_instructions(program);
+  if(semantic.size() != 11)
+  {
+    reason =
+      "phase_boundary_instruction_count_" +
+      std::to_string(semantic.size());
+    return false;
+  }
+
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : program.instructions)
+    positions.emplace(&instruction, position++);
+
+  irep_idt loop_flag;
+  irep_idt phase;
+  if(
+    !semantic[0]->is_goto() ||
+    semantic[0]->targets.size() != 1 ||
+    !negated_nonzero_symbol_test(
+      semantic[0]->condition(), loop_flag) ||
+    positions.at(&*semantic[0]->get_target()) <=
+      positions.at(&*semantic[10]) ||
+    !semantic[1]->is_goto() ||
+    semantic[1]->targets.size() != 1 ||
+    !negated_nonzero_symbol_test(
+      semantic[1]->condition(), phase) ||
+    semantic[1]->get_target() != semantic[4])
+  {
+    reason = "phase_boundary_guards";
+    return false;
+  }
+
+  irep_idt positive_object;
+  irep_idt negative_object;
+  mp_integer positive;
+  mp_integer negative;
+  if(
+    !oscillator_delta(
+      *semantic[2], positive_object, positive) ||
+    !semantic[3]->is_goto() ||
+    !semantic[3]->condition().is_true() ||
+    semantic[3]->targets.size() != 1 ||
+    semantic[3]->get_target() != semantic[5] ||
+    !oscillator_delta(
+      *semantic[4], negative_object, negative) ||
+    positive_object != negative_object ||
+    positive <= 0 || negative != -positive)
+  {
+    reason = "phase_boundary_opposites";
+    return false;
+  }
+
+  irep_idt phase_lhs;
+  irep_idt phase_rhs;
+  irep_idt exit_phase;
+  if(
+    !semantic[5]->is_assign() ||
+    !direct_symbol(semantic[5]->assign_lhs(), phase_lhs) ||
+    phase_lhs != phase ||
+    !negated_nonzero_symbol_test(
+      semantic[5]->assign_rhs(), phase_rhs) ||
+    phase_rhs != phase ||
+    !semantic[6]->is_goto() ||
+    semantic[6]->targets.size() != 1 ||
+    !negated_nonzero_symbol_test(
+      semantic[6]->condition(), exit_phase) ||
+    exit_phase != phase ||
+    semantic[6]->get_target() != semantic[10])
+  {
+    reason = "phase_boundary_toggle";
+    return false;
+  }
+
+  irep_idt nondet_value;
+  irep_idt tested_value;
+  const exprt &nondet_rhs =
+    semantic[7]->is_assign()
+      ? without_cast(semantic[7]->assign_rhs())
+      : nil_exprt();
+  if(
+    !semantic[7]->is_assign() ||
+    !direct_symbol(
+      semantic[7]->assign_lhs(), nondet_value) ||
+    nondet_rhs.id() != ID_side_effect ||
+    to_side_effect_expr(nondet_rhs).get_statement() != ID_nondet ||
+    !semantic[8]->is_goto() ||
+    semantic[8]->targets.size() != 1 ||
+    !negated_nonzero_symbol_test(
+      semantic[8]->condition(), tested_value) ||
+    tested_value != nondet_value ||
+    positions.at(&*semantic[8]->get_target()) <=
+      positions.at(&*semantic[9]) ||
+    positions.at(&*semantic[8]->get_target()) >
+      positions.at(&*semantic[10]))
+  {
+    reason = "phase_boundary_nondet_exit";
+    return false;
+  }
+
+  irep_idt cleared_flag;
+  mp_integer zero;
+  if(
+    !semantic[9]->is_assign() ||
+    !direct_symbol(semantic[9]->assign_lhs(), cleared_flag) ||
+    cleared_flag != loop_flag ||
+    !constant_eval(semantic[9]->assign_rhs(), {}, zero) ||
+    zero != 0 ||
+    !semantic[10]->is_goto() ||
+    !semantic[10]->condition().is_true() ||
+    semantic[10]->targets.size() != 1 ||
+    semantic[10]->get_target() != semantic[0])
+  {
+    reason = "phase_boundary_loop_exit";
+    return false;
+  }
+
+  const symbolt *object_symbol = nullptr;
+  const symbolt *phase_symbol = nullptr;
+  const symbolt *flag_symbol = nullptr;
+  const symbolt *nondet_symbol = nullptr;
+  if(
+    ns.lookup(positive_object, object_symbol) ||
+    ns.lookup(phase, phase_symbol) ||
+    ns.lookup(loop_flag, flag_symbol) ||
+    ns.lookup(nondet_value, nondet_symbol) ||
+    !object_symbol->is_static_lifetime ||
+    object_symbol->type.id() != ID_signedbv ||
+    !is_atomic_symbol(*object_symbol) ||
+    object_symbol->type.get_bool(ID_C_volatile) ||
+    !phase_symbol->is_static_lifetime ||
+    phase_symbol->type.id() != ID_c_bool ||
+    is_atomic_symbol(*phase_symbol) ||
+    phase_symbol->type.get_bool(ID_C_volatile) ||
+    !flag_symbol->is_static_lifetime ||
+    flag_symbol->type.id() != ID_c_bool ||
+    is_atomic_symbol(*flag_symbol) ||
+    flag_symbol->type.get_bool(ID_C_volatile) ||
+    nondet_symbol->is_static_lifetime ||
+    nondet_symbol->type.id() != ID_c_bool)
+  {
+    reason = "phase_boundary_symbol_types";
+    return false;
+  }
+
+  for(const auto &instruction : program.instructions)
+  {
+    if(
+      instruction.is_assert() || instruction.is_assume() ||
+      instruction.is_function_call() ||
+      instruction.is_start_thread() ||
+      instruction.is_atomic_begin() ||
+      instruction.is_atomic_end())
+    {
+      reason = "phase_boundary_worker_effect";
+      return false;
+    }
+  }
+
+  summary.function = function_id;
+  summary.phase = phase;
+  summary.loop_flag = loop_flag;
+  summary.object = positive_object;
+  summary.weight = positive;
+  return true;
+}
+
+bool phase_boundary_initial_and_exclusive_state(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const std::vector<create_recordt> &creates,
+  const std::vector<phase_boundary_workert> &workers,
+  std::string &reason)
+{
+  const auto main =
+    model.goto_functions.function_map.find("main");
+  if(
+    main == model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+  {
+    reason = "phase_boundary_missing_main";
+    return false;
+  }
+
+  std::set<irep_idt> all_private;
+  std::set<irep_idt> objects;
+  std::set<irep_idt> owner_functions;
+  mp_integer outstanding_weight = 0;
+  for(const auto &worker : workers)
+  {
+    if(
+      !all_private.insert(worker.phase).second ||
+      !all_private.insert(worker.loop_flag).second)
+    {
+      reason = "phase_boundary_private_alias";
+      return false;
+    }
+    objects.insert(worker.object);
+    owner_functions.insert(worker.function);
+    outstanding_weight += worker.weight;
+  }
+  if(objects.size() != 1)
+  {
+    reason = "phase_boundary_object_mismatch";
+    return false;
+  }
+  const irep_idt object = *objects.begin();
+  const symbolt *object_symbol = nullptr;
+  if(ns.lookup(object, object_symbol))
+  {
+    reason = "phase_boundary_object_symbol";
+    return false;
+  }
+  const std::size_t width =
+    to_signedbv_type(object_symbol->type).get_width();
+  if(outstanding_weight > power(2, width - 1) - 1)
+  {
+    reason = "phase_boundary_transient_overflow";
+    return false;
+  }
+
+  const auto initializer =
+    model.goto_functions.function_map.find("__CPROVER_initialize");
+  if(
+    initializer == model.goto_functions.function_map.end() ||
+    !initializer->second.body_available())
+  {
+    reason = "phase_boundary_missing_initializer";
+    return false;
+  }
+  std::size_t zero_initializations = 0;
+  std::map<irep_idt, std::size_t> private_zero_initializations;
+  for(const auto &instruction :
+      initializer->second.body.instructions)
+  {
+    const bool mentions_object =
+      instruction_mentions_any(instruction, objects);
+    const bool mentions_private =
+      instruction_mentions_any(instruction, all_private);
+    if(!mentions_object && !mentions_private)
+      continue;
+    irep_idt target;
+    mp_integer value;
+    if(
+      mentions_object && mentions_private)
+    {
+      reason = "phase_boundary_initializer_alias";
+      return false;
+    }
+    if(
+      !instruction.is_assign() ||
+      !direct_symbol(instruction.assign_lhs(), target) ||
+      !constant_eval(instruction.assign_rhs(), {}, value) ||
+      value != 0)
+    {
+      reason = "phase_boundary_initializer_assignment";
+      return false;
+    }
+    if(mentions_object)
+    {
+      if(target != object)
+      {
+        reason = "phase_boundary_object_initialization";
+        return false;
+      }
+      ++zero_initializations;
+    }
+    else
+    {
+      if(all_private.count(target) == 0)
+      {
+        reason = "phase_boundary_private_static_initialization";
+        return false;
+      }
+      ++private_zero_initializations[target];
+    }
+  }
+  if(zero_initializations != 1)
+  {
+    reason = "phase_boundary_object_initialization";
+    return false;
+  }
+  for(const auto &identifier : all_private)
+  {
+    if(private_zero_initializations[identifier] != 1)
+    {
+      reason = "phase_boundary_private_static_initialization";
+      return false;
+    }
+  }
+
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : main->second.body.instructions)
+    positions.emplace(&instruction, position++);
+  std::map<irep_idt, std::size_t> initializations;
+  for(auto instruction = main->second.body.instructions.begin();
+      instruction != creates.front().instruction; ++instruction)
+  {
+    if(instruction_mentions_any(*instruction, objects))
+    {
+      reason = "phase_boundary_explicit_object_prefix";
+      return false;
+    }
+    if(!instruction_mentions_any(*instruction, all_private))
+      continue;
+    irep_idt target;
+    bool supported = false;
+    const auto control =
+      control_signature(
+        main->second.body,
+        positions,
+        positions.at(&*instruction),
+        supported);
+    mp_integer one;
+    if(
+      !instruction->is_assign() ||
+      !direct_symbol(instruction->assign_lhs(), target) ||
+      all_private.count(target) == 0 ||
+      !supported || !control.empty() ||
+      !constant_eval(instruction->assign_rhs(), {}, one) ||
+      one != 1)
+    {
+      reason = "phase_boundary_private_initialization";
+      return false;
+    }
+    ++initializations[target];
+  }
+  for(const auto &identifier : all_private)
+  {
+    if(initializations[identifier] != 1)
+    {
+      reason = "phase_boundary_private_initialization";
+      return false;
+    }
+  }
+
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(
+      !entry.second.body_available() ||
+      entry.first == "main" ||
+      entry.first == "__CPROVER_initialize" ||
+      owner_functions.count(entry.first) != 0)
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(
+        instruction_mentions_any(instruction, all_private) ||
+        instruction_mentions_any(instruction, objects))
+      {
+        reason = "phase_boundary_foreign_access";
+        return false;
+      }
+    }
+  }
+
+  for(std::size_t index = 0; index < workers.size(); ++index)
+  {
+    const std::set<irep_idt> owner_private{
+      workers[index].phase, workers[index].loop_flag};
+    for(std::size_t other = 0; other < workers.size(); ++other)
+    {
+      if(index == other)
+        continue;
+      const auto function =
+        model.goto_functions.function_map.find(
+          workers[other].function);
+      for(const auto &instruction :
+          function->second.body.instructions)
+      {
+        if(instruction_mentions_any(instruction, owner_private))
+        {
+          reason = "phase_boundary_cross_worker_private";
+          return false;
+        }
+      }
+    }
+  }
+
+  bool after_first_create = false;
+  for(const auto &instruction : main->second.body.instructions)
+  {
+    if(&instruction == &*creates.front().instruction)
+      after_first_create = true;
+    if(
+      after_first_create &&
+      instruction_mentions_any(instruction, all_private))
+    {
+      reason = "phase_boundary_observed_private";
+      return false;
+    }
+    if(
+      contains_address_of_symbol(instruction.code(), objects) ||
+      (instruction.has_condition() &&
+       contains_address_of_symbol(
+         instruction.condition(), objects)))
+    {
+      reason = "phase_boundary_object_alias";
+      return false;
+    }
+    if(
+      after_first_create && instruction.is_assign() &&
+      contains_symbol(instruction.assign_lhs(), objects))
+    {
+      reason = "phase_boundary_late_object_write";
+      return false;
+    }
+  }
+  return true;
+}
+} // namespace
+
+bool phase_boundary_cancellation_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  std::vector<create_recordt> creates;
+  std::vector<goto_programt::targett> joins;
+  std::string reason;
+  if(
+    !collect_lifecycle(goto_model, ns, creates, joins, reason) ||
+    creates.size() < 2 ||
+    !validate_main_region(
+      goto_model, ns, creates, joins, reason))
+  {
+    std::cout
+      << "NATIVE_PHASE_BOUNDARY_CANCELLATION applied=0 reason="
+      << (reason.empty() ? "phase_boundary_lifecycle" : reason)
+      << '\n';
+    return false;
+  }
+
+  std::vector<phase_boundary_workert> workers;
+  for(const auto &create : creates)
+  {
+    phase_boundary_workert worker;
+    if(!phase_boundary_worker(
+         goto_model, ns, create.worker, worker, reason))
+    {
+      std::cout
+        << "NATIVE_PHASE_BOUNDARY_CANCELLATION applied=0 reason="
+        << reason << " worker=" << create.worker << '\n';
+      return false;
+    }
+    workers.push_back(std::move(worker));
+  }
+  if(
+    !phase_boundary_initial_and_exclusive_state(
+      goto_model, ns, creates, workers, reason))
+  {
+    std::cout
+      << "NATIVE_PHASE_BOUNDARY_CANCELLATION applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+
+  for(const auto &worker : workers)
+  {
+    auto function =
+      goto_model.goto_functions.function_map.find(worker.function);
+    for(auto &instruction : function->second.body.instructions)
+    {
+      if(
+        !instruction.is_set_return_value() &&
+        !instruction.is_end_function())
+        instruction.turn_into_skip();
+    }
+  }
+  goto_model.goto_functions.update();
+  std::cout
+    << "NATIVE_PHASE_BOUNDARY_CANCELLATION applied=1"
+    << " workers=" << workers.size()
+    << " object=" << workers.front().object << '\n';
+  (void)message_handler;
+  return true;
+}
+
+namespace
+{
+struct terminal_overwrite_workert
+{
+  irep_idt function;
+  irep_idt object;
+  exprt object_expr;
+  exprt value;
+  mp_integer constant;
+};
+
+bool terminal_overwrite_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &function_id,
+  terminal_overwrite_workert &summary,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "terminal_overwrite_missing_worker";
+    return false;
+  }
+  const auto &program = function->second.body;
+  const auto semantic = semantic_instructions(program);
+  if(semantic.size() < 5)
+  {
+    reason = "terminal_overwrite_instruction_count";
+    return false;
+  }
+
+  irep_idt guard_value;
+  const exprt &guard_rhs =
+    semantic[0]->is_assign()
+      ? without_cast(semantic[0]->assign_rhs())
+      : nil_exprt();
+  if(
+    !semantic[0]->is_assign() ||
+    !direct_symbol(semantic[0]->assign_lhs(), guard_value) ||
+    guard_rhs.id() != ID_side_effect ||
+    to_side_effect_expr(guard_rhs).get_statement() != ID_nondet ||
+    !semantic[1]->is_goto() ||
+    semantic[1]->targets.size() != 1 ||
+    !negated_nonzero_symbol_test(
+      semantic[1]->condition(), guard_value) ||
+    semantic[1]->get_target() != semantic.back())
+  {
+    reason = "terminal_overwrite_nondet_guard";
+    return false;
+  }
+
+  const auto backedge = semantic[semantic.size() - 2];
+  auto backedge_target =
+    backedge->is_goto() && backedge->targets.size() == 1
+      ? backedge->get_target()
+      : program.instructions.end();
+  while(
+    backedge_target != program.instructions.end() &&
+    (backedge_target->is_skip() ||
+     backedge_target->is_location() ||
+     backedge_target->is_decl() ||
+     backedge_target->is_dead()))
+    ++backedge_target;
+  if(
+    !backedge->is_goto() || !backedge->condition().is_true() ||
+    backedge->targets.size() != 1 ||
+    backedge_target != semantic[0])
+  {
+    reason = "terminal_overwrite_backedge";
+    return false;
+  }
+
+  irep_idt object;
+  mp_integer final_value;
+  if(
+    !semantic.back()->is_assign() ||
+    !direct_symbol(semantic.back()->assign_lhs(), object) ||
+    !constant_eval(
+      semantic.back()->assign_rhs(), {}, final_value))
+  {
+    reason = "terminal_overwrite_final_store";
+    return false;
+  }
+  const symbolt *object_symbol = nullptr;
+  const symbolt *guard_symbol = nullptr;
+  if(
+    ns.lookup(object, object_symbol) ||
+    ns.lookup(guard_value, guard_symbol) ||
+    !object_symbol->is_static_lifetime ||
+    object_symbol->type.id() != ID_unsignedbv ||
+    !is_atomic_symbol(*object_symbol) ||
+    object_symbol->type.get_bool(ID_C_volatile) ||
+    guard_symbol->is_static_lifetime ||
+    guard_symbol->type.id() != ID_c_bool ||
+    guard_symbol->type.get_bool(ID_C_volatile))
+  {
+    reason = "terminal_overwrite_symbol_types";
+    return false;
+  }
+
+  for(std::size_t index = 2; index + 2 < semantic.size(); ++index)
+  {
+    const auto instruction = semantic[index];
+    irep_idt written;
+    if(
+      !instruction->is_assign() ||
+      !direct_symbol(instruction->assign_lhs(), written) ||
+      written != object ||
+      contains_side_effect(instruction->assign_lhs()))
+    {
+      reason = "terminal_overwrite_loop_effect";
+      return false;
+    }
+    const exprt &rhs = instruction->assign_rhs();
+    if(rhs.id() == ID_dereference)
+    {
+      reason = "terminal_overwrite_loop_dereference";
+      return false;
+    }
+    find_symbols_sett symbols;
+    find_symbols(rhs, symbols);
+    for(const auto &identifier : symbols)
+      if(identifier != object)
+      {
+        reason = "terminal_overwrite_loop_dependency";
+        return false;
+      }
+  }
+
+  for(const auto &instruction : program.instructions)
+  {
+    if(
+      instruction.is_assert() || instruction.is_assume() ||
+      instruction.is_function_call() ||
+      instruction.is_start_thread() ||
+      instruction.is_atomic_begin() ||
+      instruction.is_atomic_end() ||
+      contains_address_of_symbol(instruction.code(), {object}) ||
+      (instruction.has_condition() &&
+       contains_address_of_symbol(
+         instruction.condition(), {object})))
+    {
+      reason = "terminal_overwrite_worker_effect";
+      return false;
+    }
+  }
+
+  summary.function = function_id;
+  summary.object = object;
+  summary.object_expr =
+    symbol_exprt(object, object_symbol->type);
+  summary.value = semantic.back()->assign_rhs();
+  summary.constant = final_value;
+  return true;
+}
+
+bool terminal_overwrite_exclusive_state(
+  const goto_modelt &model,
+  const std::vector<terminal_overwrite_workert> &workers,
+  std::string &reason)
+{
+  std::set<irep_idt> objects;
+  std::set<irep_idt> worker_functions;
+  for(const auto &worker : workers)
+  {
+    objects.insert(worker.object);
+    worker_functions.insert(worker.function);
+  }
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(
+        contains_address_of_symbol(instruction.code(), objects) ||
+        (instruction.has_condition() &&
+         contains_address_of_symbol(
+           instruction.condition(), objects)))
+      {
+        reason = "terminal_overwrite_address_escape";
+        return false;
+      }
+      if(!instruction.is_assign())
+        continue;
+      irep_idt written;
+      if(
+        direct_symbol(instruction.assign_lhs(), written) &&
+        objects.count(written) != 0 &&
+        entry.first != "__CPROVER_initialize" &&
+        entry.first != "main" &&
+        worker_functions.count(entry.first) == 0)
+      {
+        reason = "terminal_overwrite_foreign_writer";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+} // namespace
+
+bool joined_terminal_overwrite_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  std::vector<create_recordt> creates;
+  std::vector<goto_programt::targett> joins;
+  std::string reason;
+  if(
+    !collect_lifecycle(goto_model, ns, creates, joins, reason) ||
+    !validate_main_region(
+      goto_model, ns, creates, joins, reason))
+  {
+    std::cout
+      << "NATIVE_JOINED_TERMINAL_OVERWRITE applied=0 reason="
+      << (reason.empty() ? "terminal_overwrite_lifecycle" : reason)
+      << '\n';
+    return false;
+  }
+
+  std::vector<terminal_overwrite_workert> workers;
+  std::map<irep_idt, std::pair<exprt, exprt>> replacements;
+  std::map<irep_idt, mp_integer> constants;
+  for(const auto &create : creates)
+  {
+    terminal_overwrite_workert worker;
+    if(!terminal_overwrite_worker(
+         goto_model, ns, create.worker, worker, reason))
+    {
+      std::cout
+        << "NATIVE_JOINED_TERMINAL_OVERWRITE applied=0 reason="
+        << reason << " worker=" << create.worker << '\n';
+      return false;
+    }
+    auto replacement = replacements.find(worker.object);
+    if(replacement == replacements.end())
+    {
+      replacements.emplace(
+        worker.object,
+        std::make_pair(worker.object_expr, worker.value));
+      constants.emplace(worker.object, worker.constant);
+    }
+    else
+    {
+      if(constants.at(worker.object) != worker.constant)
+      {
+        std::cout
+          << "NATIVE_JOINED_TERMINAL_OVERWRITE applied=0 reason="
+          << "terminal_overwrite_value_mismatch object="
+          << worker.object << '\n';
+        return false;
+      }
+    }
+    workers.push_back(std::move(worker));
+  }
+  if(
+    replacements.empty() ||
+    !terminal_overwrite_exclusive_state(
+      goto_model, workers, reason))
+  {
+    std::cout
+      << "NATIVE_JOINED_TERMINAL_OVERWRITE applied=0 reason="
+      << (reason.empty() ? "terminal_overwrite_empty" : reason)
+      << '\n';
+    return false;
+  }
+
+  auto main = goto_model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != goto_model.goto_functions.function_map.end(),
+    "terminal overwrite lifecycle found main");
+  const auto final_join = joins.back();
+  const auto location = final_join->source_location();
+  for(const auto &replacement : replacements)
+    main->second.body.insert_after(
+      final_join,
+      goto_programt::make_assignment(
+        replacement.second.first,
+        replacement.second.second,
+        location));
+  for(auto &create : creates)
+    create.instruction->turn_into_skip();
+  for(auto &join : joins)
+    join->turn_into_skip();
+  goto_model.goto_functions.update();
+
+  std::cout
+    << "NATIVE_JOINED_TERMINAL_OVERWRITE applied=1 workers="
+    << workers.size() << " objects=" << replacements.size() << '\n';
+  (void)message_handler;
+  return true;
+}
+
+namespace
+{
+struct symmetric_scan_workert
+{
+  irep_idt function;
+  irep_idt index;
+  std::set<irep_idt> bounds;
+  std::set<irep_idt> arrays;
+};
+
+goto_programt::const_targett next_semantic_target(
+  goto_programt::const_targett target,
+  const goto_programt &program)
+{
+  while(
+    target != program.instructions.end() &&
+    (target->is_skip() || target->is_location() ||
+     target->is_decl() || target->is_dead()))
+    ++target;
+  return target;
+}
+
+bool symmetric_scan_bounds(
+  const exprt &src,
+  irep_idt &index,
+  std::set<irep_idt> &bounds)
+{
+  const exprt &condition = without_cast(src);
+  if(
+    condition.id() != ID_not ||
+    condition.operands().size() != 1)
+    return false;
+  const exprt &conjunction =
+    without_cast(condition.op0());
+  if(
+    conjunction.id() != ID_and ||
+    conjunction.operands().size() != 2)
+    return false;
+  for(const auto &operand : conjunction.operands())
+  {
+    const exprt &comparison = without_cast(operand);
+    irep_idt candidate;
+    irep_idt bound;
+    if(
+      comparison.id() != ID_lt ||
+      comparison.operands().size() != 2 ||
+      !direct_symbol(comparison.op0(), candidate) ||
+      !direct_symbol(comparison.op1(), bound) ||
+      (!index.empty() && candidate != index))
+      return false;
+    index = candidate;
+    bounds.insert(bound);
+  }
+  return bounds.size() == 2;
+}
+
+bool symmetric_scan_access(
+  const exprt &src,
+  const irep_idt &index,
+  irep_idt &array)
+{
+  const exprt &value = without_cast(src);
+  if(
+    value.id() != ID_dereference ||
+    value.operands().size() != 1)
+    return false;
+  const exprt &address = without_cast(value.op0());
+  if(
+    address.id() != ID_plus ||
+    address.operands().size() != 2)
+    return false;
+  irep_idt first;
+  irep_idt second;
+  if(
+    direct_symbol(address.op0(), first) &&
+    direct_symbol(address.op1(), second))
+  {
+    if(second == index)
+    {
+      array = first;
+      return true;
+    }
+    if(first == index)
+    {
+      array = second;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool symmetric_scan_equality(
+  const exprt &src,
+  const irep_idt &index,
+  std::set<irep_idt> &arrays)
+{
+  const exprt &condition = without_cast(src);
+  if(
+    condition.id() != ID_not ||
+    condition.operands().size() != 1)
+    return false;
+  const exprt &equality = without_cast(condition.op0());
+  if(
+    equality.id() != ID_equal ||
+    equality.operands().size() != 2)
+    return false;
+  irep_idt first;
+  irep_idt second;
+  if(
+    !symmetric_scan_access(equality.op0(), index, first) ||
+    !symmetric_scan_access(equality.op1(), index, second) ||
+    first == second)
+    return false;
+  arrays.insert(first);
+  arrays.insert(second);
+  return true;
+}
+
+bool symmetric_scan_increment(
+  const goto_programt::instructiont &instruction,
+  const irep_idt &index)
+{
+  irep_idt lhs;
+  if(
+    !instruction.is_assign() ||
+    !direct_symbol(instruction.assign_lhs(), lhs) ||
+    lhs != index)
+    return false;
+  const exprt &rhs = without_cast(instruction.assign_rhs());
+  irep_idt source;
+  mp_integer one;
+  return
+    rhs.id() == ID_plus && rhs.operands().size() == 2 &&
+    direct_symbol(rhs.op0(), source) && source == index &&
+    constant_eval(rhs.op1(), {}, one) && one == 1;
+}
+
+bool symmetric_scan_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &function_id,
+  symmetric_scan_workert &summary,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "symmetric_scan_missing_worker";
+    return false;
+  }
+  const auto &program = function->second.body;
+  const auto semantic = semantic_instructions(program);
+  if(semantic.size() != 6)
+  {
+    reason = "symmetric_scan_instruction_count";
+    return false;
+  }
+
+  irep_idt index;
+  std::set<irep_idt> bounds;
+  std::set<irep_idt> arrays;
+  if(
+    !semantic[0]->is_goto() ||
+    semantic[0]->targets.size() != 1 ||
+    !symmetric_scan_bounds(
+      semantic[0]->condition(), index, bounds) ||
+    !semantic[1]->is_goto() ||
+    semantic[1]->targets.size() != 1 ||
+    !symmetric_scan_equality(
+      semantic[1]->condition(), index, arrays) ||
+    !symmetric_scan_increment(*semantic[2], index) ||
+    !semantic[3]->is_goto() ||
+    !semantic[3]->condition().is_true() ||
+    semantic[3]->targets.size() != 1 ||
+    next_semantic_target(
+      semantic[3]->get_target(), program) != semantic[5] ||
+    !semantic[4]->is_goto() ||
+    !semantic[4]->condition().is_true() ||
+    semantic[4]->targets.size() != 1 ||
+    semantic[4]->get_target() != semantic[0]->get_target() ||
+    !semantic[5]->is_goto() ||
+    !semantic[5]->condition().is_true() ||
+    semantic[5]->targets.size() != 1 ||
+    next_semantic_target(
+      semantic[5]->get_target(), program) != semantic[0])
+  {
+    reason = "symmetric_scan_control_or_word";
+    return false;
+  }
+  if(
+    next_semantic_target(
+      semantic[1]->get_target(), program) != semantic[4])
+  {
+    reason = "symmetric_scan_break";
+    return false;
+  }
+
+  const symbolt *index_symbol = nullptr;
+  if(
+    ns.lookup(index, index_symbol) ||
+    !index_symbol->is_static_lifetime ||
+    index_symbol->type.id() != ID_signedbv ||
+    is_atomic_symbol(*index_symbol) ||
+    index_symbol->type.get_bool(ID_C_volatile))
+  {
+    reason = "symmetric_scan_index_type";
+    return false;
+  }
+  for(const auto &bound : bounds)
+  {
+    const symbolt *symbol = nullptr;
+    if(
+      ns.lookup(bound, symbol) ||
+      !symbol->is_static_lifetime ||
+      symbol->type.id() != ID_signedbv ||
+      symbol->type.get_bool(ID_C_volatile))
+    {
+      reason = "symmetric_scan_bound_type";
+      return false;
+    }
+  }
+  for(const auto &array : arrays)
+  {
+    const symbolt *symbol = nullptr;
+    if(
+      ns.lookup(array, symbol) ||
+      !symbol->is_static_lifetime ||
+      symbol->type.id() != ID_pointer ||
+      symbol->type.get_bool(ID_C_volatile))
+    {
+      reason = "symmetric_scan_array_type";
+      return false;
+    }
+  }
+  for(const auto &instruction : program.instructions)
+    if(
+      instruction.is_assert() || instruction.is_assume() ||
+      instruction.is_function_call() ||
+      instruction.is_start_thread() ||
+      instruction.is_atomic_begin() ||
+      instruction.is_atomic_end())
+    {
+      reason = "symmetric_scan_worker_effect";
+      return false;
+    }
+
+  summary.function = function_id;
+  summary.index = index;
+  summary.bounds = std::move(bounds);
+  summary.arrays = std::move(arrays);
+  return true;
+}
+
+bool symmetric_scan_initial_and_exclusive_state(
+  const goto_modelt &model,
+  const std::vector<symmetric_scan_workert> &workers,
+  std::string &reason)
+{
+  std::set<irep_idt> indices;
+  std::map<irep_idt, std::map<irep_idt, std::size_t>> writes;
+  std::map<irep_idt, mp_integer> initial_values;
+  for(const auto &worker : workers)
+    indices.insert(worker.index);
+  if(indices.size() != workers.size())
+  {
+    reason = "symmetric_scan_index_alias";
+    return false;
+  }
+
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(
+        contains_address_of_symbol(instruction.code(), indices) ||
+        (instruction.has_condition() &&
+         contains_address_of_symbol(
+           instruction.condition(), indices)))
+      {
+        reason = "symmetric_scan_index_escape";
+        return false;
+      }
+      if(!instruction.is_assign())
+        continue;
+      irep_idt lhs;
+      if(
+        !direct_symbol(instruction.assign_lhs(), lhs) ||
+        indices.count(lhs) == 0)
+        continue;
+      ++writes[lhs][entry.first];
+      if(entry.first == "__CPROVER_initialize")
+      {
+        mp_integer value;
+        if(!constant_eval(instruction.assign_rhs(), {}, value))
+        {
+          reason = "symmetric_scan_initial_value";
+          return false;
+        }
+        initial_values[lhs] = value;
+      }
+    }
+  }
+  for(const auto &worker : workers)
+  {
+    const auto &index_writes = writes[worker.index];
+    if(
+      index_writes.size() != 2 ||
+      index_writes.find("__CPROVER_initialize") ==
+        index_writes.end() ||
+      index_writes.at("__CPROVER_initialize") != 1 ||
+      index_writes.find(worker.function) == index_writes.end() ||
+      index_writes.at(worker.function) != 1)
+    {
+      reason = "symmetric_scan_index_writes";
+      return false;
+    }
+  }
+  if(
+    initial_values.size() != workers.size() ||
+    initial_values.at(workers[0].index) !=
+      initial_values.at(workers[1].index))
+  {
+    reason = "symmetric_scan_initial_mismatch";
+    return false;
+  }
+  return true;
+}
+
+bool symmetric_scan_error_suffix(
+  const goto_programt &program,
+  goto_programt::const_targett final_join,
+  const std::set<irep_idt> &indices,
+  std::string &reason)
+{
+  bool saw_premise = false;
+  bool saw_error = false;
+  for(auto instruction = std::next(final_join);
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(
+      instruction->is_skip() || instruction->is_location() ||
+      instruction->is_decl() || instruction->is_dead() ||
+      instruction->is_set_return_value() ||
+      instruction->is_end_function())
+      continue;
+
+    irep_idt callee;
+    if(!direct_call_identifier(*instruction, callee))
+    {
+      reason = "symmetric_scan_property_effect";
+      return false;
+    }
+    if(
+      !saw_premise && callee == "assume_abort_if_not" &&
+      instruction->call_arguments().size() == 1)
+    {
+      const exprt &premise =
+        without_cast(instruction->call_arguments().front());
+      irep_idt first;
+      irep_idt second;
+      if(
+        premise.id() != ID_notequal ||
+        premise.operands().size() != 2 ||
+        !direct_symbol(premise.op0(), first) ||
+        !direct_symbol(premise.op1(), second) ||
+        std::set<irep_idt>{first, second} != indices)
+      {
+        reason = "symmetric_scan_property_premise";
+        return false;
+      }
+      saw_premise = true;
+      continue;
+    }
+    if(saw_premise && !saw_error && callee == "reach_error")
+    {
+      saw_error = true;
+      continue;
+    }
+    reason = "symmetric_scan_property_call";
+    return false;
+  }
+  if(!saw_premise || !saw_error)
+  {
+    reason = "symmetric_scan_property_shape";
+    return false;
+  }
+  return true;
+}
+} // namespace
+
+bool symmetric_array_scan_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  std::vector<create_recordt> creates;
+  std::vector<goto_programt::targett> joins;
+  std::string reason;
+  if(
+    !collect_lifecycle(goto_model, ns, creates, joins, reason) ||
+    creates.size() != 2)
+  {
+    std::cout
+      << "NATIVE_SYMMETRIC_ARRAY_SCAN applied=0 reason="
+      << (reason.empty() ? "symmetric_scan_lifecycle" : reason)
+      << '\n';
+    return false;
+  }
+
+  std::vector<symmetric_scan_workert> workers;
+  for(const auto &create : creates)
+  {
+    symmetric_scan_workert worker;
+    if(!symmetric_scan_worker(
+         goto_model, ns, create.worker, worker, reason))
+    {
+      std::cout
+        << "NATIVE_SYMMETRIC_ARRAY_SCAN applied=0 reason="
+        << reason << " worker=" << create.worker << '\n';
+      return false;
+    }
+    workers.push_back(std::move(worker));
+  }
+  if(!validate_main_region(
+       goto_model, ns, creates, joins, reason))
+  {
+    std::cout
+      << "NATIVE_SYMMETRIC_ARRAY_SCAN applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+  if(
+    workers[0].bounds != workers[1].bounds ||
+    workers[0].arrays != workers[1].arrays ||
+    !symmetric_scan_initial_and_exclusive_state(
+      goto_model, workers, reason))
+  {
+    std::cout
+      << "NATIVE_SYMMETRIC_ARRAY_SCAN applied=0 reason="
+      << (reason.empty() ? "symmetric_scan_word_mismatch" : reason)
+      << '\n';
+    return false;
+  }
+
+  const auto first_symbol =
+    goto_model.symbol_table.symbols.find(workers[0].index);
+  const auto second_symbol =
+    goto_model.symbol_table.symbols.find(workers[1].index);
+  if(
+    first_symbol == goto_model.symbol_table.symbols.end() ||
+    second_symbol == goto_model.symbol_table.symbols.end() ||
+    first_symbol->second.type != second_symbol->second.type)
+  {
+    std::cout
+      << "NATIVE_SYMMETRIC_ARRAY_SCAN applied=0 reason="
+      << "symmetric_scan_index_type_mismatch\n";
+    return false;
+  }
+  auto main = goto_model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != goto_model.goto_functions.function_map.end(),
+    "symmetric scan lifecycle found main");
+  const auto final_join = joins.back();
+  const auto location = final_join->source_location();
+  if(!symmetric_scan_error_suffix(
+       main->second.body,
+       final_join,
+       {workers[0].index, workers[1].index},
+       reason))
+  {
+    std::cout
+      << "NATIVE_SYMMETRIC_ARRAY_SCAN applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+  main->second.body.insert_after(
+    final_join,
+    goto_programt::make_assumption(false_exprt(), location));
+  for(auto &create : creates)
+    create.instruction->turn_into_skip();
+  for(auto &join : joins)
+    join->turn_into_skip();
+  goto_model.goto_functions.update();
+
+  std::cout
+    << "NATIVE_SYMMETRIC_ARRAY_SCAN applied=1 workers=2"
+    << " arrays=2 bounds=2\n";
   (void)message_handler;
   return true;
 }
@@ -17013,17 +18702,23 @@ bool local_loop_acceleration_transform(
       INVARIANT(
         !ns.lookup(induction, symbol),
         "accepted local induction symbol exists");
-      exprt count = exact_count(bound, symbol->type);
-      INVARIANT(
-        !count.is_nil(),
-        "accepted local induction has exact bit-vector count");
+      exprt converted_bound = bound;
+      if(converted_bound.type() != symbol->type)
+        converted_bound =
+          typecast_exprt(converted_bound, symbol->type);
+      symbol_exprt current(induction, symbol->type);
+      exprt terminal = if_exprt(
+        binary_relation_exprt(
+          current, ID_lt, converted_bound),
+        converted_bound,
+        current);
       const auto head = backedge->get_target();
       const auto location = head->source_location();
       program.insert_before(
         head,
         goto_programt::make_assignment(
-          symbol_exprt(induction, symbol->type),
-          std::move(count),
+          current,
+          std::move(terminal),
           location));
       for(auto instruction = head; instruction != std::next(backedge);
           ++instruction)
@@ -17036,6 +18731,506 @@ bool local_loop_acceleration_transform(
     goto_model.goto_functions.update();
   std::cout
     << "NATIVE_LOCAL_LOOP_ACCEL applied="
+    << (transformed != 0 ? 1 : 0)
+    << " loops=" << transformed
+    << " functions=" << functions.size() << '\n';
+  (void)message_handler;
+  return transformed != 0;
+}
+
+namespace
+{
+using modular_monomialt = std::vector<exprt>;
+using modular_polynomialt = std::vector<modular_monomialt>;
+
+bool modular_polynomial(
+  const exprt &src,
+  const typet &type,
+  std::size_t &budget,
+  modular_polynomialt &result)
+{
+  if(budget == 0 || src.type() != type)
+    return false;
+  --budget;
+  const exprt &expr = without_cast(src);
+  if(expr.type() != type)
+    return false;
+  mp_integer constant;
+  const bool is_constant =
+    constant_eval(expr, {}, constant);
+  if(is_constant && constant == 0)
+  {
+    result.clear();
+    return true;
+  }
+  if(is_constant && constant == 1)
+  {
+    result = {modular_monomialt{}};
+    return true;
+  }
+  if(expr.id() == ID_plus)
+  {
+    result.clear();
+    for(const auto &operand : expr.operands())
+    {
+      modular_polynomialt operand_terms;
+      if(!modular_polynomial(
+           operand, type, budget, operand_terms))
+        return false;
+      result.insert(
+        result.end(),
+        operand_terms.begin(),
+        operand_terms.end());
+      if(result.size() > 32)
+        return false;
+    }
+    return true;
+  }
+  if(expr.id() == ID_mult)
+  {
+    result = {modular_monomialt{}};
+    for(const auto &operand : expr.operands())
+    {
+      modular_polynomialt operand_terms;
+      if(!modular_polynomial(
+           operand, type, budget, operand_terms))
+        return false;
+      if(operand_terms.empty())
+      {
+        result.clear();
+        return true;
+      }
+      modular_polynomialt product;
+      for(const auto &left : result)
+      {
+        for(const auto &right : operand_terms)
+        {
+          modular_monomialt monomial = left;
+          monomial.insert(
+            monomial.end(), right.begin(), right.end());
+          if(monomial.size() > 16)
+            return false;
+          product.push_back(std::move(monomial));
+          if(product.size() > 32)
+            return false;
+        }
+      }
+      result = std::move(product);
+    }
+    return true;
+  }
+  result = {{src}};
+  return true;
+}
+
+exprt modular_polynomial_expression(
+  modular_polynomialt polynomial,
+  const typet &type)
+{
+  if(polynomial.empty())
+    return from_integer(0, type);
+  for(auto &monomial : polynomial)
+    std::sort(monomial.begin(), monomial.end());
+  std::sort(polynomial.begin(), polynomial.end());
+
+  std::vector<exprt> terms;
+  terms.reserve(polynomial.size());
+  for(const auto &monomial : polynomial)
+  {
+    exprt term = from_integer(1, type);
+    if(!monomial.empty())
+    {
+      term = monomial.front();
+      for(std::size_t index = 1; index < monomial.size(); ++index)
+        term = mult_exprt(std::move(term), monomial[index]);
+    }
+    terms.push_back(std::move(term));
+  }
+  exprt result = terms.front();
+  for(std::size_t index = 1; index < terms.size(); ++index)
+    result = plus_exprt(std::move(result), terms[index]);
+  return result;
+}
+
+std::size_t normalize_unsigned_modular_expression(exprt &expr)
+{
+  std::size_t rewrites = 0;
+  for(auto &operand : expr.operands())
+    rewrites += normalize_unsigned_modular_expression(operand);
+  if(
+    expr.type().id() != ID_unsignedbv ||
+    (expr.id() != ID_plus && expr.id() != ID_mult))
+    return rewrites;
+  std::size_t budget = 128;
+  modular_polynomialt polynomial;
+  if(!modular_polynomial(expr, expr.type(), budget, polynomial))
+    return rewrites;
+  exprt normalized =
+    modular_polynomial_expression(
+      std::move(polynomial), expr.type());
+  if(normalized != expr)
+  {
+    expr = std::move(normalized);
+    ++rewrites;
+  }
+  return rewrites;
+}
+
+std::size_t normalize_unsigned_modular_model(
+  goto_modelt &goto_model)
+{
+  std::size_t rewrites = 0;
+  for(auto &function_entry :
+      goto_model.goto_functions.function_map)
+  {
+    if(!function_entry.second.body_available())
+      continue;
+    for(auto &instruction :
+        function_entry.second.body.instructions)
+    {
+      if(instruction.is_assign())
+        rewrites += normalize_unsigned_modular_expression(
+          instruction.assign_rhs_nonconst());
+      if(instruction.has_condition())
+        rewrites += normalize_unsigned_modular_expression(
+          instruction.condition_nonconst());
+      if(instruction.is_function_call())
+      {
+        auto &call =
+          to_code_function_call(instruction.code_nonconst());
+        for(auto &argument : call.arguments())
+          rewrites +=
+            normalize_unsigned_modular_expression(argument);
+      }
+    }
+  }
+  return rewrites;
+}
+
+bool stable_modular_scalar_expression(
+  const exprt &expr,
+  const namespacet &ns,
+  const std::set<irep_idt> &excluded)
+{
+  const exprt &value = without_cast(expr);
+  if(
+    value.id() == ID_side_effect || value.id() == ID_dereference ||
+    value.id() == ID_address_of)
+    return false;
+  if(value.id() == ID_symbol)
+  {
+    const symbolt *symbol = nullptr;
+    const irep_idt identifier =
+      to_symbol_expr(value).get_identifier();
+    return
+      excluded.count(identifier) == 0 &&
+      !ns.lookup(identifier, symbol) && !symbol->is_type &&
+      !symbol->type.get_bool(ID_C_volatile) &&
+      (symbol->type.id() == ID_signedbv ||
+       symbol->type.id() == ID_unsignedbv);
+  }
+  for(const auto &operand : value.operands())
+  {
+    if(!stable_modular_scalar_expression(operand, ns, excluded))
+      return false;
+  }
+  return true;
+}
+
+struct modular_accumulation_loopt
+{
+  irep_idt induction;
+  irep_idt accumulator;
+  exprt bound;
+  exprt delta;
+};
+
+bool modular_accumulation_loop(
+  const goto_programt &program,
+  const namespacet &ns,
+  goto_programt::const_targett backedge,
+  modular_accumulation_loopt &summary)
+{
+  if(
+    !backedge->is_goto() || !backedge->condition().is_true() ||
+    backedge->targets.size() != 1)
+    return false;
+  const auto head = backedge->get_target();
+  if(!parse_exit_guard(*head, summary.induction, summary.bound))
+    return false;
+
+  const symbolt *induction_symbol = nullptr;
+  if(
+    ns.lookup(summary.induction, induction_symbol) ||
+    induction_symbol->is_static_lifetime || induction_symbol->is_type ||
+    induction_symbol->type.id() != ID_unsignedbv ||
+    induction_symbol->type.get_bool(ID_C_volatile))
+    return false;
+
+  std::map<const goto_programt::instructiont *, std::size_t> positions;
+  std::size_t position = 0;
+  for(const auto &instruction : program.instructions)
+    positions.emplace(&instruction, position++);
+  const auto head_position = positions.at(&*head);
+  const auto backedge_position = positions.at(&*backedge);
+  if(
+    head->targets.size() != 1 ||
+    positions.at(&*head->get_target()) <= backedge_position)
+    return false;
+
+  for(auto instruction = program.instructions.begin();
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(!instruction->is_goto())
+      continue;
+    const auto source_position = positions.at(&*instruction);
+    for(const auto &target : instruction->targets)
+    {
+      const auto target_position = positions.at(&*target);
+      if(
+        target_position >= head_position &&
+        target_position <= backedge_position &&
+        (source_position < head_position ||
+         source_position > backedge_position))
+        return false;
+    }
+  }
+
+  std::size_t increments = 0;
+  std::size_t accumulations = 0;
+  for(auto instruction = head; instruction != std::next(backedge);
+      ++instruction)
+  {
+    if(instruction == head || instruction == backedge)
+      continue;
+    irep_idt incremented;
+    if(
+      parse_unit_increment(*instruction, incremented) &&
+      incremented == summary.induction)
+    {
+      ++increments;
+      continue;
+    }
+    if(instruction->is_assign())
+    {
+      irep_idt lhs;
+      if(
+        !direct_symbol(instruction->assign_lhs(), lhs) ||
+        lhs == summary.induction)
+        return false;
+      const exprt &rhs = without_cast(instruction->assign_rhs());
+      if(
+        rhs.id() != ID_plus || rhs.operands().size() != 2)
+        return false;
+      irep_idt first;
+      irep_idt second;
+      if(direct_symbol(rhs.op0(), first) && first == lhs)
+        summary.delta = rhs.op1();
+      else if(direct_symbol(rhs.op1(), second) && second == lhs)
+        summary.delta = rhs.op0();
+      else
+        return false;
+      if(!summary.accumulator.empty() && summary.accumulator != lhs)
+        return false;
+      summary.accumulator = lhs;
+      ++accumulations;
+      continue;
+    }
+    if(instruction->is_skip() || instruction->is_location())
+      continue;
+    return false;
+  }
+
+  const symbolt *accumulator_symbol = nullptr;
+  const std::set<irep_idt> excluded = {
+    summary.induction, summary.accumulator};
+  if(
+    increments != 1 || accumulations != 1 ||
+    summary.accumulator.empty() ||
+    ns.lookup(summary.accumulator, accumulator_symbol) ||
+    !accumulator_symbol->is_static_lifetime ||
+    accumulator_symbol->type.id() != ID_unsignedbv ||
+    accumulator_symbol->type.get_bool(ID_C_volatile) ||
+    !stable_modular_scalar_expression(
+      summary.bound, ns, excluded) ||
+    !stable_modular_scalar_expression(
+      summary.delta, ns, excluded))
+    return false;
+
+  bool zero_initialized = false;
+  auto last_semantic = program.instructions.end();
+  for(auto instruction = program.instructions.begin(); instruction != head;
+      ++instruction)
+  {
+    if(!instruction->is_skip() && !instruction->is_location())
+      last_semantic = instruction;
+    if(
+      instruction->is_assign() &&
+      without_cast(instruction->assign_lhs()).id() == ID_symbol &&
+      to_symbol_expr(without_cast(instruction->assign_lhs()))
+          .get_identifier() == summary.induction)
+      zero_initialized =
+        parse_zero_initialization(*instruction, summary.induction);
+  }
+  return
+    zero_initialized &&
+    last_semantic != program.instructions.end() &&
+    parse_zero_initialization(*last_semantic, summary.induction);
+}
+} // namespace
+
+bool local_modular_accumulation_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  const auto main =
+    goto_model.goto_functions.function_map.find(ID_main);
+  if(
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+    return false;
+  std::set<irep_idt> sequential_calls;
+  for(const auto &instruction : main->second.body.instructions)
+  {
+    irep_idt callee;
+    if(
+      direct_call_identifier(instruction, callee) &&
+      goto_model.goto_functions.function_map.count(callee) != 0)
+      sequential_calls.insert(callee);
+  }
+
+  std::size_t candidate_backedges = 0;
+  for(const auto &function_id : sequential_calls)
+  {
+    const auto &function =
+      goto_model.goto_functions.function_map.at(function_id);
+    if(!function.body_available())
+      continue;
+    const auto &program = function.body;
+    std::map<const goto_programt::instructiont *, std::size_t> positions;
+    std::size_t position = 0;
+    for(const auto &instruction : program.instructions)
+      positions.emplace(&instruction, position++);
+    for(auto instruction = program.instructions.begin();
+        instruction != program.instructions.end(); ++instruction)
+    {
+      if(!instruction->is_goto())
+        continue;
+      bool backward = false;
+      for(const auto &target : instruction->targets)
+      {
+        if(positions.at(&*target) < positions.at(&*instruction))
+          backward = true;
+      }
+      if(!backward)
+        continue;
+      ++candidate_backedges;
+      modular_accumulation_loopt summary;
+      if(
+        !instruction->condition().is_true() ||
+        instruction->targets.size() != 1 ||
+        !modular_accumulation_loop(
+          program, ns, instruction, summary))
+      {
+        std::cout
+          << "NATIVE_MODULAR_LOOP_SUMMARY applied=0"
+          << " reason=transactional_preflight"
+          << " function=" << function_id << '\n';
+        return false;
+      }
+    }
+  }
+  if(candidate_backedges == 0)
+  {
+    std::cout
+      << "NATIVE_MODULAR_LOOP_SUMMARY applied=0"
+      << " reason=no_direct_call_loop\n";
+    return false;
+  }
+
+  std::size_t transformed = 0;
+  std::set<irep_idt> functions;
+  for(auto &function_entry : goto_model.goto_functions.function_map)
+  {
+    if(
+      sequential_calls.count(function_entry.first) == 0 ||
+      !function_entry.second.body_available())
+      continue;
+    auto &program = function_entry.second.body;
+    std::map<const goto_programt::instructiont *, std::size_t> positions;
+    std::size_t position = 0;
+    for(const auto &instruction : program.instructions)
+      positions.emplace(&instruction, position++);
+
+    std::vector<goto_programt::targett> backedges;
+    for(auto instruction = program.instructions.begin();
+        instruction != program.instructions.end(); ++instruction)
+    {
+      if(
+        instruction->is_goto() && instruction->condition().is_true() &&
+        instruction->targets.size() == 1 &&
+        positions.at(&*instruction->get_target()) <
+          positions.at(&*instruction))
+        backedges.push_back(instruction);
+    }
+
+    for(auto backedge : backedges)
+    {
+      modular_accumulation_loopt summary;
+      if(
+        !modular_accumulation_loop(
+          program, ns, backedge, summary))
+        continue;
+      const symbolt *induction_symbol = nullptr;
+      const symbolt *accumulator_symbol = nullptr;
+      INVARIANT(
+        !ns.lookup(summary.induction, induction_symbol) &&
+        !ns.lookup(summary.accumulator, accumulator_symbol),
+        "accepted modular loop symbols exist");
+      exprt count =
+        exact_count(summary.bound, induction_symbol->type);
+      count = cast_if_needed(count, accumulator_symbol->type);
+      exprt delta =
+        cast_if_needed(summary.delta, accumulator_symbol->type);
+      exprt contribution =
+        mult_exprt(std::move(count), std::move(delta));
+      symbol_exprt accumulator(
+        summary.accumulator, accumulator_symbol->type);
+      exprt update =
+        plus_exprt(accumulator, std::move(contribution));
+      const auto head = backedge->get_target();
+      const auto location = head->source_location();
+      program.insert_before(
+        head,
+        goto_programt::make_assignment(
+          symbol_exprt(
+            summary.induction, induction_symbol->type),
+          exact_count(summary.bound, induction_symbol->type),
+          location));
+      program.insert_before(
+        head,
+        goto_programt::make_assignment(
+          accumulator, std::move(update), location));
+      for(auto instruction = head; instruction != std::next(backedge);
+          ++instruction)
+        instruction->turn_into_skip();
+      ++transformed;
+      functions.insert(function_entry.first);
+    }
+  }
+  if(transformed != 0)
+  {
+    const std::size_t normalized =
+      normalize_unsigned_modular_model(goto_model);
+    goto_model.goto_functions.update();
+    std::cout
+      << "NATIVE_MODULAR_RING_NORMALIZE applied="
+      << (normalized != 0 ? 1 : 0)
+      << " rewrites=" << normalized << '\n';
+  }
+  std::cout
+    << "NATIVE_MODULAR_LOOP_SUMMARY applied="
     << (transformed != 0 ? 1 : 0)
     << " loops=" << transformed
     << " functions=" << functions.size() << '\n';

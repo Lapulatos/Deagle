@@ -220,6 +220,35 @@ bool nonnegative_oscillator_monitor_transform(
   goto_modelt &goto_model,
   message_handlert &message_handler);
 
+/// Replace fully joined bounded workers whose private phase alternates equal
+/// opposite atomic updates for an even number of steps. The shared transition
+/// word is exactly the identity; all unsupported shapes remain unchanged.
+bool bounded_alternating_cancellation_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// Replace fully joined workers whose private phase permits nondeterministic
+/// termination only after an equal-opposite atomic update pair. Every finite
+/// transition word is the identity; unsupported shapes remain unchanged.
+bool phase_boundary_cancellation_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// Replace fully joined workers whose only shared effect is an unsigned
+/// nondeterministic loop followed by an unconditional constant overwrite.
+/// Every terminating execution has the same post-join state, while a
+/// nonterminating execution cannot reach code after the joins.
+bool joined_terminal_overwrite_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// Prove equality of the final private indices of two fully joined,
+/// symmetric scans over the same read-only array state. The scans must be
+/// structurally identical modulo operand order and write disjoint indices.
+bool symmetric_array_scan_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 /// Audit finite homogeneous spawn loops whose worker has one composable
 /// affine scalar effect. This does not mutate the GOTO model.
 bool homogeneous_spawn_witness_audit(
@@ -242,6 +271,12 @@ bool local_loop_acceleration_audit(
 /// Replace event-free thread-local zero-based unit-counting loops with their
 /// exact signed or unsigned bit-vector exit assignment.
 bool local_loop_acceleration_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
+/// After a native proof has made worker calls sequential, replace simple
+/// unsigned zero-based accumulation loops by their exact modular closed form.
+bool local_modular_accumulation_transform(
   goto_modelt &goto_model,
   message_handlert &message_handler);
 

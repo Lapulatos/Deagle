@@ -1532,6 +1532,16 @@ int cbmc_parse_optionst::doit()
         goto_model, ui_message_handler) ||
       native_model_transformed;
 
+  bool symmetric_scan_model_transformed = false;
+  if(!cmdline.isset("unwind-suggest"))
+  {
+    symmetric_scan_model_transformed =
+      symmetric_array_scan_transform(
+        goto_model, ui_message_handler);
+    native_model_transformed =
+      symmetric_scan_model_transformed ||
+      native_model_transformed;
+  }
   if(
     cmdline.isset("native-jces") &&
     !cmdline.isset("unwind-suggest"))
@@ -1651,10 +1661,17 @@ int cbmc_parse_optionst::doit()
       std::cout << "VERIFICATION SUCCESSFUL\n";
       return CPROVER_EXIT_SUCCESS;
     }
+    bool commuting_model_transformed = false;
     const bool jces_model_transformed =
       tls_destructor_counterexample_transform(
         goto_model, ui_message_handler) ||
       homogeneous_thread_local_cutoff_transform(
+        goto_model, ui_message_handler) ||
+      bounded_alternating_cancellation_transform(
+        goto_model, ui_message_handler) ||
+      phase_boundary_cancellation_transform(
+        goto_model, ui_message_handler) ||
+      joined_terminal_overwrite_transform(
         goto_model, ui_message_handler) ||
       predicate_stable_linearization_transform(
         goto_model, ui_message_handler) ||
@@ -1668,16 +1685,32 @@ int cbmc_parse_optionst::doit()
         goto_model, ui_message_handler) ||
       transition_word_equivalence_transform(
         goto_model, ui_message_handler) ||
-      join_scoped_commuting_sequentialization_transform(
-        goto_model, ui_message_handler) ||
+      (commuting_model_transformed =
+         join_scoped_commuting_sequentialization_transform(
+           goto_model, ui_message_handler)) ||
       jces_transform(goto_model, ui_message_handler);
+    if(commuting_model_transformed)
+    {
+      const bool modular_loop_transformed =
+        local_modular_accumulation_transform(
+          goto_model, ui_message_handler);
+      if(modular_loop_transformed)
+      {
+        options.set_option("deagle-closure", false);
+        std::cout
+          << "NATIVE_SEQUENTIAL_SAT_ROUTING applied=1"
+          << " reason=commuting_modular_summary\n";
+      }
+      native_model_transformed =
+        modular_loop_transformed || native_model_transformed;
+    }
     native_model_transformed =
       native_model_transformed || jces_model_transformed;
   }
 
   if(
     options.get_bool_option("deagle-nondet-bulk-init") &&
-    !native_model_transformed &&
+    (!native_model_transformed || symmetric_scan_model_transformed) &&
     !options.is_set("property") && !options.is_set("subproperty"))
   {
     const auto stats = nondet_bulk_init(
