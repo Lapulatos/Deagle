@@ -374,6 +374,55 @@ bool pure_spin_wait_collapse_transform(
     }
 
     const auto head = matched->get_target();
+    std::set<const goto_programt::instructiont *> can_reach_head;
+    can_reach_head.insert(&*head);
+    bool reachability_changed = true;
+    while(reachability_changed)
+    {
+      reachability_changed = false;
+      for(auto instruction = program.instructions.rbegin();
+          instruction != program.instructions.rend(); ++instruction)
+      {
+        const auto current = std::prev(instruction.base());
+        const auto fallthrough = std::next(current);
+        if(can_reach_head.find(&*instruction) != can_reach_head.end())
+          continue;
+        bool reaches = false;
+        if(instruction->is_goto())
+        {
+          if(
+            !instruction->condition().is_false() &&
+            instruction->targets.size() == 1 &&
+            can_reach_head.find(&*instruction->get_target()) !=
+              can_reach_head.end())
+            reaches = true;
+          if(
+            !reaches && !instruction->condition().is_true() &&
+            fallthrough != program.instructions.end() &&
+            can_reach_head.find(&*fallthrough) !=
+              can_reach_head.end())
+            reaches = true;
+        }
+        else if(
+          !instruction->is_end_function() &&
+          fallthrough != program.instructions.end() &&
+          can_reach_head.find(&*fallthrough) !=
+            can_reach_head.end())
+          reaches = true;
+        if(reaches)
+        {
+          can_reach_head.insert(&*instruction);
+          reachability_changed = true;
+        }
+      }
+    }
+    if(
+      can_reach_head.find(&*program.instructions.begin()) ==
+      can_reach_head.end())
+    {
+      reason = "inline_entry_cannot_reach_loop";
+      return false;
+    }
 
     struct statet
     {
@@ -388,6 +437,7 @@ bool pure_spin_wait_collapse_transform(
       std::map<irep_idt, exprt> values;
       std::vector<exprt> path_conditions;
       bool shared_write = false;
+      bool entered_loop = false;
       std::size_t depth = 0;
     };
 
@@ -442,15 +492,65 @@ bool pure_spin_wait_collapse_transform(
       std::set<irep_idt> visiting;
       return evaluate(source, values, visiting);
     };
+    std::function<int(const exprt &)> constant_condition_value;
+    constant_condition_value =
+      [&](const exprt &condition) -> int
+    {
+      if(condition.is_true())
+        return 1;
+      if(condition.is_false())
+        return 0;
+      if(condition.id() == ID_constant)
+      {
+        mp_integer integer;
+        if(!to_integer(to_constant_expr(condition), integer))
+          return integer == 0 ? 0 : 1;
+      }
+      if(condition.id() == ID_typecast && condition.operands().size() == 1)
+        return constant_condition_value(condition.op0());
+      if(condition.id() == ID_not && condition.operands().size() == 1)
+      {
+        const int operand = constant_condition_value(condition.op0());
+        return operand < 0 ? -1 : 1 - operand;
+      }
+      if(
+        (condition.id() == ID_equal ||
+         condition.id() == ID_notequal) &&
+        condition.operands().size() == 2)
+      {
+        const exprt &lhs = skip_typecast(condition.op0());
+        const exprt &rhs = skip_typecast(condition.op1());
+        auto is_null_pointer =
+          [](const exprt &expression)
+        {
+          return expression.id() == ID_constant &&
+                 expression.type().id() == ID_pointer &&
+                 to_constant_expr(expression).get_value() == ID_NULL;
+        };
+        auto is_object_address =
+          [](const exprt &expression)
+        {
+          if(expression.id() != ID_address_of)
+            return false;
+          const exprt &object =
+            skip_typecast(to_address_of_expr(expression).object());
+          return object.id() != ID_dereference;
+        };
+        if(
+          (is_object_address(lhs) && is_null_pointer(rhs)) ||
+          (is_null_pointer(lhs) && is_object_address(rhs)))
+          return condition.id() == ID_notequal ? 1 : 0;
+      }
+      return -1;
+    };
     auto condition_value =
       [&](const exprt &source,
           const statet &state) -> int
     {
       const exprt value = evaluated(source, state.values);
-      if(value.is_true())
-        return 1;
-      if(value.is_false())
-        return 0;
+      const int constant = constant_condition_value(value);
+      if(constant >= 0)
+        return constant;
       for(const auto &known : state.path_conditions)
       {
         if(value == known)
@@ -461,6 +561,38 @@ bool pure_spin_wait_collapse_transform(
           return 0;
       }
       return -1;
+    };
+    auto record_condition =
+      [&](statet &state, exprt condition)
+    {
+      condition = evaluated(condition, state.values);
+      state.path_conditions.push_back(condition);
+      if(condition.id() != ID_equal || condition.operands().size() != 2)
+        return;
+
+      const exprt &lhs = skip_typecast(condition.op0());
+      const exprt &rhs = skip_typecast(condition.op1());
+      auto bind_symbol =
+        [&](const exprt &symbol, const exprt &value) -> bool
+      {
+        if(symbol.id() != ID_symbol)
+          return false;
+        const irep_idt identifier =
+          to_symbol_expr(symbol).get_identifier();
+        const auto symbols = find_symbols(value);
+        if(std::any_of(
+             symbols.begin(),
+             symbols.end(),
+             [&](const symbol_exprt &dependency)
+             {
+               return dependency.get_identifier() == identifier;
+             }))
+          return false;
+        state.values[identifier] = value;
+        return true;
+      };
+      if(!bind_symbol(lhs, rhs))
+        bind_symbol(rhs, lhs);
     };
     auto forget_local_value =
       [](statet &state, const irep_idt &identifier)
@@ -590,7 +722,12 @@ bool pure_spin_wait_collapse_transform(
     };
 
     std::vector<statet> worklist;
-    worklist.emplace_back(head);
+    // Start at the function entry instead of discarding the path conditions
+    // that select this marked loop. These conditions can prove that
+    // assertion-only error branches in an inlined retry helper are
+    // unreachable. Writes and loop-carried locals from the prefix are reset
+    // on first entry to the loop: only the retrying iteration must stutter.
+    worklist.emplace_back(program.instructions.begin());
     std::size_t explored_states = 0;
     std::size_t backedge_paths = 0;
     std::size_t exit_paths = 0;
@@ -598,14 +735,30 @@ bool pure_spin_wait_collapse_transform(
     {
       statet state = std::move(worklist.back());
       worklist.pop_back();
+      if(
+        !state.entered_loop &&
+        can_reach_head.find(&*state.instruction) == can_reach_head.end())
+        continue;
       if(++explored_states > 16384 ||
          state.depth > order.size() * 4)
       {
         reason = "inline_state_budget";
         return false;
       }
+      if(state.instruction == head && !state.entered_loop)
+      {
+        state.entered_loop = true;
+        state.shared_write = false;
+        state.live_locals.clear();
+        state.depth = 0;
+      }
       if(state.instruction == matched)
       {
+        if(!state.entered_loop)
+        {
+          reason = "inline_backedge_without_entry";
+          return false;
+        }
         ++backedge_paths;
         if(state.shared_write)
         {
@@ -625,7 +778,8 @@ bool pure_spin_wait_collapse_transform(
       }
       if(state.instruction->is_end_function())
       {
-        ++exit_paths;
+        if(state.entered_loop)
+          ++exit_paths;
         continue;
       }
 
@@ -756,10 +910,21 @@ bool pure_spin_wait_collapse_transform(
           state.values.erase(identifier);
         }
       }
+      else if(instruction->is_assert())
+      {
+        if(condition_value(instruction->condition(), state) != 1)
+        {
+          reason = "inline_assert";
+          return false;
+        }
+      }
+      else if(instruction->is_set_return_value())
+      {
+        reason = "inline_return";
+        return false;
+      }
       else if(
-        instruction->is_assert() ||
-        instruction->is_set_return_value() ||
-        (!instruction->is_goto() &&
+        !instruction->is_goto() &&
          !instruction->is_assume() &&
          !instruction->is_decl() &&
          !instruction->is_skip() &&
@@ -768,7 +933,7 @@ bool pure_spin_wait_collapse_transform(
          !instruction->is_atomic_end() &&
          !(instruction->is_other() &&
            instruction->code().get_statement() ==
-             ID_expression)))
+             ID_expression))
       {
         reason = "inline_effect";
         return false;
@@ -782,8 +947,7 @@ bool pure_spin_wait_collapse_transform(
         if(value == 0)
           continue;
         if(value < 0)
-          state.path_conditions.push_back(
-            evaluated(instruction->condition(), state.values));
+          record_condition(state, instruction->condition());
       }
       if(instruction->is_goto())
       {
@@ -798,8 +962,7 @@ bool pure_spin_wait_collapse_transform(
         {
           statet taken = state;
           if(value < 0)
-            taken.path_conditions.push_back(
-              evaluated(instruction->condition(), state.values));
+            record_condition(taken, instruction->condition());
           taken.instruction = instruction->get_target();
           worklist.push_back(std::move(taken));
         }
@@ -811,8 +974,7 @@ bool pure_spin_wait_collapse_transform(
             exprt negated = not_exprt(
               evaluated(instruction->condition(), state.values));
             simplify(negated, ns);
-            fallthrough.path_conditions.push_back(
-              std::move(negated));
+            record_condition(fallthrough, std::move(negated));
           }
           fallthrough.instruction = std::next(instruction);
           worklist.push_back(std::move(fallthrough));
