@@ -1,0 +1,35 @@
+Running witnesslint version 2.1.3-dev
+
+--- Witness File Metadata ---
+Witness File: /data3/sujie/experiments/v299-symmetric-scan-wrapper-target-r3/array-eq-symm.correctness.graphml
+Witness Size in Bytes: 3450
+Witness Lines of Code: 65
+Witness Hash: 86159de1eb18d27846a2af16eb7fb405aa71fe7c2c21b1ba11998213153a1bb6
+
+--- Witness Information Before Linting ---
+Witness Version: 1.0
+
+--- Overview of analyzed program ---
+name: /data3/sujie/svcomp2026-caat/sv-benchmarks/c/weaver/array-eq-symm.wvr.c
+num_chars: 2600
+num_lines: 99
+sha256_hash: 6897befed0dbbae24492a1e82d50fcd0be6b3857b241d882a904d02a513d7a6d
+function_names: []
+sucessfully_parsed: False
+
+--- Witness Content Information ---
+Witness Type: correctness_witness
+Witness Type-Match: Unknown
+Producer: Deagle 4.1.0
+Creation Time: 2026-07-30T07:47:10+08:00
+Architecture: 32bit
+Program File: /data3/sujie/svcomp2026-caat/sv-benchmarks/c/weaver/array-eq-symm.wvr.c
+Program Hash: 6897BEFED0DBBAE24492A1E82D50FCD0BE6B3857B241D882A904D02A513D7A6D
+Source-Code Language: C
+Amount of Nodes: 2
+Amount of Edges: 1
+Amount of Invariants: 1
+Specification: CHECK( init(main()), LTL(G ! call(reach_error())) )
+
+
+witnesslint finished with exit code 0

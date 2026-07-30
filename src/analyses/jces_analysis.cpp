@@ -17954,6 +17954,502 @@ bool joined_terminal_overwrite_transform(
   return true;
 }
 
+namespace
+{
+struct symmetric_scan_workert
+{
+  irep_idt function;
+  irep_idt index;
+  std::set<irep_idt> bounds;
+  std::set<irep_idt> arrays;
+};
+
+goto_programt::const_targett next_semantic_target(
+  goto_programt::const_targett target,
+  const goto_programt &program)
+{
+  while(
+    target != program.instructions.end() &&
+    (target->is_skip() || target->is_location() ||
+     target->is_decl() || target->is_dead()))
+    ++target;
+  return target;
+}
+
+bool symmetric_scan_bounds(
+  const exprt &src,
+  irep_idt &index,
+  std::set<irep_idt> &bounds)
+{
+  const exprt &condition = without_cast(src);
+  if(
+    condition.id() != ID_not ||
+    condition.operands().size() != 1)
+    return false;
+  const exprt &conjunction =
+    without_cast(condition.op0());
+  if(
+    conjunction.id() != ID_and ||
+    conjunction.operands().size() != 2)
+    return false;
+  for(const auto &operand : conjunction.operands())
+  {
+    const exprt &comparison = without_cast(operand);
+    irep_idt candidate;
+    irep_idt bound;
+    if(
+      comparison.id() != ID_lt ||
+      comparison.operands().size() != 2 ||
+      !direct_symbol(comparison.op0(), candidate) ||
+      !direct_symbol(comparison.op1(), bound) ||
+      (!index.empty() && candidate != index))
+      return false;
+    index = candidate;
+    bounds.insert(bound);
+  }
+  return bounds.size() == 2;
+}
+
+bool symmetric_scan_access(
+  const exprt &src,
+  const irep_idt &index,
+  irep_idt &array)
+{
+  const exprt &value = without_cast(src);
+  if(
+    value.id() != ID_dereference ||
+    value.operands().size() != 1)
+    return false;
+  const exprt &address = without_cast(value.op0());
+  if(
+    address.id() != ID_plus ||
+    address.operands().size() != 2)
+    return false;
+  irep_idt first;
+  irep_idt second;
+  if(
+    direct_symbol(address.op0(), first) &&
+    direct_symbol(address.op1(), second))
+  {
+    if(second == index)
+    {
+      array = first;
+      return true;
+    }
+    if(first == index)
+    {
+      array = second;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool symmetric_scan_equality(
+  const exprt &src,
+  const irep_idt &index,
+  std::set<irep_idt> &arrays)
+{
+  const exprt &condition = without_cast(src);
+  if(
+    condition.id() != ID_not ||
+    condition.operands().size() != 1)
+    return false;
+  const exprt &equality = without_cast(condition.op0());
+  if(
+    equality.id() != ID_equal ||
+    equality.operands().size() != 2)
+    return false;
+  irep_idt first;
+  irep_idt second;
+  if(
+    !symmetric_scan_access(equality.op0(), index, first) ||
+    !symmetric_scan_access(equality.op1(), index, second) ||
+    first == second)
+    return false;
+  arrays.insert(first);
+  arrays.insert(second);
+  return true;
+}
+
+bool symmetric_scan_increment(
+  const goto_programt::instructiont &instruction,
+  const irep_idt &index)
+{
+  irep_idt lhs;
+  if(
+    !instruction.is_assign() ||
+    !direct_symbol(instruction.assign_lhs(), lhs) ||
+    lhs != index)
+    return false;
+  const exprt &rhs = without_cast(instruction.assign_rhs());
+  irep_idt source;
+  mp_integer one;
+  return
+    rhs.id() == ID_plus && rhs.operands().size() == 2 &&
+    direct_symbol(rhs.op0(), source) && source == index &&
+    constant_eval(rhs.op1(), {}, one) && one == 1;
+}
+
+bool symmetric_scan_worker(
+  const goto_modelt &model,
+  const namespacet &ns,
+  const irep_idt &function_id,
+  symmetric_scan_workert &summary,
+  std::string &reason)
+{
+  const auto function =
+    model.goto_functions.function_map.find(function_id);
+  if(
+    function == model.goto_functions.function_map.end() ||
+    !function->second.body_available())
+  {
+    reason = "symmetric_scan_missing_worker";
+    return false;
+  }
+  const auto &program = function->second.body;
+  const auto semantic = semantic_instructions(program);
+  if(semantic.size() != 6)
+  {
+    reason = "symmetric_scan_instruction_count";
+    return false;
+  }
+
+  irep_idt index;
+  std::set<irep_idt> bounds;
+  std::set<irep_idt> arrays;
+  if(
+    !semantic[0]->is_goto() ||
+    semantic[0]->targets.size() != 1 ||
+    !symmetric_scan_bounds(
+      semantic[0]->condition(), index, bounds) ||
+    !semantic[1]->is_goto() ||
+    semantic[1]->targets.size() != 1 ||
+    !symmetric_scan_equality(
+      semantic[1]->condition(), index, arrays) ||
+    !symmetric_scan_increment(*semantic[2], index) ||
+    !semantic[3]->is_goto() ||
+    !semantic[3]->condition().is_true() ||
+    semantic[3]->targets.size() != 1 ||
+    next_semantic_target(
+      semantic[3]->get_target(), program) != semantic[5] ||
+    !semantic[4]->is_goto() ||
+    !semantic[4]->condition().is_true() ||
+    semantic[4]->targets.size() != 1 ||
+    semantic[4]->get_target() != semantic[0]->get_target() ||
+    !semantic[5]->is_goto() ||
+    !semantic[5]->condition().is_true() ||
+    semantic[5]->targets.size() != 1 ||
+    next_semantic_target(
+      semantic[5]->get_target(), program) != semantic[0])
+  {
+    reason = "symmetric_scan_control_or_word";
+    return false;
+  }
+  if(
+    next_semantic_target(
+      semantic[1]->get_target(), program) != semantic[4])
+  {
+    reason = "symmetric_scan_break";
+    return false;
+  }
+
+  const symbolt *index_symbol = nullptr;
+  if(
+    ns.lookup(index, index_symbol) ||
+    !index_symbol->is_static_lifetime ||
+    index_symbol->type.id() != ID_signedbv ||
+    is_atomic_symbol(*index_symbol) ||
+    index_symbol->type.get_bool(ID_C_volatile))
+  {
+    reason = "symmetric_scan_index_type";
+    return false;
+  }
+  for(const auto &bound : bounds)
+  {
+    const symbolt *symbol = nullptr;
+    if(
+      ns.lookup(bound, symbol) ||
+      !symbol->is_static_lifetime ||
+      symbol->type.id() != ID_signedbv ||
+      symbol->type.get_bool(ID_C_volatile))
+    {
+      reason = "symmetric_scan_bound_type";
+      return false;
+    }
+  }
+  for(const auto &array : arrays)
+  {
+    const symbolt *symbol = nullptr;
+    if(
+      ns.lookup(array, symbol) ||
+      !symbol->is_static_lifetime ||
+      symbol->type.id() != ID_pointer ||
+      symbol->type.get_bool(ID_C_volatile))
+    {
+      reason = "symmetric_scan_array_type";
+      return false;
+    }
+  }
+  for(const auto &instruction : program.instructions)
+    if(
+      instruction.is_assert() || instruction.is_assume() ||
+      instruction.is_function_call() ||
+      instruction.is_start_thread() ||
+      instruction.is_atomic_begin() ||
+      instruction.is_atomic_end())
+    {
+      reason = "symmetric_scan_worker_effect";
+      return false;
+    }
+
+  summary.function = function_id;
+  summary.index = index;
+  summary.bounds = std::move(bounds);
+  summary.arrays = std::move(arrays);
+  return true;
+}
+
+bool symmetric_scan_initial_and_exclusive_state(
+  const goto_modelt &model,
+  const std::vector<symmetric_scan_workert> &workers,
+  std::string &reason)
+{
+  std::set<irep_idt> indices;
+  std::map<irep_idt, std::map<irep_idt, std::size_t>> writes;
+  std::map<irep_idt, mp_integer> initial_values;
+  for(const auto &worker : workers)
+    indices.insert(worker.index);
+  if(indices.size() != workers.size())
+  {
+    reason = "symmetric_scan_index_alias";
+    return false;
+  }
+
+  for(const auto &entry : model.goto_functions.function_map)
+  {
+    if(!entry.second.body_available())
+      continue;
+    for(const auto &instruction : entry.second.body.instructions)
+    {
+      if(
+        contains_address_of_symbol(instruction.code(), indices) ||
+        (instruction.has_condition() &&
+         contains_address_of_symbol(
+           instruction.condition(), indices)))
+      {
+        reason = "symmetric_scan_index_escape";
+        return false;
+      }
+      if(!instruction.is_assign())
+        continue;
+      irep_idt lhs;
+      if(
+        !direct_symbol(instruction.assign_lhs(), lhs) ||
+        indices.count(lhs) == 0)
+        continue;
+      ++writes[lhs][entry.first];
+      if(entry.first == "__CPROVER_initialize")
+      {
+        mp_integer value;
+        if(!constant_eval(instruction.assign_rhs(), {}, value))
+        {
+          reason = "symmetric_scan_initial_value";
+          return false;
+        }
+        initial_values[lhs] = value;
+      }
+    }
+  }
+  for(const auto &worker : workers)
+  {
+    const auto &index_writes = writes[worker.index];
+    if(
+      index_writes.size() != 2 ||
+      index_writes.find("__CPROVER_initialize") ==
+        index_writes.end() ||
+      index_writes.at("__CPROVER_initialize") != 1 ||
+      index_writes.find(worker.function) == index_writes.end() ||
+      index_writes.at(worker.function) != 1)
+    {
+      reason = "symmetric_scan_index_writes";
+      return false;
+    }
+  }
+  if(
+    initial_values.size() != workers.size() ||
+    initial_values.at(workers[0].index) !=
+      initial_values.at(workers[1].index))
+  {
+    reason = "symmetric_scan_initial_mismatch";
+    return false;
+  }
+  return true;
+}
+
+bool symmetric_scan_error_suffix(
+  const goto_programt &program,
+  goto_programt::const_targett final_join,
+  const std::set<irep_idt> &indices,
+  std::string &reason)
+{
+  bool saw_premise = false;
+  bool saw_error = false;
+  for(auto instruction = std::next(final_join);
+      instruction != program.instructions.end(); ++instruction)
+  {
+    if(
+      instruction->is_skip() || instruction->is_location() ||
+      instruction->is_decl() || instruction->is_dead() ||
+      instruction->is_set_return_value() ||
+      instruction->is_end_function())
+      continue;
+
+    irep_idt callee;
+    if(!direct_call_identifier(*instruction, callee))
+    {
+      reason = "symmetric_scan_property_effect";
+      return false;
+    }
+    if(
+      !saw_premise && callee == "assume_abort_if_not" &&
+      instruction->call_arguments().size() == 1)
+    {
+      const exprt &premise =
+        without_cast(instruction->call_arguments().front());
+      irep_idt first;
+      irep_idt second;
+      if(
+        premise.id() != ID_notequal ||
+        premise.operands().size() != 2 ||
+        !direct_symbol(premise.op0(), first) ||
+        !direct_symbol(premise.op1(), second) ||
+        std::set<irep_idt>{first, second} != indices)
+      {
+        reason = "symmetric_scan_property_premise";
+        return false;
+      }
+      saw_premise = true;
+      continue;
+    }
+    if(saw_premise && !saw_error && callee == "reach_error")
+    {
+      saw_error = true;
+      continue;
+    }
+    reason = "symmetric_scan_property_call";
+    return false;
+  }
+  if(!saw_premise || !saw_error)
+  {
+    reason = "symmetric_scan_property_shape";
+    return false;
+  }
+  return true;
+}
+} // namespace
+
+bool symmetric_array_scan_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  const namespacet ns(goto_model.symbol_table);
+  std::vector<create_recordt> creates;
+  std::vector<goto_programt::targett> joins;
+  std::string reason;
+  if(
+    !collect_lifecycle(goto_model, ns, creates, joins, reason) ||
+    creates.size() != 2)
+  {
+    std::cout
+      << "NATIVE_SYMMETRIC_ARRAY_SCAN applied=0 reason="
+      << (reason.empty() ? "symmetric_scan_lifecycle" : reason)
+      << '\n';
+    return false;
+  }
+
+  std::vector<symmetric_scan_workert> workers;
+  for(const auto &create : creates)
+  {
+    symmetric_scan_workert worker;
+    if(!symmetric_scan_worker(
+         goto_model, ns, create.worker, worker, reason))
+    {
+      std::cout
+        << "NATIVE_SYMMETRIC_ARRAY_SCAN applied=0 reason="
+        << reason << " worker=" << create.worker << '\n';
+      return false;
+    }
+    workers.push_back(std::move(worker));
+  }
+  if(!validate_main_region(
+       goto_model, ns, creates, joins, reason))
+  {
+    std::cout
+      << "NATIVE_SYMMETRIC_ARRAY_SCAN applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+  if(
+    workers[0].bounds != workers[1].bounds ||
+    workers[0].arrays != workers[1].arrays ||
+    !symmetric_scan_initial_and_exclusive_state(
+      goto_model, workers, reason))
+  {
+    std::cout
+      << "NATIVE_SYMMETRIC_ARRAY_SCAN applied=0 reason="
+      << (reason.empty() ? "symmetric_scan_word_mismatch" : reason)
+      << '\n';
+    return false;
+  }
+
+  const auto first_symbol =
+    goto_model.symbol_table.symbols.find(workers[0].index);
+  const auto second_symbol =
+    goto_model.symbol_table.symbols.find(workers[1].index);
+  if(
+    first_symbol == goto_model.symbol_table.symbols.end() ||
+    second_symbol == goto_model.symbol_table.symbols.end() ||
+    first_symbol->second.type != second_symbol->second.type)
+  {
+    std::cout
+      << "NATIVE_SYMMETRIC_ARRAY_SCAN applied=0 reason="
+      << "symmetric_scan_index_type_mismatch\n";
+    return false;
+  }
+  auto main = goto_model.goto_functions.function_map.find("main");
+  INVARIANT(
+    main != goto_model.goto_functions.function_map.end(),
+    "symmetric scan lifecycle found main");
+  const auto final_join = joins.back();
+  const auto location = final_join->source_location();
+  if(!symmetric_scan_error_suffix(
+       main->second.body,
+       final_join,
+       {workers[0].index, workers[1].index},
+       reason))
+  {
+    std::cout
+      << "NATIVE_SYMMETRIC_ARRAY_SCAN applied=0 reason="
+      << reason << '\n';
+    return false;
+  }
+  main->second.body.insert_after(
+    final_join,
+    goto_programt::make_assumption(false_exprt(), location));
+  for(auto &create : creates)
+    create.instruction->turn_into_skip();
+  for(auto &join : joins)
+    join->turn_into_skip();
+  goto_model.goto_functions.update();
+
+  std::cout
+    << "NATIVE_SYMMETRIC_ARRAY_SCAN applied=1 workers=2"
+    << " arrays=2 bounds=2\n";
+  (void)message_handler;
+  return true;
+}
+
 bool homogeneous_spawn_witness_audit(
   const goto_modelt &goto_model,
   message_handlert &message_handler)

@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-29T21:36:25.393Z",
+  "generated_at": "2026-07-30T00:03:28.926Z",
   "comparison_protocol": {
     "tasks": 725,
     "workers": 48,
@@ -16,7 +16,7 @@
     "Optimization duration is an artifact-backed observed wall-clock interval covering research, implementation, experiments, analysis, and documentation; it is not pure model-compute time.",
     "V17-V20 and V168 share timestamp records with another version, while V37 and V91 lack independent records; their durations remain missing rather than being estimated.",
     "Some historical controls were reused across dates; cumulative baseline comparisons are useful for progress, not precise per-version causal attribution.",
-    "V291 and V294-V296 were measured after a server restart with 8 physical workers. Their coverage and resource claims use contemporaneous N8 paired controls; their raw totals are shown in the ledger but excluded from the historical 48-worker resource trend lines."
+    "V291 and V294-V299 were measured after a server restart with 8 physical workers. Their coverage and resource claims use contemporaneous N8 paired controls; their raw totals are shown in the ledger but excluded from the historical 48-worker resource trend lines. V299 additionally uses the currently available /data3 benchmark tree only for paired deltas because the accepted /home benchmark tree is no longer present."
   ],
   "rows": [
     {
@@ -14962,6 +14962,174 @@
         "cpu": null,
         "wall": null,
         "peak_memory": null,
+        "paired_memory": null
+      },
+      "exact_override": true,
+      "wrapper_exact_evidence": false
+    },
+    {
+      "version": 297,
+      "label": "V297",
+      "method": "Phase-Boundary Cancellation",
+      "status": "successful",
+      "scope": "exact725",
+      "contribution_class": "native_redo",
+      "description": "Native V297 summarizes equal-opposite update pairs at phase boundaries for fully joined workers. One unified deagle_exe owns admission, transformation, backend proof, verdict, and witness generation; the wrapper is byte-identical to V296. Exact725 reaches 700 official / 712 adjudicated correct by adding parallel-misc-3 and parallel-misc-3-extended with zero old-correct losses and zero new wrong results. Prior90 remains 90/90, both correctness witnesses pass WitnessLint's format gate, and paired CPU, wall, and summed memory improve by 11.382%, 10.570%, and 2.003%.",
+      "source": "../../experiments/native-residual-v297-20260730/conclusion.md",
+      "source_notes": "../../experiments/native-residual-v297-20260730/notes.md",
+      "memory_sum_source": "/home/lapulatos/deagle-experiments/v297-phase-boundary-exact725-final-r3/results/exact725.server.2026-07-30_06-08-22.results.v297-native-phase-boundary-release-exact725.Concurrency.xml.bz2",
+      "comparison_protocol_override": {
+        "tasks": 725,
+        "workers": 8,
+        "cores_per_task": 1,
+        "memory_per_task_gb": 4,
+        "time_limit_s": 60,
+        "paired_baseline_version": 296
+      },
+      "resource_comparable_with_historical_trend": false,
+      "timing": {
+        "version": 297,
+        "directory": "native-residual-v297-20260730",
+        "available": true,
+        "start_epoch_s": 1785361104,
+        "end_epoch_s": 1785363089,
+        "start_iso": "2026-07-29T21:38:24.000Z",
+        "end_iso": "2026-07-29T22:11:29.000Z",
+        "duration_minutes": 33.083333333333336,
+        "evidence_kind": "candidate_source_birth_to_release_witness_gate"
+      },
+      "metrics": {
+        "correct": 712,
+        "cpu_s": 968.6572050000007,
+        "wall_s": 1014.9598592408001,
+        "memory_sum_b": 26867920896,
+        "paired_memory_delta_pct": null,
+        "correct_vs_baseline": 268,
+        "cpu_vs_baseline_pct": null,
+        "wall_vs_baseline_pct": null,
+        "memory_sum_vs_baseline_pct": null,
+        "correct_vs_previous_success": 2,
+        "cpu_vs_previous_success_pct": null,
+        "wall_vs_previous_success_pct": null
+      },
+      "wrapper_metrics": null,
+      "extracted_evidence": {
+        "correct": "700 official / 712 adjudicated correct and 22 unfinished tasks. The only",
+        "cpu": null,
+        "wall": null,
+        "peak_memory": null,
+        "paired_memory": null
+      },
+      "exact_override": true,
+      "wrapper_exact_evidence": false
+    },
+    {
+      "version": 298,
+      "label": "V298",
+      "method": "Joined Terminal Overwrite",
+      "status": "successful",
+      "scope": "exact725",
+      "contribution_class": "native_redo",
+      "description": "Native V298 proves constant terminal overwrites for fully joined nondeterministic unsigned workers and replaces only effects whose finite executions end in the same value. One unified deagle_exe owns admission, transformation, backend proof, verdict, and witness generation; the wrapper is byte-identical to V297. Exact725 reaches 701 official / 713 adjudicated correct by adding only spaghetti with zero old-correct losses and zero new wrong results. Prior90 remains 90/90, the correctness witness passes WitnessLint's format gate, and paired CPU, wall, and summed memory improve by 6.920%, 7.248%, and 0.476%.",
+      "source": "../../experiments/native-residual-v298-20260730/conclusion.md",
+      "source_notes": "../../experiments/native-residual-v298-20260730/notes.md",
+      "memory_sum_source": "/home/lapulatos/deagle-experiments/v298-terminal-overwrite-exact725-final-r2/results/exact725.server.2026-07-30_06-46-31.results.v298-native-terminal-overwrite-exact725.Concurrency.xml.bz2",
+      "comparison_protocol_override": {
+        "tasks": 725,
+        "workers": 8,
+        "cores_per_task": 1,
+        "memory_per_task_gb": 4,
+        "time_limit_s": 60,
+        "paired_baseline_version": 297
+      },
+      "resource_comparable_with_historical_trend": false,
+      "timing": {
+        "version": 298,
+        "directory": "native-residual-v298-20260730",
+        "available": true,
+        "start_epoch_s": 1785363761,
+        "end_epoch_s": 1785365447,
+        "start_iso": "2026-07-29T22:22:41.000Z",
+        "end_iso": "2026-07-29T22:50:47.000Z",
+        "duration_minutes": 28.1,
+        "evidence_kind": "candidate_plan_birth_to_reproducible_build_gate"
+      },
+      "metrics": {
+        "correct": 713,
+        "cpu_s": 901.6218819999998,
+        "wall_s": 941.3961547822692,
+        "memory_sum_b": 26740121600,
+        "paired_memory_delta_pct": null,
+        "correct_vs_baseline": 269,
+        "cpu_vs_baseline_pct": null,
+        "wall_vs_baseline_pct": null,
+        "memory_sum_vs_baseline_pct": null,
+        "correct_vs_previous_success": 1,
+        "cpu_vs_previous_success_pct": null,
+        "wall_vs_previous_success_pct": null
+      },
+      "wrapper_metrics": null,
+      "extracted_evidence": {
+        "correct": "Exact725 reaches 701 official / 713 adjudicated correct by changing only",
+        "cpu": null,
+        "wall": null,
+        "peak_memory": "-0.476%, and peak memory remains 3,999,997,952 bytes.",
+        "paired_memory": null
+      },
+      "exact_override": true,
+      "wrapper_exact_evidence": false
+    },
+    {
+      "version": 299,
+      "label": "V299",
+      "method": "Symmetric Array-Scan Equality",
+      "status": "successful",
+      "scope": "exact725",
+      "contribution_class": "native_redo",
+      "description": "Native V299 proves that two fully joined symmetric equality scans over the same read-only array state finish with equal private indices. Admission checks lifecycle, worker control words, bounds, arrays, index initialization and exclusivity, types, and the exact post-join property shape; the byte-identical wrapper performs no proof or verdict work. Against a same-machine V298 control, paired Exact725 changes only array-eq-symm from wrong false(unreach-call) to correct true, reaching 702 official / 714 adjudicated correct with zero old-correct losses and zero new wrong results. Paired CPU, wall, and summed memory change +0.48%, +0.47%, and +0.23%. The final Prior90 statuses are identical to control, the 3,450-byte correctness witness passes WitnessLint's format gate, and two clean builds are byte-identical.",
+      "source": "../../experiments/native-residual-v299-20260730/conclusion.md",
+      "source_notes": "../../experiments/native-residual-v299-20260730/notes.md",
+      "memory_sum_source": "../../experiments/native-residual-v299-20260730/results/exact-v299exact725.server.2026-07-30_07-39-52.results.v299-native-symmetric-scan-exact725.Concurrency.xml.bz2",
+      "comparison_protocol_override": {
+        "tasks": 725,
+        "workers": 8,
+        "cores_per_task": 1,
+        "memory_per_task_gb": 4,
+        "time_limit_s": 60,
+        "paired_baseline_version": 298
+      },
+      "resource_comparable_with_historical_trend": false,
+      "timing": {
+        "version": 299,
+        "directory": "native-residual-v299-20260730",
+        "available": true,
+        "start_epoch_s": 1785365720,
+        "end_epoch_s": 1785369406,
+        "start_iso": "2026-07-29T22:55:20.000Z",
+        "end_iso": "2026-07-29T23:56:46.000Z",
+        "duration_minutes": 61.43333333333333,
+        "evidence_kind": "candidate_source_birth_to_independent_clean_build_gate"
+      },
+      "metrics": {
+        "correct": 714,
+        "cpu_s": 1404.2573806320004,
+        "wall_s": 1426.3497360697947,
+        "memory_sum_b": 101154689024,
+        "paired_memory_delta_pct": null,
+        "correct_vs_baseline": 270,
+        "cpu_vs_baseline_pct": null,
+        "wall_vs_baseline_pct": null,
+        "memory_sum_vs_baseline_pct": null,
+        "correct_vs_previous_success": 1,
+        "cpu_vs_previous_success_pct": null,
+        "wall_vs_previous_success_pct": null
+      },
+      "wrapper_metrics": null,
+      "extracted_evidence": {
+        "correct": "- Final Exact725 has 701 official correct, 713 adjudicated correct, three",
+        "cpu": null,
+        "wall": null,
+        "peak_memory": "1419.671 s to 1426.350 s (+0.47%), and summed peak memory from 100.921 GB to",
         "paired_memory": null
       },
       "exact_override": true,

@@ -1532,6 +1532,16 @@ int cbmc_parse_optionst::doit()
         goto_model, ui_message_handler) ||
       native_model_transformed;
 
+  bool symmetric_scan_model_transformed = false;
+  if(!cmdline.isset("unwind-suggest"))
+  {
+    symmetric_scan_model_transformed =
+      symmetric_array_scan_transform(
+        goto_model, ui_message_handler);
+    native_model_transformed =
+      symmetric_scan_model_transformed ||
+      native_model_transformed;
+  }
   if(
     cmdline.isset("native-jces") &&
     !cmdline.isset("unwind-suggest"))
@@ -1700,7 +1710,7 @@ int cbmc_parse_optionst::doit()
 
   if(
     options.get_bool_option("deagle-nondet-bulk-init") &&
-    !native_model_transformed &&
+    (!native_model_transformed || symmetric_scan_model_transformed) &&
     !options.is_set("property") && !options.is_set("subproperty"))
   {
     const auto stats = nondet_bulk_init(

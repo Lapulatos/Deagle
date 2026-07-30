@@ -242,6 +242,13 @@ bool joined_terminal_overwrite_transform(
   goto_modelt &goto_model,
   message_handlert &message_handler);
 
+/// Prove equality of the final private indices of two fully joined,
+/// symmetric scans over the same read-only array state. The scans must be
+/// structurally identical modulo operand order and write disjoint indices.
+bool symmetric_array_scan_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 /// Audit finite homogeneous spawn loops whose worker has one composable
 /// affine scalar effect. This does not mutate the GOTO model.
 bool homogeneous_spawn_witness_audit(
