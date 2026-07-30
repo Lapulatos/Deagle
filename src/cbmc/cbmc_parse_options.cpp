@@ -350,6 +350,91 @@ bool apply_native_replay_choices(
     << " applied=" << applied << '\n';
   return applied == choices.size() && applied != 0;
 }
+
+bool lift_single_spawn_source_prefix(
+  const goto_tracet &input,
+  goto_tracet &output)
+{
+  const auto is_thread_creation =
+    [](const goto_trace_stept &step)
+    {
+      if(step.is_spawn())
+        return true;
+      if(!step.is_assignment())
+        return false;
+      const auto lhs_object = step.get_lhs_object();
+      return
+        lhs_object.has_value() &&
+        id2string(lhs_object->get_identifier()).find(
+          "pthread_create::thread") != std::string::npos;
+    };
+
+  if(
+    input.steps.empty() ||
+    !input.get_last_step().is_assert() ||
+    input.get_last_step().cond_value ||
+    input.get_last_step().thread_nr == 0)
+    return false;
+
+  const unsigned failing_thread =
+    input.get_last_step().thread_nr;
+  auto first_worker = input.steps.end();
+  auto creation = input.steps.end();
+  bool creator_resumed = false;
+  std::set<unsigned> worker_threads;
+  for(auto step = input.steps.begin(); step != input.steps.end(); ++step)
+  {
+    if(step->thread_nr == 0)
+    {
+      if(first_worker != input.steps.end())
+        creator_resumed = true;
+      else if(is_thread_creation(*step))
+        creation = step;
+      continue;
+    }
+    worker_threads.insert(step->thread_nr);
+    if(first_worker == input.steps.end())
+      first_worker = step;
+  }
+
+  if(
+    creator_resumed ||
+    worker_threads.size() != 1 ||
+    *worker_threads.begin() != failing_thread ||
+    first_worker == input.steps.end() ||
+    creation == input.steps.end() ||
+    creation->thread_nr != 0)
+    return false;
+
+  for(auto step = input.steps.begin();; ++step)
+  {
+    output.add_step(*step);
+    if(step == creation)
+      break;
+  }
+  for(auto step = first_worker; step != input.steps.end(); ++step)
+  {
+    if(step->thread_nr != failing_thread)
+      return false;
+    output.add_step(*step);
+  }
+  std::size_t lifted_step_number = 1;
+  for(auto &step : output.steps)
+    step.step_nr = lifted_step_number++;
+
+  const bool accepted =
+    !output.steps.empty() &&
+    output.get_last_step().is_assert() &&
+    !output.get_last_step().cond_value;
+  std::cout
+    << "NATIVE_ORIGINAL_GOTO_REPLAY prefix_lift=1"
+    << " accepted=" << (accepted ? 1 : 0)
+    << " input_steps=" << input.steps.size()
+    << " output_steps=" << output.steps.size()
+    << " worker=" << failing_thread
+    << std::endl;
+  return accepted;
+}
 }
 
 cbmc_parse_optionst::cbmc_parse_optionst(int argc, const char **argv)
@@ -1916,6 +2001,8 @@ int cbmc_parse_optionst::doit()
 
     messaget replay_log{ui_message_handler};
     if(
+      !source_replay_single_worker_schedule_transform(
+        *native_original_replay_model, ui_message_handler) ||
       cbmc_parse_optionst::process_goto_program(
         *native_original_replay_model,
         replay_options,
@@ -1946,10 +2033,14 @@ int cbmc_parse_optionst::doit()
       return CPROVER_EXIT_VERIFICATION_SAFE;
     }
 
-    const auto &replay_failure =
-      replay_verifier.get_traces().all().front().get_last_step();
+    const goto_tracet &replay_trace =
+      replay_verifier.get_traces().all().front();
+    const auto &replay_failure = replay_trace.get_last_step();
+    goto_tracet source_prefix_trace;
     if(
       !replay_failure.is_assert() ||
+      !lift_single_spawn_source_prefix(
+        replay_trace, source_prefix_trace) ||
       candidate_failure_function !=
         replay_failure.pc->source_location().get_function() ||
       candidate_failure_line !=
@@ -1964,13 +2055,13 @@ int cbmc_parse_optionst::doit()
     std::cout
       << "NATIVE_ORIGINAL_GOTO_REPLAY applied=1"
       << " choices=" << replay_choices.size()
-      << " steps="
-      << replay_verifier.get_traces().all().front().steps.size()
+      << " replay_steps=" << replay_trace.steps.size()
+      << " source_steps=" << source_prefix_trace.steps.size()
       << '\n';
     const namespacet replay_namespace(
       native_original_replay_model->symbol_table);
     output_graphml(
-      replay_verifier.get_traces().all().front(),
+      source_prefix_trace,
       replay_namespace,
       replay_options);
     replay_verifier.report();

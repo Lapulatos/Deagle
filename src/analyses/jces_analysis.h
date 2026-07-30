@@ -84,6 +84,15 @@ bool single_worker_initialization_prefix_transform(
 bool single_worker_initialization_prefix_applied(
   const goto_modelt &goto_model);
 
+/// Restrict a source-model violation replay to the first create of one
+/// homogeneous worker class without changing any earlier initialization.
+/// This is a counterexample-only schedule under-approximation: the spawned
+/// worker may reach the property while the creator remains delayed at the
+/// first-create scheduling point.
+bool source_replay_single_worker_schedule_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 /// Return the canonical inner-initialization loop that must be fully
 /// unwound after applying the single-worker initialization prefix.
 std::string single_worker_initialization_prefix_unwind_loop(

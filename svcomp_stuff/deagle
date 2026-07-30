@@ -105,6 +105,12 @@ def get_result(remove = True):
                 or line.startswith(
                     "NATIVE_COUNTEREXAMPLE_RESCUE_PORTFOLIO "
                 )
+                or line.startswith(
+                    "NATIVE_SOURCE_REPLAY_SCHEDULE "
+                )
+                or line.startswith(
+                    "NATIVE_ORIGINAL_GOTO_REPLAY "
+                )
                 or line.startswith("COUNTERFACTUAL_UIP_PROFILE ")
                 or line.startswith("COUNTERFACTUAL_UIP_DOMAIN ")
                 or line.startswith("COUNTERFACTUAL_UIP_DOMAIN_SOURCE ")

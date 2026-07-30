@@ -15509,6 +15509,61 @@ bool single_worker_initialization_prefix_applied(
       .get_bool("deagle_single_worker_initialization_prefix");
 }
 
+bool source_replay_single_worker_schedule_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  std::string reason;
+  const auto candidates = dormant_spawn_cutoffs(goto_model, reason);
+  if(candidates.size() != 1)
+  {
+    std::cout
+      << "NATIVE_SOURCE_REPLAY_SCHEDULE applied=0"
+      << " reason=worker_class_count"
+      << " classes=" << candidates.size() << '\n';
+    return false;
+  }
+
+  bool truncated = false;
+  if(!apply_dormant_spawn_counts(
+       goto_model, candidates, {1}, truncated) ||
+     !truncated)
+  {
+    std::cout
+      << "NATIVE_SOURCE_REPLAY_SCHEDULE applied=0"
+      << " reason=spawn_transform"
+      << " truncated=" << (truncated ? 1 : 0) << '\n';
+    return false;
+  }
+
+  auto main = goto_model.goto_functions.function_map.find("main");
+  if(
+    main == goto_model.goto_functions.function_map.end() ||
+    !main->second.body_available())
+    return false;
+  bool creator_paused = false;
+  for(
+    auto instruction =
+      main->second.body.const_cast_target(candidates.front().exit);
+    instruction != main->second.body.instructions.end();
+    ++instruction)
+  {
+    if(instruction->is_end_function())
+      break;
+    instruction->turn_into_skip();
+    creator_paused = true;
+  }
+  if(!creator_paused)
+    return false;
+  goto_model.goto_functions.update();
+  std::cout
+    << "NATIVE_SOURCE_REPLAY_SCHEDULE applied=1"
+    << " workers=1 initialization=unchanged"
+    << " truncated=1 creator_paused=1\n";
+  (void)message_handler;
+  return true;
+}
+
 std::string single_worker_initialization_prefix_unwind_loop(
   const goto_modelt &goto_model)
 {
