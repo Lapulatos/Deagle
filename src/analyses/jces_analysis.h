@@ -296,13 +296,15 @@ bool pure_spin_wait_collapse_transform(
   goto_modelt &goto_model,
   message_handlert &message_handler,
   bool &empty_barrier_family,
-  bool &within_proof_budget);
+  bool &within_proof_budget,
+  bool &unreserved_scalar_read_transformed);
 
 /// Apply the pure-spin transform only to models carrying the exact native
 /// compiler-barrier marker. Unsupported marked models terminate inconclusive.
 bool pure_spin_wait_dispatch(
   goto_modelt &goto_model,
-  message_handlert &message_handler);
+  message_handlert &message_handler,
+  bool &unreserved_scalar_read_transformed);
 
 /// Audit whether a joined nested loop of unit additions is equivalent to a
 /// joined loop that adds the runtime inner iteration count once.

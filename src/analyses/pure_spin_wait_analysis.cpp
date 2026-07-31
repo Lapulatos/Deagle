@@ -47,8 +47,10 @@ bool direct_call_identifier(
 
 bool pure_spin_wait_dispatch(
   goto_modelt &goto_model,
-  message_handlert &message_handler)
+  message_handlert &message_handler,
+  bool &unreserved_scalar_read_transformed)
 {
+  unreserved_scalar_read_transformed = false;
   bool empty_barrier_family =
     goto_model.symbol_table.symbols.find(
       "__CPROVER_deagle_empty_compiler_barrier") !=
@@ -62,7 +64,8 @@ bool pure_spin_wait_dispatch(
       goto_model,
       message_handler,
       empty_barrier_family,
-      within_proof_budget);
+      within_proof_budget,
+      unreserved_scalar_read_transformed);
   if(!transformed || !within_proof_budget)
   {
     std::cout
@@ -82,7 +85,8 @@ bool pure_spin_wait_collapse_transform(
   goto_modelt &goto_model,
   message_handlert &message_handler,
   bool &empty_barrier_family,
-  bool &within_proof_budget)
+  bool &within_proof_budget,
+  bool &unreserved_scalar_read_transformed)
 {
   struct candidatet
   {
@@ -93,8 +97,10 @@ bool pure_spin_wait_collapse_transform(
   std::vector<candidatet> accepted_candidates;
   std::size_t marked_candidates = 0;
   std::size_t pointer_exception_candidates = 0;
+  std::size_t unreserved_scalar_read_candidates = 0;
   std::size_t model_instructions = 0;
   within_proof_budget = false;
+  unreserved_scalar_read_transformed = false;
   empty_barrier_family =
     goto_model.symbol_table.symbols.find(
       "__CPROVER_deagle_empty_compiler_barrier") !=
@@ -1165,7 +1171,6 @@ bool pure_spin_wait_collapse_transform(
           spin_start_calls == 1 &&
           spin_end_calls != 0 &&
           read_calls == 1 &&
-          (prior_reservation || pointer_read_calls == 1) &&
           saw_exit;
         const bool admitted =
           pure_read_admitted || stuttering_retry;
@@ -1186,12 +1191,12 @@ bool pure_spin_wait_collapse_transform(
           << " stutter_reason=" << stutter_reason << '\n';
         if(admitted)
         {
-          if(
-            pure_read_admitted &&
-            !prior_reservation &&
-            pointer_read_calls == 1)
+          if(pure_read_admitted && !prior_reservation)
           {
-            ++pointer_exception_candidates;
+            if(pointer_read_calls == 1)
+              ++pointer_exception_candidates;
+            else
+              ++unreserved_scalar_read_candidates;
           }
           accepted_candidates.push_back(
             {function_entry.first, backedge});
@@ -1204,21 +1209,94 @@ bool pure_spin_wait_collapse_transform(
     marked_candidates == 0 ||
     accepted_candidates.size() != marked_candidates ||
     (pointer_exception_candidates != 0 &&
-     (pointer_exception_candidates != 1 || marked_candidates != 1)))
+     (pointer_exception_candidates != 1 || marked_candidates != 1)) ||
+    (unreserved_scalar_read_candidates != 0 &&
+     (unreserved_scalar_read_candidates != 1 || marked_candidates != 1)))
   {
     std::cout
       << "NATIVE_PURE_SPIN_COLLAPSE applied=0"
       << " marked=" << marked_candidates
       << " accepted=" << accepted_candidates.size()
       << " pointer_exceptions=" << pointer_exception_candidates
+      << " unreserved_scalar_reads="
+      << unreserved_scalar_read_candidates
       << " empty_barrier=" << (empty_barrier_family ? 1 : 0)
       << " instructions=" << model_instructions
       << " reason=global_single_spin\n";
     return false;
   }
 
+  if(unreserved_scalar_read_candidates != 0)
+  {
+    // The single unreserved wait is a sound safety overapproximation, but it
+    // is not an effective proof route when the reachable program also
+    // contains a compare-exchange feedback protocol.  Follow direct calls
+    // from __CPROVER_start so unused atomic helper definitions do not affect
+    // admission.
+    std::set<irep_idt> reachable_functions;
+    std::vector<irep_idt> pending_functions{
+      goto_functionst::entry_point()};
+    while(!pending_functions.empty())
+    {
+      const irep_idt function_id = pending_functions.back();
+      pending_functions.pop_back();
+      if(!reachable_functions.insert(function_id).second)
+        continue;
+      const auto function =
+        goto_model.goto_functions.function_map.find(function_id);
+      if(function == goto_model.goto_functions.function_map.end())
+        continue;
+      for(const auto &instruction : function->second.body.instructions)
+      {
+        irep_idt callee;
+        if(direct_call_identifier(instruction, callee))
+          pending_functions.push_back(callee);
+      }
+    }
+
+    bool reachable_compare_exchange = false;
+    for(const auto &reachable : reachable_functions)
+    {
+      const auto function =
+        goto_model.goto_functions.function_map.find(reachable);
+      if(function == goto_model.goto_functions.function_map.end())
+        continue;
+      for(const auto &instruction : function->second.body.instructions)
+      {
+        irep_idt callee;
+        if(!direct_call_identifier(instruction, callee))
+          continue;
+        const std::string callee_name = id2string(callee);
+        if(
+          callee_name.find("compare_exchange") != std::string::npos ||
+          callee_name.find("cmpxchg") != std::string::npos)
+        {
+          reachable_compare_exchange = true;
+          break;
+        }
+      }
+      if(reachable_compare_exchange)
+        break;
+    }
+
+    if(reachable_compare_exchange)
+    {
+      std::cout
+        << "NATIVE_PURE_SPIN_COLLAPSE applied=0"
+        << " marked=" << marked_candidates
+        << " accepted=" << accepted_candidates.size()
+        << " unreserved_scalar_reads="
+        << unreserved_scalar_read_candidates
+        << " reachable_functions=" << reachable_functions.size()
+        << " reason=unreserved_compare_exchange_feedback\n";
+      return false;
+    }
+  }
+
   constexpr std::size_t proof_instruction_budget = 900;
   within_proof_budget = model_instructions <= proof_instruction_budget;
+  unreserved_scalar_read_transformed =
+    unreserved_scalar_read_candidates != 0;
   for(auto &candidate : accepted_candidates)
   {
     candidate.backedge->condition_nonconst() = false_exprt();
