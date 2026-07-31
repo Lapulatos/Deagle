@@ -324,8 +324,22 @@ void field_sensitivityt::field_assignments_rec(
         index_exprt{ssa_rhs, from_integer(i, type->index_type())}, ns);
       const exprt &index_lhs = *fs_it;
 
+      const exprt saved_event_guard = state.event_guard_context;
+      if(
+        ssa_rhs.id() == ID_with &&
+        to_with_expr(ssa_rhs).where().id() != ID_constant)
+      {
+        state.event_guard_context = simplify_opt(
+          and_exprt{
+            saved_event_guard,
+            equal_exprt{
+              to_with_expr(ssa_rhs).where(),
+              from_integer(i, type->index_type())}},
+          ns);
+      }
       field_assignments_rec(
         ns, state, index_lhs, index_rhs, target, allow_pointer_unsoundness);
+      state.event_guard_context = saved_event_guard;
       ++fs_it;
     }
   }
