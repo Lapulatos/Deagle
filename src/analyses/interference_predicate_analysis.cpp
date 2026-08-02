@@ -18,10 +18,12 @@ Module: Interference-Closed Predicate Analysis
 
 #include <util/expr_util.h>
 #include <util/arith_tools.h>
+#include <util/byte_operators.h>
 #include <util/irep_hash.h>
 #include <util/message.h>
 #include <util/namespace.h>
 #include <util/pointer_expr.h>
+#include <util/pointer_offset_size.h>
 #include <util/replace_expr.h>
 #include <util/replace_symbol.h>
 #include <util/simplify_expr.h>
@@ -34,6 +36,7 @@ Module: Interference-Closed Predicate Analysis
 #include <functional>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <unordered_map>
@@ -111,8 +114,53 @@ bool exact_product_lvalue(const exprt &input)
   return false;
 }
 
-// Preserve only address shapes whose dynamic base can later be resolved from
-// one exact product-state pointer value. Ambiguous bases still fail closed.
+const exprt *direct_product_root_symbol(const exprt &input)
+{
+  const exprt &expression = skip_typecast(input);
+  if(expression.id() == ID_symbol)
+    return &expression;
+  if(expression.id() == ID_member)
+    return direct_product_root_symbol(to_member_expr(expression).struct_op());
+  if(expression.id() == ID_index)
+    return direct_product_root_symbol(to_index_expr(expression).array());
+  return nullptr;
+}
+
+bool same_exact_product_object(const exprt &left_input, const exprt &right_input)
+{
+  const exprt &left = skip_typecast(left_input);
+  const exprt &right = skip_typecast(right_input);
+  if(left.id() != right.id())
+    return false;
+  if(left.id() == ID_symbol)
+    return
+      to_symbol_expr(left).get_identifier() ==
+      to_symbol_expr(right).get_identifier();
+  if(left.id() == ID_member)
+    return
+      to_member_expr(left).get_component_name() ==
+        to_member_expr(right).get_component_name() &&
+      same_exact_product_object(
+        to_member_expr(left).struct_op(), to_member_expr(right).struct_op());
+  if(left.id() == ID_index)
+  {
+    const auto left_index = numeric_cast<mp_integer>(
+      skip_typecast(to_index_expr(left).index()));
+    const auto right_index = numeric_cast<mp_integer>(
+      skip_typecast(to_index_expr(right).index()));
+    return
+      left_index.has_value() && right_index.has_value() &&
+      *left_index == *right_index &&
+      same_exact_product_object(
+        to_index_expr(left).array(), to_index_expr(right).array());
+  }
+  return false;
+}
+
+// A product state can resolve an address such as &p->field after p has been
+// assigned one exact tracked-object address.  Keep this deliberately narrower
+// than arbitrary pointer arithmetic: unresolved pointers still make the
+// concrete product step fail closed.
 bool state_resolvable_product_lvalue_shape(const exprt &input)
 {
   const exprt &expression = skip_typecast(input);
@@ -121,11 +169,67 @@ bool state_resolvable_product_lvalue_shape(const exprt &input)
   if(expression.id() == ID_member)
     return state_resolvable_product_lvalue_shape(
       to_member_expr(expression).struct_op());
-  if(expression.id() == ID_dereference)
+  if(expression.id() == ID_index)
     return
-      skip_typecast(to_dereference_expr(expression).pointer()).id() ==
-      ID_symbol;
+      state_resolvable_product_lvalue_shape(
+        to_index_expr(expression).array()) &&
+      !has_subexpr(to_index_expr(expression).index(), ID_dereference) &&
+      !has_subexpr(to_index_expr(expression).index(), ID_if);
+  if(expression.id() == ID_dereference)
+  {
+    const exprt &pointer = to_dereference_expr(expression).pointer();
+    return
+      state_resolvable_product_lvalue_shape(pointer) &&
+      !has_subexpr(pointer, ID_if);
+  }
   return false;
+}
+
+bool finite_product_byte_extract_lvalue_shape(const exprt &input)
+{
+  const exprt &expression = skip_typecast(input);
+  if(
+    expression.id() != ID_byte_extract_little_endian &&
+    expression.id() != ID_byte_extract_big_endian)
+    return false;
+  const auto &extract = to_byte_extract_expr(expression);
+  const typet &target_type = extract.type();
+  return
+    target_type.id() != ID_array && target_type.id() != ID_struct &&
+    target_type.id() != ID_union && direct_product_lvalue(extract.op()) &&
+    !has_subexpr(extract.offset(), ID_dereference) &&
+    !has_subexpr(extract.offset(), ID_if);
+}
+
+bool has_invalid_product_object(const exprt &input)
+{
+  if(input.get_bool(ID_C_invalid_object))
+    return true;
+  for(const auto &operand : input.operands())
+    if(has_invalid_product_object(operand))
+      return true;
+  return false;
+}
+
+bool state_resolvable_scalar_dereferences(
+  const exprt &input,
+  const namespacet &ns)
+{
+  const exprt &expression = skip_typecast(input);
+  if(expression.id() == ID_dereference)
+  {
+    const typet &type = ns.follow(expression.type());
+    if(
+      type.id() == ID_array || type.id() == ID_struct ||
+      type.id() == ID_union ||
+      !state_resolvable_product_lvalue_shape(
+        to_dereference_expr(expression).pointer()))
+      return false;
+  }
+  for(const auto &operand : expression.operands())
+    if(!state_resolvable_scalar_dereferences(operand, ns))
+      return false;
+  return true;
 }
 
 bool is_string_literal_address(const exprt &input)
@@ -300,13 +404,35 @@ bool resolve_product_expression(
   if(!has_subexpr(expression, ID_dereference))
     return true;
   const exprt original = expression;
+  const exprt &original_root = skip_typecast(original);
+  if(
+    std::getenv("DEAGLE_FINITE_PRODUCT_AUDIT") != nullptr &&
+    original_root.id() == ID_address_of &&
+    !state_resolvable_product_lvalue_shape(
+      to_address_of_expr(original_root).object()))
+    std::cout << "V225_FINITE_PRODUCT_ADDRESS_SHAPE_REJECT entry="
+              << function_id << " location=" << location->location_number
+              << " original={" << from_expr(ns, function_id, original)
+              << "}" << std::endl;
+  if(
+    original_root.id() == ID_address_of &&
+    state_resolvable_product_lvalue_shape(
+      to_address_of_expr(original_root).object()))
+    return true;
   if(rewrite_unique_product_dereferences(
        program, predecessors, location, expression))
     return true;
   expression = original;
   dereference(function_id, location, expression, ns, value_sets);
-  const exprt &original_root = skip_typecast(original);
   const exprt &resolved_root = skip_typecast(expression);
+  if(
+    has_invalid_product_object(expression) &&
+    has_subexpr(original, ID_dereference) &&
+    state_resolvable_scalar_dereferences(original, ns))
+  {
+    expression = original;
+    return true;
+  }
   if(
     resolved_root.get_bool(ID_C_invalid_object) &&
     original_root.id() == ID_dereference &&
@@ -401,7 +527,8 @@ bool lower_unique_product_dereferences(
         const bool direct_lhs =
           rhs_resolved &&
           (direct_product_lvalue(lhs) ||
-           skip_typecast(lhs).id() == ID_dereference);
+           skip_typecast(lhs).id() == ID_dereference ||
+           finite_product_byte_extract_lvalue_shape(lhs));
         if(!lhs_resolved || !rhs_resolved || !direct_lhs)
         {
           if(std::getenv("DEAGLE_FINITE_PRODUCT_AUDIT") != nullptr)
@@ -3547,7 +3674,8 @@ struct finite_product_statet
   std::vector<std::size_t> pcs;
   std::vector<bool> active;
   std::vector<bool> completed;
-  std::vector<exprt> values;
+  std::shared_ptr<std::vector<std::size_t>> values =
+    std::make_shared<std::vector<std::size_t>>();
   int atomic_owner = -1;
 };
 
@@ -3627,9 +3755,7 @@ public:
                   << from_expr(ns, irep_idt(), object) << '}';
       std::cout << '\n';
     }
-    const std::size_t symbol_limit =
-      threads.size() == 4 ? max_three_worker_symbols : max_symbols;
-    if(symbols.empty() || symbols.size() > symbol_limit)
+    if(symbols.empty() || symbols.size() > max_symbols)
     {
       fail("symbol_count");
       return;
@@ -3726,7 +3852,7 @@ public:
                     << "}\n";
         return fail_run("nonconstant_initializer");
       }
-      initial.values.push_back(std::move(value));
+      initial.values->push_back(intern_state_value(value));
     }
 
     std::deque<finite_product_statet> pending;
@@ -3741,6 +3867,28 @@ public:
           if(state.atomic_owner >= 0)
             selected = static_cast<std::size_t>(state.atomic_owner);
           else
+          {
+            for(std::size_t thread_index = 0;
+                thread_index < threads.size(); ++thread_index)
+            {
+              if(!state.active[thread_index])
+                continue;
+              const std::size_t pc = state.pcs[thread_index];
+              if(pc >= threads[thread_index].locations.size())
+                continue;
+              const auto join = threads[thread_index].join_workers.find(pc);
+              if(
+                threads[thread_index].spawn_workers.count(pc) != 0 ||
+                (join != threads[thread_index].join_workers.end() &&
+                 state.completed[join->second]) ||
+                threads[thread_index].locations[pc]->is_end_function())
+              {
+                selected = thread_index;
+                break;
+              }
+            }
+          }
+          if(selected == threads.size())
           {
             for(std::size_t thread_index = 0;
                 thread_index < threads.size(); ++thread_index)
@@ -3782,7 +3930,7 @@ public:
                 : static_cast<const exprt &>(selected_location->dead_symbol());
               const auto tracked = symbol_indices.find(object);
               if(tracked != symbol_indices.end())
-                state.values[tracked->second].make_nil();
+                mutable_state_values(state)[tracked->second] = nil_value_id;
             }
             state.pcs[selected] = selected_pc + 1;
             continue;
@@ -3799,9 +3947,11 @@ public:
           if(
             std::getenv("DEAGLE_FINITE_PRODUCT_AUDIT") != nullptr &&
             transition_count % 1000000 == 0)
+          {
             std::cout << "V225_FINITE_PRODUCT_PROGRESS transitions="
                       << transition_count << " states=" << visited.size()
                       << " pending=" << pending.size() << std::endl;
+          }
           if(!step_reachable)
           {
             reachable = false;
@@ -3835,9 +3985,11 @@ public:
           if(
             std::getenv("DEAGLE_FINITE_PRODUCT_AUDIT") != nullptr &&
             transition_count % 1000000 == 0)
+          {
             std::cout << "V225_FINITE_PRODUCT_PROGRESS transitions="
                       << transition_count << " states=" << visited.size()
                       << " pending=" << pending.size() << std::endl;
+          }
           bool reachable = true;
           if(!normalize_state(successor, reachable))
             return false;
@@ -3894,13 +4046,14 @@ public:
 
 private:
   static constexpr std::size_t max_workers = 5;
-  static constexpr std::size_t max_symbols = 256;
-  // Give exactly three materialized workers a narrow extra state budget while
-  // keeping larger products outside exhaustive search.
-  static constexpr std::size_t max_three_worker_symbols = 264;
+  // Diagnostic headroom only: the release gate still needs a structural
+  // resource predictor that excludes the expensive recursive-MCS product.
+  static constexpr std::size_t max_symbols = 340;
   static constexpr std::size_t max_locations_per_worker = 2048;
   static constexpr std::size_t max_states = 5000000;
   static constexpr std::size_t max_transitions = 20000000;
+  static constexpr std::size_t max_assignment_normalization_cache_entries =
+    4096;
 
   goto_modelt &model;
   namespacet ns;
@@ -3910,13 +4063,50 @@ private:
   std::vector<finite_product_symmetry_groupt> symmetry_groups;
   std::vector<bool> symmetric_thread_mask;
   std::vector<bool> symmetric_slot_mask;
+  std::unordered_map<exprt, std::size_t, irep_hash> state_value_ids;
+  std::vector<exprt> state_values;
+  std::unordered_map<exprt, exprt, irep_hash> assignment_normalization_cache;
   std::vector<int> slot_owners;
   std::vector<std::vector<std::set<std::size_t>>> live_local_slots;
+  std::vector<std::vector<std::vector<bool>>> live_local_slot_masks;
   bool failed = false;
   std::string failure_reason;
   std::size_t transition_count = 0;
   std::size_t diagnostic_thread = static_cast<std::size_t>(-1);
   unsigned diagnostic_location = 0;
+
+
+  static constexpr std::size_t nil_value_id =
+    std::numeric_limits<std::size_t>::max();
+
+  std::size_t intern_state_value(const exprt &value)
+  {
+    if(value.is_nil())
+      return nil_value_id;
+    INVARIANT(
+      is_exact_constant(value),
+      "finite product states contain exact constants");
+    const auto inserted =
+      state_value_ids.emplace(value, state_values.size());
+    if(inserted.second)
+      state_values.push_back(value);
+    return inserted.first->second;
+  }
+
+  const exprt &state_value(const std::size_t id) const
+  {
+    PRECONDITION(id != nil_value_id && id < state_values.size());
+    return state_values[id];
+  }
+
+  static std::vector<std::size_t> &mutable_state_values(
+    finite_product_statet &state)
+  {
+    if(!state.values.unique())
+      state.values =
+        std::make_shared<std::vector<std::size_t>>(*state.values);
+    return *state.values;
+  }
 
   void fail(const std::string &reason)
   {
@@ -4041,7 +4231,10 @@ private:
     const auto &index = to_index_expr(expr);
     const exprt &array = skip_typecast(index.array());
     const typet &array_type = ns.follow(array.type());
-    if(array_type.id() != ID_array || !direct_product_lvalue(array))
+    if(
+      array_type.id() != ID_array ||
+      (!direct_product_lvalue(array) &&
+       !state_resolvable_address_object(array)))
       return false;
     const auto size =
       numeric_cast<std::size_t>(to_array_type(array_type).size());
@@ -4093,7 +4286,10 @@ private:
     const auto &index = to_index_expr(object);
     const exprt &array = skip_typecast(index.array());
     const typet &array_type = ns.follow(array.type());
-    if(array_type.id() != ID_array || !direct_product_lvalue(array))
+    if(
+      array_type.id() != ID_array ||
+      (!direct_product_lvalue(array) &&
+       !state_resolvable_address_object(array)))
       return false;
     const auto size =
       numeric_cast<std::size_t>(to_array_type(array_type).size());
@@ -4116,6 +4312,14 @@ private:
       expression_supported(to_dereference_expr(lhs).pointer());
   }
 
+  bool finite_byte_extract_lvalue(const exprt &input) const
+  {
+    const exprt &lhs = skip_typecast(input);
+    if(!finite_product_byte_extract_lvalue_shape(lhs))
+      return false;
+    return expression_supported(to_byte_extract_expr(lhs).offset());
+  }
+
   bool exact_pointer_object(const exprt &input, exprt &object) const
   {
     const exprt &pointer = skip_typecast(input);
@@ -4126,6 +4330,23 @@ private:
         return false;
       object = candidate;
       return true;
+    }
+    if(pointer.id() == ID_symbol && input.type().id() == ID_pointer)
+    {
+      const typet &array_type = ns.follow(pointer.type());
+      if(array_type.id() == ID_array)
+      {
+        const auto size = numeric_cast<std::size_t>(
+          to_array_type(array_type).size());
+        if(!size.has_value() || *size == 0)
+          return false;
+        object = index_exprt(
+          pointer,
+          from_integer(0, to_array_type(array_type).index_type()),
+          to_array_type(array_type).element_type());
+        object = simplify_expr(std::move(object), ns);
+        return exact_in_bounds_product_lvalue(object);
+      }
     }
     if(pointer.id() != ID_plus || pointer.operands().size() != 2)
       return false;
@@ -4239,6 +4460,28 @@ private:
       *left_value != *right_value;
   }
 
+  bool distinct_static_root_objects(
+    const exprt &left,
+    const exprt &right) const
+  {
+    const exprt *left_root = direct_product_root_symbol(left);
+    const exprt *right_root = direct_product_root_symbol(right);
+    if(left_root == nullptr || right_root == nullptr)
+      return false;
+    const irep_idt &left_id =
+      to_symbol_expr(*left_root).get_identifier();
+    const irep_idt &right_id =
+      to_symbol_expr(*right_root).get_identifier();
+    if(left_id == right_id)
+      return false;
+    const symbolt *left_symbol = nullptr;
+    const symbolt *right_symbol = nullptr;
+    return
+      !ns.lookup(left_id, left_symbol) &&
+      !ns.lookup(right_id, right_symbol) &&
+      left_symbol->is_static_lifetime && right_symbol->is_static_lifetime;
+  }
+
   void evaluate_exact_pointer_comparisons(exprt &value) const
   {
     for(auto &operand : value.operands())
@@ -4272,15 +4515,27 @@ private:
         equality = true;
       else if(distinct_exact_array_elements(objects[0], objects[1]))
         equality = false;
+      else if(distinct_static_root_objects(objects[0], objects[1]))
+        equality = false;
       else
         return;
     }
     else
       return;
-    if((value.id() == ID_equal) == equality)
-      value = true_exprt();
+    if(value.id() == ID_equal)
+    {
+      if(equality)
+        value = true_exprt();
+      else
+        value = false_exprt();
+    }
     else
-      value = false_exprt();
+    {
+      if(equality)
+        value = false_exprt();
+      else
+        value = true_exprt();
+    }
   }
 
   bool overwrites_tracked_member(const exprt &input) const
@@ -4355,16 +4610,133 @@ private:
         return fail_step("finite_dereference_slot");
       updates.emplace_back(exact->second, rhs);
     }
-    else if(lhs.id() == ID_index)
+    else if(
+      skip_typecast(lhs).id() == ID_byte_extract_little_endian ||
+      skip_typecast(lhs).id() == ID_byte_extract_big_endian)
     {
-      const auto &index = to_index_expr(lhs);
-      exprt exact_index;
-      if(!evaluate(index.index(), state, exact_index))
+      const auto &extract = to_byte_extract_expr(skip_typecast(lhs));
+      exprt exact_offset;
+      if(!evaluate(extract.offset(), state, exact_offset))
         return false;
-      exprt exact_lhs = index_exprt(
-        index.array(), std::move(exact_index), index.type());
+      exact_offset = simplify_expr(std::move(exact_offset), ns);
+      const auto offset = numeric_cast<mp_integer>(exact_offset);
+      if(!offset.has_value() || *offset < 0)
+        return fail_step("finite_byte_extract_offset");
+      const auto object = get_subexpression_at_offset(
+        extract.op(), *offset, extract.type(), ns);
+      if(
+        !object.has_value() ||
+        !exact_in_bounds_product_lvalue(*object) ||
+        object->id() == ID_byte_extract_little_endian ||
+        object->id() == ID_byte_extract_big_endian)
+        return fail_step("finite_byte_extract_target");
+      const auto exact = symbol_indices.find(*object);
+      auto exact_slot = exact;
+      if(exact_slot == symbol_indices.end())
+      {
+        std::size_t path_matches = 0;
+        for(auto candidate = symbol_indices.begin();
+            candidate != symbol_indices.end(); ++candidate)
+        {
+          if(
+            candidate->first.type() == extract.type() &&
+            same_exact_product_object(candidate->first, *object))
+          {
+            exact_slot = candidate;
+            ++path_matches;
+          }
+        }
+        if(path_matches != 1)
+        {
+          const auto base_offset = compute_pointer_offset(extract.op(), ns);
+          const exprt *base_root = direct_product_root_symbol(extract.op());
+          std::size_t matches = 0;
+          if(base_offset.has_value() && base_root != nullptr)
+          {
+            const mp_integer absolute_offset = *base_offset + *offset;
+            for(auto candidate = symbol_indices.begin();
+                candidate != symbol_indices.end(); ++candidate)
+            {
+              if(candidate->first.type() != extract.type())
+                continue;
+              const exprt *candidate_root =
+                direct_product_root_symbol(candidate->first);
+              if(
+                candidate_root == nullptr ||
+                to_symbol_expr(*candidate_root).get_identifier() !=
+                  to_symbol_expr(*base_root).get_identifier())
+                continue;
+              const auto candidate_offset =
+                compute_pointer_offset(candidate->first, ns);
+              if(
+                !candidate_offset.has_value() ||
+                *candidate_offset != absolute_offset)
+                continue;
+              exact_slot = candidate;
+              ++matches;
+            }
+          }
+          if(matches != 1)
+          {
+            if(std::getenv("DEAGLE_FINITE_PRODUCT_AUDIT") != nullptr)
+            {
+              std::cout << "V225_FINITE_PRODUCT_BYTE_EXTRACT_SLOT lhs={"
+                        << from_expr(ns, irep_idt(), lhs) << "} offset={"
+                        << from_expr(ns, irep_idt(), exact_offset)
+                        << "} object={" << from_expr(ns, irep_idt(), *object)
+                        << "} path_matches=" << path_matches
+                        << " matches=" << matches << std::endl;
+              const exprt *wanted_root = direct_product_root_symbol(*object);
+              for(const auto &candidate : symbol_indices)
+              {
+                const exprt *candidate_root =
+                  direct_product_root_symbol(candidate.first);
+                if(
+                  wanted_root == nullptr || candidate_root == nullptr ||
+                  to_symbol_expr(*candidate_root).get_identifier() !=
+                    to_symbol_expr(*wanted_root).get_identifier())
+                  continue;
+                std::cout
+                  << "V225_FINITE_PRODUCT_BYTE_EXTRACT_CANDIDATE object={"
+                  << from_expr(ns, irep_idt(), candidate.first)
+                  << "} same_path="
+                  << same_exact_product_object(candidate.first, *object)
+                  << " same_type="
+                  << (candidate.first.type() == extract.type())
+                  << " candidate_type={" << candidate.first.type().pretty()
+                  << "} target_type={" << extract.type().pretty() << "}"
+                  << std::endl;
+              }
+            }
+            return fail_step("finite_byte_extract_slot");
+          }
+        }
+      }
+      updates.emplace_back(exact_slot->second, rhs);
+    }
+    else if(finite_index_lvalue(lhs))
+    {
+      exprt exact_lhs = lhs;
+      substitute_lvalue_indices(exact_lhs, state);
       exact_lhs = simplify_expr(std::move(exact_lhs), ns);
-      const auto exact = symbol_indices.find(exact_lhs);
+      auto exact = symbol_indices.find(exact_lhs);
+      if(exact == symbol_indices.end())
+      {
+        std::size_t matches = 0;
+        for(auto candidate = symbol_indices.begin();
+            candidate != symbol_indices.end(); ++candidate)
+        {
+          if(
+            candidate->first.type() == exact_lhs.type() &&
+            same_exact_product_object(candidate->first, exact_lhs))
+          {
+            exact = candidate;
+            ++matches;
+          }
+        }
+        if(matches != 1)
+          return fail_step("finite_index_target");
+      }
       if(exact == symbol_indices.end())
         return fail_step("finite_index_target");
       updates.emplace_back(exact->second, rhs);
@@ -4382,14 +4754,26 @@ private:
       const typet &target_type = symbols[update.first].type();
       if(value.type() != target_type)
         value = typecast_exprt::conditional_cast(value, target_type);
-      value = simplify_expr(std::move(value), ns);
-      canonicalize_exact_pointer(value);
+      const auto cached = assignment_normalization_cache.find(value);
+      if(cached != assignment_normalization_cache.end())
+        value = cached->second;
+      else
+      {
+        const exprt unnormalized = value;
+        value = simplify_expr(std::move(value), ns);
+        canonicalize_exact_pointer(value);
+        if(
+          assignment_normalization_cache.size() <
+          max_assignment_normalization_cache_entries)
+          assignment_normalization_cache.emplace(unnormalized, value);
+      }
       if(!is_exact_constant(value))
         return fail_step("assignment_cast");
       update.second = std::move(value);
     }
     for(auto &update : updates)
-      state.values[update.first] = std::move(update.second);
+      mutable_state_values(state)[update.first] =
+        intern_state_value(update.second);
     return true;
   }
 
@@ -4477,6 +4861,8 @@ private:
       return
         product_thread_local_symbol(
           location->assign_lhs(), ns, local_identifier) &&
+        !finite_boolean_nondet_assignment(
+          location->assign_lhs(), location->assign_rhs()) &&
         !expression_reads_shared_value(location->assign_rhs());
     }
     if(location->is_assume() || location->is_goto())
@@ -4485,6 +4871,22 @@ private:
       location->is_skip() || location->is_location() ||
       location->is_decl() || location->is_dead() ||
       location->is_set_return_value();
+  }
+
+  bool finite_boolean_nondet_assignment(
+    const exprt &lhs,
+    const exprt &rhs) const
+  {
+    const exprt &value = skip_typecast(rhs);
+    if(
+      value.id() != ID_side_effect ||
+      value.get(ID_statement) != ID_nondet ||
+      !value.operands().empty())
+      return false;
+    if(symbol_indices.find(lhs) == symbol_indices.end())
+      return false;
+    const typet &type = ns.follow(lhs.type());
+    return type.id() == ID_bool || type.id() == ID_c_bool;
   }
 
   static std::string replace_all_text(
@@ -4731,6 +5133,61 @@ private:
       collect_expr_symbols(operand, result);
   }
 
+  bool collect_exact_subobjects_of_type(
+    const exprt &input,
+    const typet &target_type,
+    std::set<exprt> &result,
+    std::size_t &added) const
+  {
+    constexpr std::size_t max_byte_extract_targets = 32;
+    if(added > max_byte_extract_targets)
+      return false;
+    const exprt &object = skip_typecast(input);
+    const typet &object_type = ns.follow(object.type());
+    if(object.type() == target_type)
+    {
+      if(!exact_product_lvalue(object))
+        return false;
+      if(result.insert(object).second)
+        ++added;
+      return added <= max_byte_extract_targets;
+    }
+    if(object_type.id() == ID_struct)
+    {
+      for(const auto &component : to_struct_type(object_type).components())
+      {
+        const member_exprt member(
+          object, component.get_name(), component.type());
+        if(!collect_exact_subobjects_of_type(
+             member, target_type, result, added))
+          return false;
+      }
+      return true;
+    }
+    if(object_type.id() == ID_array)
+    {
+      const auto size = numeric_cast<std::size_t>(
+        to_array_type(object_type).size());
+      constexpr std::size_t max_finite_byte_extract_elements = 8;
+      if(
+        !size.has_value() || *size == 0 ||
+        *size > max_finite_byte_extract_elements)
+        return false;
+      for(std::size_t index = 0; index < *size; ++index)
+      {
+        const index_exprt element(
+          object,
+          from_integer(index, to_array_type(object_type).index_type()),
+          to_array_type(object_type).element_type());
+        if(!collect_exact_subobjects_of_type(
+             element, target_type, result, added))
+          return false;
+      }
+      return true;
+    }
+    return true;
+  }
+
   void collect_shared_symbols()
   {
     std::set<exprt> found;
@@ -4740,6 +5197,20 @@ private:
       {
         if(location->is_assign())
         {
+          const exprt &lhs = skip_typecast(location->assign_lhs());
+          if(
+            lhs.id() == ID_byte_extract_little_endian ||
+            lhs.id() == ID_byte_extract_big_endian)
+          {
+            const auto &extract = to_byte_extract_expr(lhs);
+            std::size_t added = 0;
+            if(!collect_exact_subobjects_of_type(
+                 extract.op(), extract.type(), found, added))
+            {
+              fail("finite_byte_extract_targets");
+              return;
+            }
+          }
           collect_expr_symbols(location->assign_lhs(), found);
           collect_expr_symbols(location->assign_rhs(), found);
         }
@@ -4824,6 +5295,8 @@ private:
           std::set<std::size_t> in = out;
           if(location->is_assign())
           {
+            collect_thread_local_slots(
+              location->assign_lhs(), thread_index, in);
             const auto defined = symbol_indices.find(location->assign_lhs());
             if(
               defined != symbol_indices.end() &&
@@ -4845,6 +5318,21 @@ private:
         }
       }
     }
+    live_local_slot_masks.resize(threads.size());
+    for(std::size_t thread_index = 0; thread_index < threads.size();
+        ++thread_index)
+    {
+      const auto &live = live_local_slots[thread_index];
+      auto &masks = live_local_slot_masks[thread_index];
+      masks.assign(live.size(), std::vector<bool>(symbols.size(), false));
+      for(std::size_t pc = 0; pc < live.size(); ++pc)
+      {
+        for(const auto slot : live[pc])
+          masks[pc][slot] = true;
+      }
+    }
+    live_local_slots.clear();
+    live_local_slots.shrink_to_fit();
     return true;
   }
 
@@ -4858,8 +5346,8 @@ private:
     const std::size_t thread_index = static_cast<std::size_t>(owner);
     const std::size_t pc = state.pcs[thread_index];
     return
-      pc < live_local_slots[thread_index].size() &&
-      live_local_slots[thread_index][pc].count(slot) != 0;
+      pc < live_local_slot_masks[thread_index].size() &&
+      live_local_slot_masks[thread_index][pc][slot];
   }
 
   void audit_lifecycle(const std::vector<irep_idt> &thread_ids)
@@ -5001,6 +5489,8 @@ private:
         to_member_expr(object).struct_op());
     if(object.id() == ID_dereference)
       return expression_supported(to_dereference_expr(object).pointer());
+    if(object.id() == ID_index)
+      return finite_address_index_supported(object);
     return false;
   }
 
@@ -5030,9 +5520,17 @@ private:
           const bool finite_index = finite_index_lvalue(lhs);
           const bool finite_dereference =
             finite_dereference_lvalue(lhs);
+          const bool finite_byte_extract =
+            finite_byte_extract_lvalue(lhs);
+          const bool finite_boolean_nondet =
+            finite_boolean_nondet_assignment(
+              lhs, location->assign_rhs());
+          if(finite_boolean_nondet && atomic_depth != 0)
+            return fail("atomic_nondet_assignment");
           if(
             (tracked != symbol_indices.end() || finite_index ||
-             finite_dereference) &&
+             finite_dereference || finite_byte_extract) &&
+            !finite_boolean_nondet &&
             !expression_supported(location->assign_rhs()))
           {
             if(std::getenv("DEAGLE_FINITE_PRODUCT_AUDIT") != nullptr)
@@ -5047,7 +5545,7 @@ private:
           }
           if(
             tracked == symbol_indices.end() && !finite_index &&
-            !finite_dereference &&
+            !finite_dereference && !finite_byte_extract &&
             (!direct_product_lvalue(lhs) || product_scalar_object(lhs)))
           {
             if(std::getenv("DEAGLE_FINITE_PRODUCT_AUDIT") != nullptr)
@@ -5067,7 +5565,19 @@ private:
             for(const auto &update : updates)
             {
               if(!expression_supported(update.second))
+              {
+                if(std::getenv("DEAGLE_FINITE_PRODUCT_AUDIT") != nullptr)
+                  std::cout << "V225_FINITE_PRODUCT_AGGREGATE_RHS_REJECT "
+                            << "entry=" << thread.entry << " location="
+                            << location->location_number << " lhs={"
+                            << from_expr(ns, thread.entry, lhs) << "} rhs={"
+                            << from_expr(
+                                 ns, thread.entry, location->assign_rhs())
+                            << "} slot=" << update.first << " projected={"
+                            << from_expr(ns, thread.entry, update.second)
+                            << "}" << std::endl;
                 return fail("unsupported_aggregate_rhs");
+              }
             }
           }
         }
@@ -5115,9 +5625,9 @@ private:
         const auto target = symbol_indices.find(object);
         if(
           target != symbol_indices.end() &&
-          state.values[target->second].is_not_nil())
+          (*state.values)[target->second] != nil_value_id)
         {
-          expression = state.values[target->second];
+          expression = state_value((*state.values)[target->second]);
           return;
         }
         const typet &object_type = ns.follow(object.type());
@@ -5134,9 +5644,9 @@ private:
     const auto found = symbol_indices.find(expression);
     if(
       found != symbol_indices.end() &&
-      state.values[found->second].is_not_nil())
+      (*state.values)[found->second] != nil_value_id)
     {
-      expression = state.values[found->second];
+      expression = state_value((*state.values)[found->second]);
       return;
     }
     for(auto &operand : expression.operands())
@@ -5146,8 +5656,8 @@ private:
     const auto simplified = symbol_indices.find(expression);
     if(
       simplified != symbol_indices.end() &&
-      state.values[simplified->second].is_not_nil())
-      expression = state.values[simplified->second];
+      (*state.values)[simplified->second] != nil_value_id)
+      expression = state_value((*state.values)[simplified->second]);
   }
 
   void substitute_lvalue_indices(
@@ -5177,11 +5687,65 @@ private:
       substitute_lvalue_indices(to_typecast_expr(lvalue).op(), state);
   }
 
+  bool evaluate_simple_exact_expression(
+    const exprt &input,
+    const finite_product_statet &state,
+    exprt &result) const
+  {
+    if(is_exact_constant(input))
+    {
+      result = input;
+      return true;
+    }
+    const auto tracked = symbol_indices.find(input);
+    if(
+      tracked != symbol_indices.end() &&
+      (*state.values)[tracked->second] != nil_value_id)
+    {
+      result = state_value((*state.values)[tracked->second]);
+      return true;
+    }
+    if(input.id() == ID_symbol)
+      return false;
+    if(input.id() == ID_address_of)
+    {
+      result = input;
+      substitute_lvalue_indices(
+        to_address_of_expr(result).object(), state);
+      result = simplify_expr(std::move(result), ns);
+      canonicalize_exact_pointers(result);
+      return is_exact_constant(result);
+    }
+    if(
+      input.id() == ID_dereference ||
+      input.id() == ID_index || input.id() == ID_member ||
+      input.id() == ID_byte_extract_little_endian ||
+      input.id() == ID_byte_extract_big_endian ||
+      input.id() == ID_pointer_offset || input.id() == ID_side_effect)
+      return false;
+    result = input;
+    for(std::size_t index = 0; index < input.operands().size(); ++index)
+    {
+      exprt operand;
+      if(!evaluate_simple_exact_expression(
+           input.operands()[index], state, operand))
+        return false;
+      result.operands()[index] = std::move(operand);
+    }
+    result = simplify_expr(std::move(result), ns);
+    canonicalize_exact_pointers(result);
+    evaluate_exact_pointer_comparisons(result);
+    result = simplify_expr(std::move(result), ns);
+    return is_exact_constant(result);
+  }
+
   bool evaluate(
     const exprt &input,
     const finite_product_statet &state,
     exprt &result)
   {
+    if(evaluate_simple_exact_expression(input, state, result))
+      return true;
     result = input;
     substitute_state_values(result, state);
     result = simplify_expr(std::move(result), ns);
@@ -5201,6 +5765,70 @@ private:
                   << "}" << std::endl;
         if(diagnostic_thread < threads.size())
         {
+          std::set<irep_idt> referenced_ids;
+          collect_product_symbol_ids(input, referenced_ids);
+          bool definitions_changed = true;
+          while(definitions_changed)
+          {
+            definitions_changed = false;
+            for(const auto &definition : threads[diagnostic_thread].locations)
+            {
+              if(!definition->is_assign())
+                continue;
+              const exprt &definition_lhs =
+                skip_typecast(definition->assign_lhs());
+              if(definition_lhs.id() != ID_symbol)
+                continue;
+              const irep_idt &defined =
+                to_symbol_expr(definition_lhs).get_identifier();
+              if(referenced_ids.count(defined) == 0)
+                continue;
+              std::set<irep_idt> rhs_ids;
+              collect_product_symbol_ids(
+                definition->assign_rhs(), rhs_ids);
+              for(const auto &rhs_id : rhs_ids)
+                if(referenced_ids.insert(rhs_id).second)
+                  definitions_changed = true;
+              std::cout << "V225_FINITE_PRODUCT_NONCONSTANT_DEFINITION location="
+                        << definition->location_number << " lhs={"
+                        << from_expr(ns, threads[diagnostic_thread].entry,
+                                     definition->assign_lhs())
+                        << "} rhs={"
+                        << from_expr(ns, threads[diagnostic_thread].entry,
+                                     definition->assign_rhs())
+                        << "}" << std::endl;
+            }
+          }
+          for(const auto &slot : symbol_indices)
+          {
+            const exprt *root = direct_product_root_symbol(slot.first);
+            if(
+              root == nullptr ||
+              referenced_ids.count(
+                to_symbol_expr(*root).get_identifier()) == 0)
+              continue;
+            std::cout << "V225_FINITE_PRODUCT_NONCONSTANT_SLOT object={"
+                      << from_expr(ns, irep_idt(), slot.first) << "} value={"
+                      << ((*state.values)[slot.second] == nil_value_id
+                            ? std::string("<nil>")
+                            : from_expr(
+                                ns,
+                                irep_idt(),
+                                state_value((*state.values)[slot.second])))
+                      << "}" << std::endl;
+          }
+          const std::size_t current_pc =
+            state.pcs[diagnostic_thread];
+          const std::size_t first_pc = current_pc > 12 ? current_pc - 12 : 0;
+          for(std::size_t pc = first_pc;
+              pc <= current_pc &&
+              pc < threads[diagnostic_thread].locations.size(); ++pc)
+          {
+            const auto prior = threads[diagnostic_thread].locations[pc];
+            std::cout << "V225_FINITE_PRODUCT_NONCONSTANT_WINDOW pc=" << pc
+                      << " location=" << prior->location_number << " code={"
+                      << prior->code().pretty() << "}" << std::endl;
+          }
           for(const auto location : threads[diagnostic_thread].locations)
           {
             if(location->location_number != diagnostic_location)
@@ -5260,10 +5888,21 @@ private:
     const auto location = thread.locations[pc];
     diagnostic_thread = thread_index;
     diagnostic_location = location->location_number;
+    const auto spawn = thread.spawn_workers.find(pc);
+    const auto join = thread.join_workers.find(pc);
     if(
-      thread.spawn_workers.count(pc) != 0 ||
-      thread.join_workers.count(pc) != 0 || location->is_end_function())
-      return fail_step("deterministic_lifecycle");
+      join != thread.join_workers.end() &&
+      !state.completed[join->second])
+      return fail_step("deterministic_blocked_join");
+    if(location->is_end_function())
+    {
+      state.active[thread_index] = false;
+      state.completed[thread_index] = true;
+      state.pcs[thread_index] = thread.locations.size();
+      if(state.atomic_owner == static_cast<int>(thread_index))
+        return fail_step("atomic_end_function");
+      return true;
+    }
     const auto next_location = std::next(location);
     if(next_location == thread.program->instructions.end())
       return fail_step("deterministic_fallthrough");
@@ -5282,9 +5921,19 @@ private:
     }
     else if(location->is_assign())
     {
+      if(finite_boolean_nondet_assignment(
+           location->assign_lhs(), location->assign_rhs()))
+        return fail_step("deterministic_nondet_assignment");
       if(!apply_assignment(
            location->assign_lhs(), location->assign_rhs(), state))
         return false;
+    }
+
+    if(spawn != thread.spawn_workers.end())
+    {
+      if(state.active[spawn->second] || state.completed[spawn->second])
+        return fail_step("worker_reactivation");
+      state.active[spawn->second] = true;
     }
     else if(location->is_assert())
     {
@@ -5325,8 +5974,8 @@ private:
       return !failed;
     }
 
-    state.pcs[thread_index] = index_of(thread, next_location);
-    return !failed;
+    state.pcs[thread_index] = pc + 1;
+    return true;
   }
 
   bool step(
@@ -5397,6 +6046,22 @@ private:
     }
     else if(location->is_assign())
     {
+      if(finite_boolean_nondet_assignment(
+           location->assign_lhs(), location->assign_rhs()))
+      {
+        const auto target = symbol_indices.find(location->assign_lhs());
+        if(target == symbol_indices.end())
+          return fail_step("finite_nondet_slot");
+        for(unsigned value = 0; value != 2; ++value)
+        {
+          finite_product_statet next = base;
+          mutable_state_values(next)[target->second] = intern_state_value(
+            from_integer(value, symbols[target->second].type()));
+          next.pcs[thread_index] = pc + 1;
+          successors.push_back(std::move(next));
+        }
+        return true;
+      }
       if(!apply_assignment(
            location->assign_lhs(), location->assign_rhs(), base))
         return false;
@@ -5441,9 +6106,7 @@ private:
       return true;
     }
 
-    base.pcs[thread_index] = index_of(thread, next_location);
-    if(failed)
-      return false;
+    base.pcs[thread_index] = pc + 1;
     successors.push_back(std::move(base));
     return true;
   }
@@ -5461,53 +6124,26 @@ private:
       reinterpret_cast<const char *>(&value), sizeof(value));
   }
 
-  static void append_state_value(std::string &out, const exprt &value)
+  static void append_state_value(
+    std::string &out,
+    const std::size_t value_id)
   {
-    if(value.is_nil())
+    if(value_id == nil_value_id)
       out.push_back('U');
-    else if(value.is_true())
-      out.push_back('T');
-    else if(value.is_false())
-      out.push_back('F');
-    else if(value.id() == ID_constant)
-    {
-      out.push_back('C');
-      const std::string text =
-        id2string(to_constant_expr(value).get_value());
-      const std::size_t size = text.size();
-      append_binary(out, size);
-      out.append(text);
-    }
-    else if(value.id() == ID_address_of)
-    {
-      INVARIANT(
-        exact_product_lvalue(to_address_of_expr(value).object()),
-        "finite product pointer states contain exact object addresses");
-      out.push_back('P');
-      const std::string text = value.pretty();
-      const std::size_t size = text.size();
-      append_binary(out, size);
-      out.append(text);
-    }
-    else if(is_exact_constant(value))
-    {
-      out.push_back('Q');
-      const std::string text = value.pretty();
-      const std::size_t size = text.size();
-      append_binary(out, size);
-      out.append(text);
-    }
     else
-      INVARIANT(false, "finite product states contain exact constants");
+    {
+      out.push_back('V');
+      append_binary(out, value_id);
+    }
   }
 
-  std::string key(const finite_product_statet &state) const
+  std::string key(const finite_product_statet &state)
   {
     std::string out;
     out.reserve(
       sizeof(state.atomic_owner) +
       state.pcs.size() * (sizeof(std::size_t) + 2) +
-      state.values.size() * 4);
+      state.values->size() * 4);
     append_binary(out, state.atomic_owner);
     for(std::size_t index = 0; index < state.pcs.size(); ++index)
     {
@@ -5532,7 +6168,7 @@ private:
         for(const auto slot : group.local_slots[member])
         {
           if(local_slot_live(slot, state))
-            append_state_value(configuration, state.values[slot]);
+            append_state_value(configuration, (*state.values)[slot]);
         }
         configurations.push_back(std::move(configuration));
       }
@@ -5544,10 +6180,10 @@ private:
         out.append(configuration);
       }
     }
-    for(std::size_t index = 0; index < state.values.size(); ++index)
+    for(std::size_t index = 0; index < state.values->size(); ++index)
     {
       if(!symmetric_slot_mask[index] && local_slot_live(index, state))
-        append_state_value(out, state.values[index]);
+        append_state_value(out, (*state.values)[index]);
     }
     return out;
   }
