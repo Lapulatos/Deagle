@@ -305,6 +305,44 @@ void goto_function_inline(
   goto_inline.goto_inline(function, goto_function, inline_map, true);
 }
 
+void goto_function_inline_with_unwind_assertion(
+  goto_modelt &goto_model,
+  const irep_idt function,
+  message_handlert &message_handler,
+  unsigned recursion_unwind_limit)
+{
+  PRECONDITION(recursion_unwind_limit > 0);
+  const namespacet ns(goto_model.symbol_table);
+  goto_inlinet goto_inline(
+    goto_model.goto_functions,
+    ns,
+    message_handler,
+    false,
+    true,
+    recursion_unwind_limit,
+    true,
+    &goto_model.symbol_table);
+
+  const auto function_it =
+    goto_model.goto_functions.function_map.find(function);
+  if(
+    function_it == goto_model.goto_functions.function_map.end() ||
+    !function_it->second.body_available())
+    return;
+
+  goto_inlinet::inline_mapt inline_map;
+  auto &call_list = inline_map[function_it->first];
+  for(auto instruction = function_it->second.body.instructions.begin();
+      instruction != function_it->second.body.instructions.end();
+      ++instruction)
+  {
+    if(instruction->is_function_call())
+      call_list.emplace_back(instruction, true);
+  }
+  goto_inline.goto_inline(
+    function, function_it->second, inline_map, false);
+}
+
 jsont goto_function_inline_and_log(
   goto_modelt &goto_model,
   const irep_idt function,

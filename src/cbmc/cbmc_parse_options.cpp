@@ -1889,6 +1889,19 @@ int cbmc_parse_optionst::doit()
       native_model_transformed;
 
   if(
+    !cmdline.isset("native-jces") &&
+    !cmdline.isset("unwind-suggest") &&
+    interference_predicate_finite_product_auto(
+      goto_model, ui_message_handler) ==
+      interference_predicate_resultt::SAFE &&
+    output_native_correctness_witness(
+      goto_model, options, native_witness_guards))
+  {
+    std::cout << "VERIFICATION SUCCESSFUL\n";
+    return CPROVER_EXIT_SUCCESS;
+  }
+
+  if(
     cmdline.isset("native-jces") &&
     !cmdline.isset("unwind-suggest") &&
     interference_predicate_finite_product_auto(

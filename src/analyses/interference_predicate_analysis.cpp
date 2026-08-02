@@ -182,6 +182,28 @@ bool state_resolvable_product_lvalue_shape(const exprt &input)
       state_resolvable_product_lvalue_shape(pointer) &&
       !has_subexpr(pointer, ID_if);
   }
+  if(expression.id() == ID_plus && expression.operands().size() == 2)
+  {
+    const exprt *pointer = nullptr;
+    const exprt *offset = nullptr;
+    for(const auto &operand : expression.operands())
+    {
+      if(skip_typecast(operand).type().id() == ID_pointer)
+      {
+        if(pointer != nullptr)
+          return false;
+        pointer = &operand;
+      }
+      else
+        offset = &operand;
+    }
+    return
+      pointer != nullptr && offset != nullptr &&
+      state_resolvable_product_lvalue_shape(*pointer) &&
+      !has_subexpr(*offset, ID_dereference) &&
+      !has_subexpr(*offset, ID_if) &&
+      !has_subexpr(*offset, ID_side_effect);
+  }
   return false;
 }
 
@@ -216,6 +238,18 @@ bool state_resolvable_scalar_dereferences(
   const namespacet &ns)
 {
   const exprt &expression = skip_typecast(input);
+  if(expression.id() == ID_member)
+  {
+    const typet &member_type = ns.follow(expression.type());
+    const exprt &compound =
+      skip_typecast(to_member_expr(expression).struct_op());
+    if(
+      member_type.id() != ID_array && member_type.id() != ID_struct &&
+      member_type.id() != ID_union && compound.id() == ID_dereference &&
+      state_resolvable_product_lvalue_shape(
+        to_dereference_expr(compound).pointer()))
+      return true;
+  }
   if(expression.id() == ID_dereference)
   {
     const typet &type = ns.follow(expression.type());
@@ -424,6 +458,7 @@ bool resolve_product_expression(
     return true;
   expression = original;
   dereference(function_id, location, expression, ns, value_sets);
+  expression = simplify_expr(std::move(expression), ns);
   const exprt &resolved_root = skip_typecast(expression);
   if(
     has_invalid_product_object(expression) &&
@@ -459,6 +494,11 @@ bool resolve_product_expression(
   const bool resolved =
     !has_subexpr(expression, ID_dereference) &&
     !has_subexpr(expression, ID_if);
+  if(!resolved && state_resolvable_scalar_dereferences(original, ns))
+  {
+    expression = original;
+    return true;
+  }
   if(
     !resolved && original_root.id() == ID_address_of &&
     state_resolvable_product_lvalue_shape(
@@ -527,6 +567,7 @@ bool lower_unique_product_dereferences(
         const bool direct_lhs =
           rhs_resolved &&
           (direct_product_lvalue(lhs) ||
+           state_resolvable_product_lvalue_shape(lhs) ||
            skip_typecast(lhs).id() == ID_dereference ||
            finite_product_byte_extract_lvalue_shape(lhs));
         if(!lhs_resolved || !rhs_resolved || !direct_lhs)
@@ -600,8 +641,7 @@ bool isolate_product_thread_locals(
       if(instruction.has_condition())
         collect_product_symbol_ids(instruction.condition(), identifiers);
     }
-    replace_symbolt replacement;
-    std::vector<symbolt> cloned_symbols;
+    std::vector<std::pair<const symbolt *, irep_idt>> clone_plan;
     for(const auto &identifier : identifiers)
     {
       const auto original = model.symbol_table.symbols.find(identifier);
@@ -614,14 +654,35 @@ bool isolate_product_thread_locals(
         std::to_string(thread_index) + "$" + id2string(identifier);
       if(model.symbol_table.symbols.count(cloned_identifier) != 0)
         return false;
-      symbolt cloned = original->second;
-      cloned.name = cloned_identifier;
-      cloned.base_name = cloned_identifier;
-      cloned.pretty_name = cloned_identifier;
+      clone_plan.emplace_back(&original->second, cloned_identifier);
+    }
+
+    // A VLA variable's type contains its local array-size symbol. Clone all
+    // identifiers first, then rewrite both the declared symbol types and every
+    // expression type with one complete map. Using the ordinary checked
+    // replacement one symbol at a time would transiently pair a cloned size
+    // with the old array type and violate type consistency.
+    unchecked_replace_symbolt type_replacement;
+    for(const auto &planned : clone_plan)
+      type_replacement.insert(
+        symbol_exprt(planned.first->name, planned.first->type),
+        symbol_exprt(planned.second, planned.first->type));
+
+    unchecked_replace_symbolt replacement;
+    std::vector<symbolt> cloned_symbols;
+    for(const auto &planned : clone_plan)
+    {
+      symbolt cloned = *planned.first;
+      cloned.name = planned.second;
+      cloned.base_name = planned.second;
+      cloned.pretty_name = planned.second;
+      type_replacement.replace(cloned.type);
+      if(cloned.value.is_not_nil())
+        type_replacement.replace(cloned.value);
       cloned_symbols.push_back(cloned);
-      replacement.set(
-        symbol_exprt(identifier, original->second.type),
-        symbol_exprt(cloned_identifier, original->second.type));
+      replacement.insert(
+        symbol_exprt(planned.first->name, planned.first->type),
+        symbol_exprt(planned.second, cloned.type));
     }
     for(const auto &symbol : cloned_symbols)
     {
@@ -662,6 +723,10 @@ void collect_product_thread_local_ids(
   irep_idt identifier;
   if(product_thread_local_symbol(expression, ns, identifier))
     identifiers.insert(identifier);
+  const typet &type = ns.follow(expression.type());
+  if(type.id() == ID_array)
+    collect_product_thread_local_ids(
+      to_array_type(type).size(), ns, identifiers);
   for(const auto &operand : expression.operands())
     collect_product_thread_local_ids(operand, ns, identifiers);
 }
@@ -3691,7 +3756,9 @@ public:
   finite_product_runnert(
     goto_modelt &model,
     const std::vector<irep_idt> &thread_ids,
-    const std::vector<bool> &may_have_multiple_instances)
+    const std::vector<bool> &may_have_multiple_instances,
+    const std::size_t location_limit,
+    const std::size_t symbol_limit)
     : model(model), ns(model.symbol_table)
   {
     if(thread_ids.size() < 2 || thread_ids.size() > max_workers)
@@ -3723,12 +3790,12 @@ public:
         fail("missing_thread_body");
         return;
       }
-      if(function->second.body.instructions.size() > max_locations_per_worker)
+      if(function->second.body.instructions.size() > location_limit)
       {
         std::cout << "V225_FINITE_PRODUCT_LOCATION_CAP entry=" << thread_id
                   << " locations="
                   << function->second.body.instructions.size()
-                  << " cap=" << max_locations_per_worker << '\n';
+                  << " cap=" << location_limit << '\n';
         fail("location_cap");
         return;
       }
@@ -3755,7 +3822,7 @@ public:
                   << from_expr(ns, irep_idt(), object) << '}';
       std::cout << '\n';
     }
-    if(symbols.empty() || symbols.size() > max_symbols)
+    if(symbols.empty() || symbols.size() > symbol_limit)
     {
       fail("symbol_count");
       return;
@@ -4046,10 +4113,6 @@ public:
 
 private:
   static constexpr std::size_t max_workers = 5;
-  // Diagnostic headroom only: the release gate still needs a structural
-  // resource predictor that excludes the expensive recursive-MCS product.
-  static constexpr std::size_t max_symbols = 340;
-  static constexpr std::size_t max_locations_per_worker = 2048;
   static constexpr std::size_t max_states = 5000000;
   static constexpr std::size_t max_transitions = 20000000;
   static constexpr std::size_t max_assignment_normalization_cache_entries =
@@ -4199,19 +4262,19 @@ private:
       const exprt &array = skip_typecast(index.array());
       const typet &array_type = ns.follow(array.type());
       if(
-        array_type.id() != ID_array || array.id() != ID_symbol ||
+        array_type.id() != ID_array ||
         !direct_product_lvalue(array))
         return false;
       const auto size =
         numeric_cast<std::size_t>(to_array_type(array_type).size());
       constexpr std::size_t max_finite_member_elements = 8;
-      if(
-        !size.has_value() || *size == 0 ||
-        *size > max_finite_member_elements)
+      if(size.has_value() && (*size == 0 || *size > max_finite_member_elements))
         return false;
+      const std::size_t element_count =
+        size.has_value() ? *size : max_finite_member_elements;
       elements.clear();
-      elements.reserve(*size);
-      for(std::size_t element = 0; element < *size; ++element)
+      elements.reserve(element_count);
+      for(std::size_t element = 0; element < element_count; ++element)
       {
         exprt candidate = index_exprt(
           array, from_integer(element, index.index().type()), base.type());
@@ -4239,18 +4302,18 @@ private:
     const auto size =
       numeric_cast<std::size_t>(to_array_type(array_type).size());
     constexpr std::size_t max_finite_index_elements = 8;
-    if(
-      !size.has_value() || *size == 0 ||
-      *size > max_finite_index_elements)
+    if(size.has_value() && (*size == 0 || *size > max_finite_index_elements))
       return false;
+    const std::size_t element_count =
+      size.has_value() ? *size : max_finite_index_elements;
     const typet &element_type = ns.follow(expr.type());
     if(
       element_type.id() == ID_array || element_type.id() == ID_struct ||
       element_type.id() == ID_union || element_type.id() == ID_code)
       return false;
     elements.clear();
-    elements.reserve(*size);
-    for(std::size_t element = 0; element < *size; ++element)
+    elements.reserve(element_count);
+    for(std::size_t element = 0; element < element_count; ++element)
     {
       exprt constant_index = from_integer(element, index.index().type());
       exprt candidate = index_exprt(array, constant_index, expr.type());
@@ -4482,6 +4545,46 @@ private:
       left_symbol->is_static_lifetime && right_symbol->is_static_lifetime;
   }
 
+  bool distinct_exact_product_objects(
+    const exprt &left_input,
+    const exprt &right_input) const
+  {
+    const exprt &left = skip_typecast(left_input);
+    const exprt &right = skip_typecast(right_input);
+    if(left == right)
+      return false;
+    if(left.id() == ID_member && right.id() == ID_member)
+    {
+      const auto &left_member = to_member_expr(left);
+      const auto &right_member = to_member_expr(right);
+      if(left_member.get_component_name() != right_member.get_component_name())
+      {
+        const typet &compound = ns.follow(left_member.struct_op().type());
+        return
+          compound.id() == ID_struct &&
+          left_member.struct_op() == right_member.struct_op();
+      }
+      return distinct_exact_product_objects(
+        left_member.struct_op(), right_member.struct_op());
+    }
+    if(left.id() == ID_index && right.id() == ID_index)
+    {
+      const auto &left_index = to_index_expr(left);
+      const auto &right_index = to_index_expr(right);
+      if(left_index.array() != right_index.array())
+        return distinct_exact_product_objects(
+          left_index.array(), right_index.array());
+      const auto left_value = numeric_cast<mp_integer>(
+        skip_typecast(left_index.index()));
+      const auto right_value = numeric_cast<mp_integer>(
+        skip_typecast(right_index.index()));
+      return
+        left_value.has_value() && right_value.has_value() &&
+        *left_value != *right_value;
+    }
+    return distinct_static_root_objects(left, right);
+  }
+
   void evaluate_exact_pointer_comparisons(exprt &value) const
   {
     for(auto &operand : value.operands())
@@ -4515,6 +4618,8 @@ private:
         equality = true;
       else if(distinct_exact_array_elements(objects[0], objects[1]))
         equality = false;
+      else if(distinct_exact_product_objects(objects[0], objects[1]))
+        equality = false;
       else if(distinct_static_root_objects(objects[0], objects[1]))
         equality = false;
       else
@@ -4547,10 +4652,15 @@ private:
     {
       const exprt *root = &object;
       bool has_member = false;
-      while(root->id() == ID_member)
+      while(root->id() == ID_member || root->id() == ID_index)
       {
-        has_member = true;
-        root = &to_member_expr(*root).struct_op();
+        if(root->id() == ID_member)
+        {
+          has_member = true;
+          root = &to_member_expr(*root).struct_op();
+        }
+        else
+          root = &to_index_expr(*root).array();
       }
       if(has_member && *root == lhs)
         return true;
@@ -4571,10 +4681,15 @@ private:
       const exprt &object = symbols[index];
       const exprt *root = &object;
       bool has_member = false;
-      while(root->id() == ID_member)
+      while(root->id() == ID_member || root->id() == ID_index)
       {
-        has_member = true;
-        root = &to_member_expr(*root).struct_op();
+        if(root->id() == ID_member)
+        {
+          has_member = true;
+          root = &to_member_expr(*root).struct_op();
+        }
+        else
+          root = &to_index_expr(*root).array();
       }
       if(!has_member || *root != lhs)
         continue;
@@ -4591,6 +4706,8 @@ private:
     const exprt &rhs,
     finite_product_statet &state)
   {
+    if(!dynamic_product_indices_in_bounds(lhs, state))
+      return fail_step("dynamic_index_bounds");
     const auto tracked = symbol_indices.find(lhs);
     std::vector<std::pair<std::size_t, exprt>> updates;
     if(tracked != symbol_indices.end())
@@ -4607,7 +4724,34 @@ private:
         return fail_step("finite_dereference_target");
       const auto exact = symbol_indices.find(object);
       if(exact == symbol_indices.end())
+      {
+        if(std::getenv("DEAGLE_FINITE_PRODUCT_AUDIT") != nullptr)
+          std::cout << "V225_FINITE_PRODUCT_DEREFERENCE_SLOT lhs={"
+                    << from_expr(ns, irep_idt(), lhs) << "} pointer={"
+                    << from_expr(ns, irep_idt(), pointer) << "} object={"
+                    << from_expr(ns, irep_idt(), object) << "}"
+                    << std::endl;
         return fail_step("finite_dereference_slot");
+      }
+      updates.emplace_back(exact->second, rhs);
+    }
+    else if(
+      state_resolvable_product_lvalue_shape(lhs) &&
+      (!direct_product_lvalue(lhs) || has_subexpr(lhs, ID_index)))
+    {
+      exprt exact_lhs = lhs;
+      substitute_lvalue_indices(exact_lhs, state);
+      exact_lhs = simplify_expr(std::move(exact_lhs), ns);
+      const auto exact = symbol_indices.find(exact_lhs);
+      if(exact == symbol_indices.end())
+      {
+        if(std::getenv("DEAGLE_FINITE_PRODUCT_AUDIT") != nullptr)
+          std::cout << "V225_FINITE_PRODUCT_STATE_LVALUE_SLOT lhs={"
+                    << from_expr(ns, irep_idt(), lhs) << "} resolved={"
+                    << from_expr(ns, irep_idt(), exact_lhs) << "}"
+                    << std::endl;
+        return fail_step("finite_state_lvalue_slot");
+      }
       updates.emplace_back(exact->second, rhs);
     }
     else if(
@@ -5119,6 +5263,13 @@ private:
       const exprt &base_index = skip_typecast(*indexed);
       if(base_index.id() != ID_index)
         return;
+      const typet &array_type =
+        ns.follow(to_index_expr(base_index).array().type());
+      if(
+        array_type.id() == ID_array &&
+        !numeric_cast<std::size_t>(
+           to_array_type(array_type).size()).has_value())
+        collect_expr_symbols(to_array_type(array_type).size(), result);
       collect_expr_symbols(to_index_expr(base_index).index(), result);
       return;
     }
@@ -5131,6 +5282,23 @@ private:
     }
     for(const auto &operand : expr.operands())
       collect_expr_symbols(operand, result);
+  }
+
+  void collect_dereference_target_types(
+    const exprt &input,
+    std::set<typet> &types) const
+  {
+    const exprt &expression = skip_typecast(input);
+    if(expression.id() == ID_dereference)
+    {
+      const typet &type = ns.follow(expression.type());
+      if(
+        type.id() != ID_array && type.id() != ID_struct &&
+        type.id() != ID_union && type.id() != ID_code)
+        types.insert(expression.type());
+    }
+    for(const auto &operand : expression.operands())
+      collect_dereference_target_types(operand, types);
   }
 
   bool collect_exact_subobjects_of_type(
@@ -5191,12 +5359,17 @@ private:
   void collect_shared_symbols()
   {
     std::set<exprt> found;
+    std::set<typet> dereference_target_types;
     for(const auto &thread : threads)
     {
       for(const auto location : thread.locations)
       {
         if(location->is_assign())
         {
+          collect_dereference_target_types(
+            location->assign_lhs(), dereference_target_types);
+          collect_dereference_target_types(
+            location->assign_rhs(), dereference_target_types);
           const exprt &lhs = skip_typecast(location->assign_lhs());
           if(
             lhs.id() == ID_byte_extract_little_endian ||
@@ -5217,7 +5390,28 @@ private:
         else if(
           location->is_assume() || location->is_assert() ||
           location->is_goto())
+        {
+          collect_dereference_target_types(
+            location->condition(), dereference_target_types);
           collect_expr_symbols(location->condition(), found);
+        }
+      }
+    }
+    const std::vector<exprt> directly_found(found.begin(), found.end());
+    for(const auto &object : directly_found)
+    {
+      const exprt *cursor = &object;
+      while(skip_typecast(*cursor).id() == ID_member)
+      {
+        const exprt &parent =
+          to_member_expr(skip_typecast(*cursor)).struct_op();
+        for(const auto &target_type : dereference_target_types)
+        {
+          std::size_t added = 0;
+          collect_exact_subobjects_of_type(
+            parent, target_type, found, added);
+        }
+        cursor = &parent;
       }
     }
     symbols.assign(found.begin(), found.end());
@@ -5429,9 +5623,8 @@ private:
     if(expr.id() == ID_index)
     {
       std::vector<exprt> elements;
-      if(!finite_index_elements(expr, elements))
-        return false;
       if(
+        finite_index_elements(expr, elements) &&
         !std::all_of(
           elements.begin(),
           elements.end(),
@@ -5439,7 +5632,8 @@ private:
             return symbol_indices.find(element) != symbol_indices.end();
           }))
         return false;
-      return expression_supported(to_index_expr(expr).index());
+      if(!elements.empty())
+        return expression_supported(to_index_expr(expr).index());
     }
     if(expr.id() == ID_member)
     {
@@ -5463,6 +5657,13 @@ private:
         return expression_supported(to_index_expr(base_index).index());
       }
     }
+    const typet &resolved_type = ns.follow(expr.type());
+    if(
+      resolved_type.id() != ID_array && resolved_type.id() != ID_struct &&
+      resolved_type.id() != ID_union && resolved_type.id() != ID_code &&
+      state_resolvable_product_lvalue_shape(expr) &&
+      !has_subexpr(expr, ID_side_effect) && !has_subexpr(expr, ID_if))
+      return true;
     if(
       expr.id() == ID_side_effect)
     {
@@ -5520,6 +5721,8 @@ private:
           const bool finite_index = finite_index_lvalue(lhs);
           const bool finite_dereference =
             finite_dereference_lvalue(lhs);
+          const bool finite_state_lvalue =
+            state_resolvable_product_lvalue_shape(lhs);
           const bool finite_byte_extract =
             finite_byte_extract_lvalue(lhs);
           const bool finite_boolean_nondet =
@@ -5529,7 +5732,8 @@ private:
             return fail("atomic_nondet_assignment");
           if(
             (tracked != symbol_indices.end() || finite_index ||
-             finite_dereference || finite_byte_extract) &&
+             finite_dereference || finite_state_lvalue ||
+             finite_byte_extract) &&
             !finite_boolean_nondet &&
             !expression_supported(location->assign_rhs()))
           {
@@ -5545,7 +5749,8 @@ private:
           }
           if(
             tracked == symbol_indices.end() && !finite_index &&
-            !finite_dereference && !finite_byte_extract &&
+            !finite_dereference && !finite_state_lvalue &&
+            !finite_byte_extract &&
             (!direct_product_lvalue(lhs) || product_scalar_object(lhs)))
           {
             if(std::getenv("DEAGLE_FINITE_PRODUCT_AUDIT") != nullptr)
@@ -5687,6 +5892,51 @@ private:
       substitute_lvalue_indices(to_typecast_expr(lvalue).op(), state);
   }
 
+  bool dynamic_product_indices_in_bounds(
+    const exprt &input,
+    const finite_product_statet &state)
+  {
+    const exprt &expression = skip_typecast(input);
+    if(expression.id() == ID_index)
+    {
+      const auto &index = to_index_expr(expression);
+      const typet &array_type = ns.follow(index.array().type());
+      if(array_type.id() == ID_array)
+      {
+        const exprt &size_expression = to_array_type(array_type).size();
+        if(!numeric_cast<std::size_t>(size_expression).has_value())
+        {
+          exprt exact_size = size_expression;
+          substitute_state_values(exact_size, state);
+          exact_size = simplify_expr(std::move(exact_size), ns);
+          exprt exact_index = index.index();
+          substitute_state_values(exact_index, state);
+          exact_index = simplify_expr(std::move(exact_index), ns);
+          const auto size = numeric_cast<mp_integer>(exact_size);
+          const auto offset = numeric_cast<mp_integer>(exact_index);
+          constexpr std::size_t max_dynamic_elements = 8;
+          if(
+            !size.has_value() || !offset.has_value() || *size <= 0 ||
+            *size > max_dynamic_elements || *offset < 0 || *offset >= *size)
+          {
+            if(std::getenv("DEAGLE_FINITE_PRODUCT_AUDIT") != nullptr)
+              std::cout << "V225_FINITE_PRODUCT_DYNAMIC_INDEX_BOUNDS expr={"
+                        << from_expr(ns, irep_idt(), expression)
+                        << "} size={" << from_expr(ns, irep_idt(), exact_size)
+                        << "} index={"
+                        << from_expr(ns, irep_idt(), exact_index) << "}"
+                        << std::endl;
+            return false;
+          }
+        }
+      }
+    }
+    for(const auto &operand : expression.operands())
+      if(!dynamic_product_indices_in_bounds(operand, state))
+        return false;
+    return true;
+  }
+
   bool evaluate_simple_exact_expression(
     const exprt &input,
     const finite_product_statet &state,
@@ -5744,6 +5994,11 @@ private:
     const finite_product_statet &state,
     exprt &result)
   {
+    if(!dynamic_product_indices_in_bounds(input, state))
+    {
+      fail("dynamic_index_bounds");
+      return false;
+    }
     if(evaluate_simple_exact_expression(input, state, result))
       return true;
     result = input;
@@ -7279,6 +7534,7 @@ interference_predicate_resultt interference_predicate_fixedpoint(
   analysis_model.symbol_table = goto_model.symbol_table;
   analysis_model.goto_functions.copy_from(goto_model.goto_functions);
   std::set<irep_idt> materialized_entries;
+  bool finite_product_recursive = false;
   if(finite_product_mode)
   {
     goto_modelt materialized_model;
@@ -7385,11 +7641,11 @@ interference_predicate_resultt interference_predicate_fixedpoint(
          thread_ids,
          recursive_function))
     {
-      std::cout << "V225_FINITE_PRODUCT result=UNKNOWN "
-                   "reason=recursive_call_graph function="
-                << recursive_function
-                << " states_or_transitions=0\n";
-      return interference_predicate_resultt::UNKNOWN;
+      finite_product_recursive = true;
+      constexpr unsigned recursion_unwind_limit = 4;
+      std::cout << "V225_FINITE_PRODUCT_RECURSION function="
+                << recursive_function << " unwind="
+                << recursion_unwind_limit << '\n';
     }
   }
   for(const auto &thread_id : thread_ids)
@@ -7407,7 +7663,19 @@ interference_predicate_resultt interference_predicate_fixedpoint(
                       : function->second.body.instructions.size())
                 << std::endl;
     }
-    goto_function_inline(analysis_model, thread_id, message_handler, false, false);
+    if(finite_product_mode)
+    {
+      const unsigned recursion_unwind_limit =
+        finite_product_recursive && thread_id != main_entry ? 2 : 4;
+      goto_function_inline_with_unwind_assertion(
+        analysis_model,
+        thread_id,
+        message_handler,
+        recursion_unwind_limit);
+    }
+    else
+      goto_function_inline(
+        analysis_model, thread_id, message_handler, false, false);
     if(
       finite_product_mode &&
       std::getenv("DEAGLE_FINITE_PRODUCT_AUDIT") != nullptr)
@@ -7491,7 +7759,11 @@ interference_predicate_resultt interference_predicate_fixedpoint(
     if(dead_locals_eliminated)
     {
       finite_product_runnert finite_product(
-        product_model, thread_ids, thread_multiple_instances);
+        product_model,
+        thread_ids,
+        thread_multiple_instances,
+        finite_product_recursive ? 4096 : 2048,
+        finite_product_recursive ? 512 : 340);
       const auto result = finite_product.run();
       if(result == interference_predicate_resultt::SAFE)
         return result;

@@ -17,8 +17,10 @@ Author: Daniel Kroening, kroening@kroening.com
 
 #include <util/cprover_prefix.h>
 #include <util/invariant.h>
+#include <util/replace_symbol.h>
 #include <util/std_code.h>
 #include <util/symbol.h>
+#include <util/symbol_table_base.h>
 
 void goto_inlinet::parameter_assignments(
   const goto_programt::targett target,
@@ -331,18 +333,31 @@ void goto_inlinet::expand_function_call(
     return;
 
   // see if we are already expanding it
-  if(recursion_set.find(identifier)!=recursion_set.end())
+  const auto recursion = recursion_set.find(identifier);
+  if(recursion != recursion_set.end())
   {
-    // it's recursive.
-    // Uh. Buh. Give up.
-    log.warning().source_location = function.find_source_location();
-    log.warning() << "recursion is ignored on call to '" << identifier << "'"
-                  << messaget::eom;
+    if(
+      recursion_unwind_limit == 0 ||
+      recursion->second >= recursion_unwind_limit)
+    {
+      log.warning().source_location = function.find_source_location();
+      log.warning() << "recursion unwind boundary on call to '" << identifier
+                    << "'" << messaget::eom;
 
-    if(force_full)
-      target->turn_into_skip();
+      if(recursion_unwind_assert)
+      {
+        const source_locationt source_location = target->source_location();
+        *target = goto_programt::make_assertion(
+          false_exprt(), source_location);
+        target->source_location_nonconst().set_property_class("unwind");
+        target->source_location_nonconst().set_comment(
+          "bounded recursion unwinding assertion");
+      }
+      else if(force_full)
+        target->turn_into_skip();
 
-    return;
+      return;
+    }
   }
 
   goto_functionst::function_mapt::iterator f_it=
@@ -514,7 +529,7 @@ void goto_inlinet::goto_inline_nontransitive(
   if(call_list.empty())
     return;
 
-  recursion_set.insert(identifier);
+  ++recursion_set[identifier];
 
   for(const auto &call : call_list)
   {
@@ -531,7 +546,8 @@ void goto_inlinet::goto_inline_nontransitive(
       call.first);
   }
 
-  recursion_set.erase(identifier);
+  if(--recursion_set[identifier] == 0)
+    recursion_set.erase(identifier);
 
   // remove_skip(goto_program);
   // goto_program.update(); // does not change loop ids
@@ -546,7 +562,17 @@ const goto_inlinet::goto_functiont &goto_inlinet::goto_inline_transitive(
 {
   PRECONDITION(goto_function.body_available());
 
-  cachet::const_iterator c_it=cache.find(identifier);
+  irep_idt cache_identifier = identifier;
+  if(recursion_unwind_limit != 0)
+  {
+    const auto recursion = recursion_set.find(identifier);
+    const unsigned depth =
+      recursion == recursion_set.end() ? 0 : recursion->second;
+    cache_identifier = id2string(identifier) + "$recursion_unwind$" +
+                       std::to_string(depth);
+  }
+
+  cachet::const_iterator c_it=cache.find(cache_identifier);
 
   if(c_it!=cache.end())
   {
@@ -557,7 +583,7 @@ const goto_inlinet::goto_functiont &goto_inlinet::goto_inline_transitive(
     return cached;
   }
 
-  goto_functiont &cached=cache[identifier];
+  goto_functiont &cached=cache[cache_identifier];
   DATA_INVARIANT(
     cached.body.empty(), "body of new function in cache must be empty");
 
@@ -567,6 +593,69 @@ const goto_inlinet::goto_functiont &goto_inlinet::goto_inline_transitive(
 
   cached.copy_from(goto_function); // location numbers not changed
   inline_log.copy_from(goto_function.body, cached.body);
+
+  const auto recursion = recursion_set.find(identifier);
+  const unsigned recursion_depth =
+    recursion == recursion_set.end() ? 0 : recursion->second;
+  if(recursion_depth != 0)
+  {
+    CHECK_RETURN(mutable_symbol_table != nullptr);
+    std::set<irep_idt> frame_identifiers(
+      cached.parameter_identifiers.begin(),
+      cached.parameter_identifiers.end());
+    for(const auto &instruction : cached.body.instructions)
+      if(instruction.is_decl())
+        frame_identifiers.insert(
+          instruction.decl_symbol().get_identifier());
+
+    unchecked_replace_symbolt type_replacement;
+    for(const auto &frame_identifier : frame_identifiers)
+    {
+      const symbolt *original = nullptr;
+      if(ns.lookup(frame_identifier, original))
+        continue;
+      const irep_idt clone_identifier =
+        id2string(frame_identifier) + "$recursion_unwind$" +
+        std::to_string(recursion_depth);
+      type_replacement.insert(
+        original->symbol_expr(),
+        symbol_exprt(clone_identifier, original->type));
+    }
+
+    unchecked_replace_symbolt replacement;
+    for(const auto &frame_identifier : frame_identifiers)
+    {
+      const symbolt *original = nullptr;
+      if(ns.lookup(frame_identifier, original))
+        continue;
+      const irep_idt clone_identifier =
+        id2string(frame_identifier) + "$recursion_unwind$" +
+        std::to_string(recursion_depth);
+      symbolt cloned = *original;
+      cloned.name = clone_identifier;
+      cloned.base_name = clone_identifier;
+      cloned.pretty_name = clone_identifier;
+      type_replacement.replace(cloned.type);
+      if(cloned.value.is_not_nil())
+        type_replacement.replace(cloned.value);
+      if(!mutable_symbol_table->has_symbol(clone_identifier))
+        CHECK_RETURN(!mutable_symbol_table->add(cloned));
+      replacement.insert(
+        original->symbol_expr(), symbol_exprt(clone_identifier, cloned.type));
+    }
+    for(auto &parameter : cached.parameter_identifiers)
+    {
+      const auto renamed = replacement.get_expr_map().find(parameter);
+      if(renamed != replacement.get_expr_map().end())
+        parameter = to_symbol_expr(renamed->second).get_identifier();
+    }
+    for(auto &instruction : cached.body.instructions)
+    {
+      replacement.replace(instruction.code_nonconst());
+      if(instruction.has_condition())
+        replacement.replace(instruction.condition_nonconst());
+    }
+  }
 
   goto_programt &goto_program=cached.body;
 
@@ -581,7 +670,7 @@ const goto_inlinet::goto_functiont &goto_inlinet::goto_inline_transitive(
   if(call_list.empty())
     return cached;
 
-  recursion_set.insert(identifier);
+  ++recursion_set[identifier];
 
   for(const auto &call : call_list)
   {
@@ -593,7 +682,8 @@ const goto_inlinet::goto_functiont &goto_inlinet::goto_inline_transitive(
       call);
   }
 
-  recursion_set.erase(identifier);
+  if(--recursion_set[identifier] == 0)
+    recursion_set.erase(identifier);
 
   // remove_skip(goto_program);
   // goto_program.update(); // does not change loop ids

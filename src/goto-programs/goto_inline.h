@@ -67,6 +67,15 @@ void goto_function_inline(
   bool adjust_function=false,
   bool caching=true);
 
+/// Transitively inline calls while replacing any recursion that exceeds the
+/// supplied call-depth limit with an unwinding assertion. A proof may use the
+/// result only if all such assertions are unreachable.
+void goto_function_inline_with_unwind_assertion(
+  goto_modelt &goto_model,
+  const irep_idt function,
+  message_handlert &message_handler,
+  unsigned recursion_unwind_limit);
+
 jsont goto_function_inline_and_log(
   goto_modelt &,
   const irep_idt function,

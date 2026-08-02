@@ -15,12 +15,15 @@ Author: Daniel Kroening, kroening@kroening.com
 #ifndef CPROVER_GOTO_PROGRAMS_GOTO_INLINE_CLASS_H
 #define CPROVER_GOTO_PROGRAMS_GOTO_INLINE_CLASS_H
 
+#include <unordered_map>
 #include <unordered_set>
 
 #include <util/message.h>
 #include <util/json.h>
 
 #include "goto_functions.h"
+
+class symbol_table_baset;
 
 class goto_inlinet
 {
@@ -37,12 +40,18 @@ public:
     const namespacet &ns,
     message_handlert &message_handler,
     bool adjust_function,
-    bool caching = true)
+    bool caching = true,
+    unsigned recursion_unwind_limit = 0,
+    bool recursion_unwind_assert = false,
+    symbol_table_baset *mutable_symbol_table = nullptr)
     : log(message_handler),
       goto_functions(goto_functions),
       ns(ns),
       adjust_function(adjust_function),
-      caching(caching)
+      caching(caching),
+      recursion_unwind_limit(recursion_unwind_limit),
+      recursion_unwind_assert(recursion_unwind_assert),
+      mutable_symbol_table(mutable_symbol_table)
   {
   }
 
@@ -140,6 +149,9 @@ protected:
 
   const bool adjust_function;
   const bool caching;
+  const unsigned recursion_unwind_limit;
+  const bool recursion_unwind_assert;
+  symbol_table_baset *const mutable_symbol_table;
 
   goto_inline_logt inline_log;
 
@@ -207,7 +219,8 @@ protected:
   typedef std::unordered_set<irep_idt> finished_sett;
   finished_sett finished_set;
 
-  typedef std::unordered_set<irep_idt> recursion_sett;
+  typedef std::unordered_map<irep_idt, unsigned, irep_id_hash>
+    recursion_sett;
   recursion_sett recursion_set;
 
   typedef std::unordered_set<irep_idt> no_body_sett;
