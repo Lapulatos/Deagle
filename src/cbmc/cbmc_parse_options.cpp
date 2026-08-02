@@ -12,6 +12,7 @@ Author: Daniel Kroening, kroening@kroening.com
 #include "cbmc_parse_options.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib> // exit()
 #include <chrono>
 #include <cstdio>
@@ -35,6 +36,7 @@ Author: Daniel Kroening, kroening@kroening.com
 #endif
 
 #include <util/config.h>
+#include <util/expr_util.h>
 #include <util/exit_codes.h>
 #include <util/invariant.h>
 #include <util/make_unique.h>
@@ -490,6 +492,78 @@ void normalize_native_witness_condition(exprt &condition)
   }
 }
 
+bool contains_native_witness_null_pointer(const exprt &expression)
+{
+  if(
+    expression.id() == ID_constant && expression.type().id() == ID_pointer &&
+    is_null_pointer(to_constant_expr(expression)))
+    return true;
+  for(const auto &operand : expression.operands())
+  {
+    if(contains_native_witness_null_pointer(operand))
+      return true;
+  }
+  return false;
+}
+
+bool is_native_witness_null_pointer(const exprt &expression)
+{
+  if(
+    expression.id() == ID_constant && expression.type().id() == ID_pointer &&
+    is_null_pointer(to_constant_expr(expression)))
+    return true;
+  return
+    expression.id() == ID_typecast && expression.operands().size() == 1 &&
+    is_native_witness_null_pointer(expression.op0());
+}
+
+std::string native_witness_invariant_text(
+  const namespacet &ns,
+  const irep_idt &function,
+  const exprt &invariant)
+{
+  if(
+    (invariant.id() == ID_equal || invariant.id() == ID_notequal) &&
+    invariant.operands().size() == 2 &&
+    (is_native_witness_null_pointer(invariant.op0()) ||
+     is_native_witness_null_pointer(invariant.op1())))
+  {
+    const exprt &non_null_operand =
+      is_native_witness_null_pointer(invariant.op0())
+        ? invariant.op1()
+        : invariant.op0();
+    return
+      from_expr(ns, function, non_null_operand) +
+      (invariant.id() == ID_equal ? " == 0" : " != 0");
+  }
+
+  std::string text = from_expr(ns, function, invariant);
+  if(!contains_native_witness_null_pointer(invariant))
+    return text;
+
+  std::size_t position = 0;
+  while((position = text.find("NULL", position)) != std::string::npos)
+  {
+    const bool left_boundary =
+      position == 0 ||
+      !(std::isalnum(static_cast<unsigned char>(text[position - 1])) ||
+        text[position - 1] == '_');
+    const std::size_t end = position + 4;
+    const bool right_boundary =
+      end == text.size() ||
+      !(std::isalnum(static_cast<unsigned char>(text[end])) ||
+        text[end] == '_');
+    if(left_boundary && right_boundary)
+    {
+      text.replace(position, 4, "0");
+      ++position;
+    }
+    else
+      position = end;
+  }
+  return text;
+}
+
 bool output_native_correctness_witness(
   const goto_modelt &goto_model,
   const optionst &options,
@@ -527,7 +601,7 @@ bool output_native_correctness_witness(
     normalize_native_witness_condition(invariant);
     simplify_expr(invariant, ns);
     graph[node].invariant =
-      from_expr(ns, assertion.function, invariant);
+      native_witness_invariant_text(ns, assertion.function, invariant);
     graph[node].invariant_scope = id2string(assertion.function);
     graph.add_edge(entry, node);
 
