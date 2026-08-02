@@ -39,6 +39,7 @@ class optionst;
   "(interference-predicate-self-test)" \
   "(interference-predicate-profile)" \
   "(interference-predicate-fixedpoint)" \
+  "(finite-protocol-product)" \
   "(interference-predicate-recursive-worker-fixedpoint)" \
   "(protocol-induced-capacity-cutoff)" \
   "(native-lock-ego-abstraction)" \

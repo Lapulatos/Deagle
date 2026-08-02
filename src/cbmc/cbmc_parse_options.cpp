@@ -19,6 +19,7 @@ Author: Daniel Kroening, kroening@kroening.com
 #include <iostream>
 #include <map>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <vector>
 
@@ -37,6 +38,7 @@ Author: Daniel Kroening, kroening@kroening.com
 #include <util/exit_codes.h>
 #include <util/invariant.h>
 #include <util/make_unique.h>
+#include <util/simplify_expr.h>
 #include <util/version.h>
 
 #ifdef _MSC_VER
@@ -387,6 +389,107 @@ native_witness_assertionst collect_native_witness_assertions(
   return assertions;
 }
 
+native_witness_assertionst collect_native_witness_guard_invariants(
+  const goto_modelt &goto_model)
+{
+  std::set<irep_idt> assertion_functions;
+  for(const auto &function : goto_model.goto_functions.function_map)
+  {
+    if(!function.second.body_available())
+      continue;
+    for(const auto &instruction : function.second.body.instructions)
+    {
+      if(instruction.is_assert())
+      {
+        assertion_functions.insert(function.first);
+        break;
+      }
+    }
+  }
+
+  native_witness_assertionst guards;
+  std::set<irep_idt> called_assertion_functions;
+  for(const auto &function : goto_model.goto_functions.function_map)
+  {
+    if(!function.second.body_available())
+      continue;
+
+    const goto_programt::instructiont *previous = nullptr;
+    for(const auto &instruction : function.second.body.instructions)
+    {
+      if(instruction.is_function_call())
+      {
+        const exprt &callee = instruction.call_function();
+        if(
+          callee.id() == ID_symbol &&
+          assertion_functions.count(to_symbol_expr(callee).get_identifier()) !=
+            0)
+        {
+          const irep_idt callee_id =
+            to_symbol_expr(callee).get_identifier();
+          called_assertion_functions.insert(callee_id);
+          if(
+            previous == nullptr || !previous->is_goto() ||
+            previous->targets.size() != 1 ||
+            previous->get_target()->location_number <=
+              instruction.location_number ||
+            previous->condition().is_true() ||
+            previous->source_location().get_file().empty() ||
+            previous->source_location().get_line().empty())
+            return {};
+
+          guards.push_back(
+            {function.first,
+             previous->source_location(),
+             previous->condition()});
+        }
+      }
+      previous = &instruction;
+    }
+  }
+
+  if(
+    called_assertion_functions.empty() ||
+    called_assertion_functions != assertion_functions)
+    return {};
+  return guards;
+}
+
+void normalize_native_witness_condition(exprt &condition)
+{
+  for(auto &operand : condition.operands())
+    normalize_native_witness_condition(operand);
+
+  if(
+    condition.id() == ID_typecast &&
+    (condition.type().id() == ID_bool ||
+     condition.type().id() == ID_c_bool) &&
+    condition.operands().size() == 1 &&
+    (condition.op0().id() == ID_string_constant ||
+     (condition.op0().id() == ID_address_of &&
+      condition.op0().operands().size() == 1 &&
+      condition.op0().op0().id() == ID_index &&
+      condition.op0().op0().operands().size() == 2 &&
+      condition.op0().op0().op0().id() == ID_string_constant)))
+    condition = true_exprt();
+
+  if(condition.id() == ID_and)
+  {
+    exprt::operandst retained;
+    for(const auto &operand : condition.operands())
+    {
+      if(!operand.is_true())
+        retained.push_back(operand);
+    }
+    if(retained.empty())
+      condition = true_exprt();
+    else if(retained.size() == 1)
+      condition = retained.front();
+    else
+      condition.operands() = std::move(retained);
+  }
+}
+
 bool output_native_correctness_witness(
   const goto_modelt &goto_model,
   const optionst &options,
@@ -420,8 +523,11 @@ bool output_native_correctness_witness(
     graph[node].line = assertion.source_location.get_line();
     graph[node].is_violation = false;
     graph[node].has_invariant = true;
+    exprt invariant = assertion.condition;
+    normalize_native_witness_condition(invariant);
+    simplify_expr(invariant, ns);
     graph[node].invariant =
-      from_expr(ns, assertion.function, assertion.condition);
+      from_expr(ns, assertion.function, invariant);
     graph[node].invariant_scope = id2string(assertion.function);
     graph.add_edge(entry, node);
 
@@ -1155,6 +1261,7 @@ int cbmc_parse_optionst::doit()
   }
 
   native_witness_assertionst native_witness_assertions;
+  native_witness_assertionst native_witness_guards;
   std::unique_ptr<goto_modelt> native_original_replay_model;
   int get_goto_program_ret = get_goto_program(
     goto_model,
@@ -1162,10 +1269,13 @@ int cbmc_parse_optionst::doit()
     cmdline,
     ui_message_handler,
     [&native_witness_assertions,
+     &native_witness_guards,
      &native_original_replay_model,
      this](const goto_modelt &unprocessed_model) {
       native_witness_assertions =
         collect_native_witness_assertions(unprocessed_model);
+      native_witness_guards =
+        collect_native_witness_guard_invariants(unprocessed_model);
       if(cmdline.isset("native-counterexample-rescue-portfolio"))
       {
         native_original_replay_model =
@@ -1707,6 +1817,19 @@ int cbmc_parse_optionst::doit()
   if(
     cmdline.isset("native-jces") &&
     !cmdline.isset("unwind-suggest") &&
+    interference_predicate_finite_product_auto(
+      goto_model, ui_message_handler) ==
+      interference_predicate_resultt::SAFE &&
+    output_native_correctness_witness(
+      goto_model, options, native_witness_guards))
+  {
+    std::cout << "VERIFICATION SUCCESSFUL\n";
+    return CPROVER_EXIT_SUCCESS;
+  }
+
+  if(
+    cmdline.isset("native-jces") &&
+    !cmdline.isset("unwind-suggest") &&
     nested_iteration_homomorphism_proof(
       goto_model, ui_message_handler) &&
     output_native_correctness_witness(
@@ -2078,7 +2201,11 @@ int cbmc_parse_optionst::doit()
   if(cmdline.isset("interference-predicate-fixedpoint"))
   {
     const auto result =
-      interference_predicate_fixedpoint(goto_model, ui_message_handler);
+      interference_predicate_fixedpoint(
+        goto_model,
+        ui_message_handler,
+        false,
+        cmdline.isset("finite-protocol-product"));
     if(
       result == interference_predicate_resultt::SAFE &&
       output_native_correctness_witness(

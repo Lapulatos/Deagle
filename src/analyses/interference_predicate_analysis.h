@@ -25,6 +25,14 @@ bool interference_predicate_profile(
 interference_predicate_resultt interference_predicate_fixedpoint(
   const goto_modelt &goto_model,
   message_handlert &message_handler,
-  bool repeated_single_worker_only = false);
+  bool repeated_single_worker_only = false,
+  bool finite_protocol_product = false);
+
+/// Try the finite protocol product only for a bounded lifecycle shape that is
+/// admitted from the GOTO model itself. Unsupported shapes return UNKNOWN
+/// without changing the input model.
+interference_predicate_resultt interference_predicate_finite_product_auto(
+  const goto_modelt &goto_model,
+  message_handlert &message_handler);
 
 #endif // CPROVER_ANALYSES_INTERFERENCE_PREDICATE_ANALYSIS_H

@@ -208,6 +208,13 @@ bool indexed_lifecycle_prefix_transform(
   goto_modelt &goto_model,
   message_handlert &message_handler);
 
+/// Exactly unroll admitted indexed lifecycle loops while preserving the
+/// complete program suffix. This form is suitable for safety proofs, unlike
+/// the counterexample-only prefix transform above.
+bool indexed_lifecycle_full_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler);
+
 /// Audit two finite, fully joined producer/consumer loops whose condition
 /// variables enforce a one-token alternating execution. This does not mutate
 /// the GOTO model.

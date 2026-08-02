@@ -877,6 +877,30 @@ bool parse_zero_initialization(
   return !to_integer(to_constant_expr(rhs), value) && value == 0;
 }
 
+bool parse_small_constant_initialization(
+  const goto_programt::instructiont &instruction,
+  const irep_idt &identifier,
+  unsigned &value)
+{
+  if(!instruction.is_assign())
+    return false;
+  const exprt &lhs = without_cast(instruction.assign_lhs());
+  if(
+    lhs.id() != ID_symbol ||
+    to_symbol_expr(lhs).get_identifier() != identifier)
+    return false;
+  const exprt &rhs = without_cast(instruction.assign_rhs());
+  if(rhs.id() != ID_constant)
+    return false;
+  mp_integer integer;
+  if(
+    to_integer(to_constant_expr(rhs), integer) || integer < 0 ||
+    integer > 8)
+    return false;
+  value = integer.to_ulong();
+  return true;
+}
+
 bool parse_exit_guard(
   const goto_programt::instructiont &instruction,
   irep_idt &induction,
@@ -7558,12 +7582,9 @@ bool apply_dormant_spawn_counts(
 
 bool constant_lifecycle_bound(const exprt &expr, unsigned &bound)
 {
-  const exprt &value = without_cast(expr);
-  if(value.id() != ID_constant)
-    return false;
   mp_integer integer;
   if(
-    to_integer(to_constant_expr(value), integer) || integer <= 0 ||
+    !constant_eval(expr, {}, integer) || integer <= 0 ||
     integer > 8)
     return false;
   bound = integer.to_ulong();
@@ -7606,11 +7627,14 @@ bool indexed_lifecycle_loop(
     reason = "lifecycle_nonconstant_bound";
     return false;
   }
+  unsigned initial = 0;
   if(
     head == program.instructions.begin() ||
-    !parse_zero_initialization(*std::prev(head), induction))
+    !parse_small_constant_initialization(
+      *std::prev(head), induction, initial) ||
+    initial >= bound)
   {
-    reason = "lifecycle_nonzero_init";
+    reason = "lifecycle_nonconstant_or_empty_range";
     return false;
   }
   if(head == backedge)
@@ -7697,7 +7721,7 @@ bool indexed_lifecycle_loop(
 
   summary.head = head;
   summary.exit = exit;
-  summary.bound = bound;
+  summary.bound = bound - initial;
   summary.induction = induction;
   summary.operation = operation;
   return true;
@@ -16161,16 +16185,20 @@ bool indexed_lifecycle_prefix_audit(
   return !loops.empty();
 }
 
-bool indexed_lifecycle_prefix_transform(
+namespace
+{
+bool indexed_lifecycle_transform(
   goto_modelt &goto_model,
-  message_handlert &message_handler)
+  message_handlert &message_handler,
+  bool truncate_suffix)
 {
   std::string reason;
   auto loops = indexed_lifecycle_loops(goto_model, reason);
   if(loops.empty())
   {
     std::cout
-      << "NATIVE_INDEXED_LIFECYCLE_PREFIX applied=0"
+      << "NATIVE_INDEXED_LIFECYCLE_"
+      << (truncate_suffix ? "PREFIX" : "FULL") << " applied=0"
       << " reason=" << reason << '\n';
     return false;
   }
@@ -16204,9 +16232,12 @@ bool indexed_lifecycle_prefix_transform(
       loop->exit,
       loop->bound,
       goto_unwindt::unwind_strategyt::ASSUME);
+    if(!truncate_suffix)
+      main->second.body.update();
   }
   bool truncated = false;
   if(
+    truncate_suffix &&
     creates != 0 && joins != 0 &&
     prefix_exit != main->second.body.instructions.end())
   {
@@ -16223,13 +16254,31 @@ bool indexed_lifecycle_prefix_transform(
   }
   goto_model.goto_functions.update();
   std::cout
-    << "NATIVE_INDEXED_LIFECYCLE_PREFIX applied=1"
+    << "NATIVE_INDEXED_LIFECYCLE_"
+    << (truncate_suffix ? "PREFIX" : "FULL") << " applied=1"
     << " loops=" << loops.size()
     << " creates=" << creates
     << " joins=" << joins
     << " truncated=" << (truncated ? 1 : 0) << '\n';
   (void)message_handler;
   return true;
+}
+} // namespace
+
+bool indexed_lifecycle_prefix_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  return indexed_lifecycle_transform(
+    goto_model, message_handler, true);
+}
+
+bool indexed_lifecycle_full_transform(
+  goto_modelt &goto_model,
+  message_handlert &message_handler)
+{
+  return indexed_lifecycle_transform(
+    goto_model, message_handler, false);
 }
 
 bool alternating_phase_recurrence_audit(
