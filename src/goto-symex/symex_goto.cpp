@@ -765,18 +765,21 @@ static void merge_names(
     return;
   }
 
+  const bool finite_pointer_write_join =
+    dest_state.source.pc->code().get_bool("#finite_pointer_write_join");
+  const symbolt &symbol = ns.lookup(obj_identifier);
+
   // field sensitivity: only merge on individual fields
   if(dest_state.field_sensitivity.is_divisible(ssa))
     return;
 
   // shared variables are renamed on every access anyway, we don't need to
   // merge anything
-  const symbolt &symbol = ns.lookup(obj_identifier);
-
   // shared?
   if(
     dest_state.atomic_section_id == 0 && dest_state.threads.size() >= 2 &&
-    (symbol.is_shared() || dirty(symbol.name)))
+    (symbol.is_shared() || dirty(symbol.name)) &&
+    !finite_pointer_write_join)
   {
     return; // no phi nodes for shared stuff
   }

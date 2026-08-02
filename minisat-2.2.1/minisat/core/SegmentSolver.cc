@@ -1,5 +1,6 @@
 // __SZH_ADD_BEGIN__
 
+#include <algorithm>
 #include <regex>
 
 #include "SegmentSolver.h"
@@ -20,6 +21,57 @@ void SegmentSolver::save_raw_graph(oc_edge_tablet& _oc_edge_table, oc_guard_mapt
     oc_result_order = &_oc_result_order;
 
     set_graph();
+
+    if(native_indexed_dispatch)
+        prepare_native_indexed_dispatch();
+}
+
+void SegmentSolver::enable_native_indexed_dispatch()
+{
+    native_indexed_dispatch = true;
+}
+
+void SegmentSolver::prepare_native_indexed_dispatch()
+{
+    int maximum_literal = -1;
+    for(const auto &entry : lit_to_edge)
+        maximum_literal = std::max(maximum_literal, toInt(entry.first));
+    for(const auto &entry : guard_lit_to_node)
+        maximum_literal = std::max(maximum_literal, toInt(entry.first));
+
+    native_theory_subscription.assign(
+        maximum_literal < 0 ? 0 : static_cast<std::size_t>(maximum_literal + 1),
+        0);
+    for(const auto &entry : lit_to_edge)
+        native_theory_subscription[toInt(entry.first)] = 1;
+    for(const auto &entry : guard_lit_to_node)
+        native_theory_subscription[toInt(entry.first)] = 1;
+
+    native_write_capacity_per_address.assign(id_to_address.size(), 0);
+    native_read_capacity_per_address.assign(id_to_address.size(), 0);
+    for(const auto &chain : chains)
+    {
+        for(const auto node_id : chain)
+        {
+            const auto &node = nodes[node_id];
+            if(
+              node.address < 0 ||
+              static_cast<std::size_t>(node.address) >= id_to_address.size())
+                continue;
+            if(node.is_write)
+                ++native_write_capacity_per_address[node.address];
+            if(node.is_read)
+                ++native_read_capacity_per_address[node.address];
+        }
+    }
+}
+
+bool SegmentSolver::has_native_theory_subscription(Lit lit) const
+{
+    const int index = toInt(lit);
+    return index >= 0 &&
+           static_cast<std::size_t>(index) < native_theory_subscription.size() &&
+           native_theory_subscription[index] != 0;
 }
 
 int SegmentSolver::get_node(std::string name)
@@ -487,6 +539,19 @@ void SegmentSolver::extract_writes_reads_per_loc(node_idt node, std::vector<digi
 {
     writes_per_loc.resize(id_to_address.size());
     reads_per_loc.resize(id_to_address.size());
+    if(
+      native_indexed_dispatch &&
+      native_write_capacity_per_address.size() == id_to_address.size() &&
+      native_read_capacity_per_address.size() == id_to_address.size())
+    {
+        for(std::size_t address = 0; address < id_to_address.size(); ++address)
+        {
+            writes_per_loc[address].reserve(
+                native_write_capacity_per_address[address]);
+            reads_per_loc[address].reserve(
+                native_read_capacity_per_address[address]);
+        }
+    }
     for(int chain = 0; chain < int(chains.size()); chain++)
     {
         if(chain == nodes[node].chain) // We specifically handle intra-threaded successors elsewhere
@@ -1402,8 +1467,9 @@ SegmentSolver::SegmentSolver()
 
 SegmentSolver::decide_entryt SegmentSolver::get_decide_entry(Lit l)
 {
-    if(lit_to_edge.find(l) != lit_to_edge.end())
-        return lit_to_edge[l];
+    const auto entry = lit_to_edge.find(l);
+    if(entry != lit_to_edge.end())
+        return entry->second;
     return std::make_pair(std::make_pair(-1, -1), OC_NA);
 }
 
@@ -1445,22 +1511,25 @@ CRef SegmentSolver::propagate()
         num_props++;
 
         //our method
-        auto decide_entry = get_decide_entry(p);
-        if(decide_entry.first.first != -1)
+        if(!native_indexed_dispatch || has_native_theory_subscription(p))
         {
-            if(OC_VERBOSITY >= 1)
-                std::cout << var(p) << "(" << sign(p) << ") is related to an edge (" << toInt(assigns[var(p)]) << ")\n";
+            auto decide_entry = get_decide_entry(p);
+            if(decide_entry.first.first != -1)
+            {
+                if(OC_VERBOSITY >= 1)
+                    std::cout << var(p) << "(" << sign(p) << ") is related to an edge (" << toInt(assigns[var(p)]) << ")\n";
 
-            edges_to_add.push_back(segment_edget(decide_entry.first.first, decide_entry.first.second, decide_entry.second, p));
-        }
+                edges_to_add.push_back(segment_edget(decide_entry.first.first, decide_entry.first.second, decide_entry.second, p));
+            }
 
-        auto guard_nodes = check_guard_literal(p);
-        for(auto guard_node: guard_nodes)
-        {
-            if(OC_VERBOSITY >= 1)
-                std::cout << var(p) << "(" << sign(p) << ") is related to a guard of " << guard_node << "\n";
+            auto guard_nodes = check_guard_literal(p);
+            for(auto guard_node: guard_nodes)
+            {
+                if(OC_VERBOSITY >= 1)
+                    std::cout << var(p) << "(" << sign(p) << ") is related to a guard of " << guard_node << "\n";
 
-            guards_to_enable.push_back(guard_node);
+                guards_to_enable.push_back(guard_node);
+            }
         }
         //out method ends
 

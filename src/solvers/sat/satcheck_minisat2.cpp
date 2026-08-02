@@ -428,6 +428,11 @@ void deagle_segment_solvert::save_raw_graph(oc_edge_tablet& _oc_edge_table, oc_g
   solver->save_raw_graph(_oc_edge_table, _oc_guard_map, _oc_location_map, _oc_result_order);
 }
 
+void deagle_segment_solvert::enable_native_indexed_dispatch()
+{
+  solver->enable_native_indexed_dispatch();
+}
+
 void memory_model_solvert::save_raw_graph(oc_edge_tablet& _oc_edge_table, oc_label_tablet& _oc_label_table, cat_modulet& _cat_module)
 {
   solver->save_raw_graph(_oc_edge_table, _oc_label_table, _cat_module);

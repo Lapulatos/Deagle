@@ -241,6 +241,7 @@ ssa_step_matches_failing_property(const irep_idt &property_id)
            symex_target_equationt::SSA_stepst::const_iterator step,
            const decision_proceduret &decision_procedure) {
     return step->is_assert() && step->get_property_id() == property_id &&
+           decision_procedure.get(step->guard_handle).is_true() &&
            decision_procedure.get(step->cond_handle).is_false();
   };
 }
@@ -697,28 +698,24 @@ void postprocess_equation(
     {
       memory_model->use_deagle = true;
       equation.use_deagle_closure = true;
+      if(options.get_bool_option("native-indexed-dispatch"))
+        equation.use_native_indexed_dispatch = true;
+      else if(options.get_bool_option("native-adaptive-indexed-dispatch"))
+        equation.use_native_adaptive_indexed_dispatch = true;
     }
-    if(options.get_bool_option("native-indexed-dispatch"))
-    {
-      memory_model->use_deagle = true;
-      equation.use_deagle_closure = true;
-      equation.use_native_indexed_dispatch = true;
-    }
-    if(options.get_bool_option("native-adaptive-indexed-dispatch"))
-    {
-      memory_model->use_deagle = true;
-      equation.use_deagle_closure = true;
-      equation.use_native_adaptive_indexed_dispatch = true;
-    }
-    if(options.get_bool_option("deagle-icd"))
+    else if(options.get_bool_option("deagle-icd"))
     {
       memory_model->use_deagle = true;
       equation.use_deagle_icd = true;
     }
-    if(options.get_bool_option("deagle-segment"))
+    else if(options.get_bool_option("deagle-segment"))
     {
       memory_model->use_deagle = true;
       equation.use_deagle_segment = true;
+      if(
+        options.get_bool_option("native-indexed-dispatch") ||
+        options.get_bool_option("native-adaptive-indexed-dispatch"))
+        equation.use_native_indexed_dispatch = true;
     }
     if(options.get_bool_option("datarace"))
       memory_model->enable_datarace = true;
@@ -870,6 +867,9 @@ std::chrono::duration<double> prepare_property_decider(
     auto& decision_procedure = *(prop_conv_solvert*)(&(property_decider.get_decision_procedure()));
 
     std::cout << "Set Deagle segment solver's graph\n";
+
+    if(equation.use_native_indexed_dispatch)
+      deagle_segment_solver.enable_native_indexed_dispatch();
 
     //set graph
     oc_edge_tablet oc_edge_table;

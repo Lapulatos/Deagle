@@ -46,6 +46,13 @@ class SegmentSolver : public Solver
 
     std::vector<std::pair<Lit, int>> literals_to_assign;
     std::set<Lit> assigned_literals;
+    bool native_indexed_dispatch = false;
+    std::vector<unsigned char> native_theory_subscription;
+    std::vector<std::size_t> native_write_capacity_per_address;
+    std::vector<std::size_t> native_read_capacity_per_address;
+
+    void prepare_native_indexed_dispatch();
+    bool has_native_theory_subscription(Lit lit) const;
 
     // for storing reasons
     std::vector<pooled_reasont> reason_pool;
@@ -102,6 +109,7 @@ protected:
     void analyze(CRef confl, vec<Lit>& out_learnt, int& out_btlevel);
 public:
     SegmentSolver();
+    void enable_native_indexed_dispatch();
     node_idt get_node(std::string name);
     void save_raw_graph(oc_edge_tablet& _oc_edge_table, oc_guard_mapt& _oc_guard_map, oc_location_mapt& _oc_location_map, std::map<std::string, int>& _oc_result_order);
     void set_graph();

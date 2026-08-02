@@ -135,6 +135,7 @@ class deagle_segment_solvert:
 public:
   using satcheck_minisat2_baset<Minisat::SegmentSolver>::satcheck_minisat2_baset;
   const std::string solver_text() override;
+  void enable_native_indexed_dispatch();
   void save_raw_graph(oc_edge_tablet& _oc_edge_table, oc_guard_mapt& _oc_guard_map, oc_location_mapt& _oc_location_map, std::map<std::string, int>& _oc_result_order);
 };
 

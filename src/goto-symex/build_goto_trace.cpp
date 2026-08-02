@@ -452,6 +452,7 @@ static bool is_failed_assertion_step(
   const decision_proceduret &decision_procedure)
 {
   return step->is_assert() &&
+         decision_procedure.get(step->guard_handle).is_true() &&
          decision_procedure.get(step->cond_handle).is_false();
 }
 

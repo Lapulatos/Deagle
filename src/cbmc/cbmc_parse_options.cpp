@@ -109,6 +109,7 @@ Author: Daniel Kroening, kroening@kroening.com
 #include <goto-symex/path_storage.h>
 
 #include <pointer-analysis/add_failed_symbols.h>
+#include <pointer-analysis/lower_finite_pointer_writes.h>
 
 #include <langapi/mode.h>
 
@@ -118,23 +119,50 @@ namespace
 {
 
 template <class incremental_goto_checkerT>
-class guided_stop_on_fail_verifiert
-  : public stop_on_fail_verifiert<incremental_goto_checkerT>
+class guided_all_properties_verifiert
+  : public all_properties_verifiert<incremental_goto_checkerT>
 {
 public:
-  using stop_on_fail_verifiert<
-    incremental_goto_checkerT>::stop_on_fail_verifiert;
-
-  goto_tracet build_shortest_trace() const
-  {
-    return this->incremental_goto_checker.build_shortest_trace();
-  }
+  using all_properties_verifiert<
+    incremental_goto_checkerT>::all_properties_verifiert;
 
   goto_tracet build_trace(const irep_idt &property_id) const
   {
     return this->incremental_goto_checker.build_trace(property_id);
   }
+};
 
+class guided_unwind_suggestion_checkert
+  : public multi_path_symex_only_checkert
+{
+public:
+  using multi_path_symex_only_checkert::multi_path_symex_only_checkert;
+
+  std::map<irep_idt, unsigned> suggestions()
+  {
+    symex.unwind_suggest();
+    std::map<irep_idt, unsigned> result;
+    for(const auto &function : goto_model.get_goto_functions().function_map)
+    {
+      if(!function.second.body_available())
+        continue;
+      for(const auto &instruction : function.second.body.instructions)
+      {
+        if(!instruction.is_backwards_goto())
+          continue;
+        const auto suggestion = symex.single_unwind_limit.find(
+          instruction.code().source_location());
+        if(suggestion != symex.single_unwind_limit.end() &&
+           suggestion->second > 0)
+        {
+          result.emplace(
+            goto_programt::loop_id(function.first, instruction),
+            static_cast<unsigned>(suggestion->second));
+        }
+      }
+    }
+    return result;
+  }
 };
 
 enum class guided_multiloop_result_kindt
@@ -156,6 +184,37 @@ bool is_unwinding_property(const irep_idt &property_id)
 {
   return id2string(property_id).find(".unwind.") != std::string::npos;
 }
+
+irep_idt loop_id_from_unwinding_property(const irep_idt &property_id)
+{
+  const std::string property = id2string(property_id);
+  const std::string separator = ".unwind.";
+  const std::size_t separator_position = property.rfind(separator);
+  if(separator_position == std::string::npos)
+    return {};
+  return property.substr(0, separator_position) + "." +
+         property.substr(separator_position + separator.size());
+}
+
+template <class incremental_goto_checkerT>
+class guided_stop_on_fail_verifiert
+  : public stop_on_fail_verifiert<incremental_goto_checkerT>
+{
+public:
+  using stop_on_fail_verifiert<
+    incremental_goto_checkerT>::stop_on_fail_verifiert;
+
+  goto_tracet build_shortest_trace() const
+  {
+    return this->incremental_goto_checker.build_shortest_trace();
+  }
+
+  goto_tracet build_trace(const irep_idt &property_id) const
+  {
+    return this->incremental_goto_checker.build_trace(property_id);
+  }
+
+};
 
 class unwinding_only_multi_path_symex_checkert
   : public multi_path_symex_checkert
@@ -345,6 +404,181 @@ guided_multiloop_resultt guided_multiloop_unwind(
       << selected_loop << " bound=" << bound->second
       << " trace_steps=" << selected_trace.steps.size()
       << '\n';
+  }
+
+  std::cout
+    << "NATIVE_GUIDED_MULTILOOP_UNWIND applied=0"
+    << " reason=round_budget rounds=" << max_rounds << '\n';
+  guided_multiloop_resultt answer;
+  answer.kind = guided_multiloop_result_kindt::INCOMPLETE;
+  return answer;
+}
+
+guided_multiloop_resultt guided_finite_pointer_unwind(
+  goto_modelt &goto_model,
+  const optionst &base_options,
+  ui_message_handlert &ui_message_handler)
+{
+  constexpr std::size_t max_rounds = 32;
+  constexpr unsigned max_loop_bound = 64;
+  constexpr unsigned unsuggested_probe_bound = 5;
+
+  guided_unwind_suggestion_checkert suggestion_checker(
+    base_options, ui_message_handler, goto_model);
+  const std::map<irep_idt, unsigned> suggestions =
+    suggestion_checker.suggestions();
+
+  std::map<irep_idt, unsigned> bounds;
+  unwindsett initial_unwindset(goto_model);
+  initial_unwindset.parse_unwind(base_options.get_option("unwind"));
+  initial_unwindset.parse_unwindset(
+    base_options.get_list_option("unwindset"), ui_message_handler);
+
+  for(const auto &function : goto_model.goto_functions.function_map)
+  {
+    if(!function.second.body_available())
+      continue;
+    for(const auto &instruction : function.second.body.instructions)
+    {
+      if(!instruction.is_backwards_goto())
+        continue;
+      const irep_idt loop_id =
+        goto_programt::loop_id(function.first, instruction);
+      const auto initial_limit = initial_unwindset.get_limit(loop_id, 0);
+      const auto suggestion = suggestions.find(loop_id);
+      unsigned initial_bound = unsuggested_probe_bound;
+      if(initial_limit.has_value())
+        initial_bound = *initial_limit;
+      else if(suggestion != suggestions.end())
+        initial_bound = suggestion->second;
+      bounds.emplace(loop_id, std::min(initial_bound, max_loop_bound));
+    }
+  }
+
+  if(bounds.empty())
+    return {};
+
+  for(std::size_t round = 1; round <= max_rounds; ++round)
+  {
+    optionst round_options = base_options;
+    optionst::value_listt unwindset;
+    for(const auto &bound : bounds)
+      unwindset.push_back(
+        id2string(bound.first) + ":" + std::to_string(bound.second));
+    round_options.set_option("unwind", "");
+    round_options.set_option("unwindset", unwindset);
+    round_options.set_option("partial-loops", false);
+    round_options.set_option("trace", true);
+    round_options.set_option("stop-on-fail", true);
+
+    std::cout
+      << "NATIVE_GUIDED_MULTILOOP_UNWIND round=" << round
+      << " loops=" << bounds.size() << '\n';
+
+    // Check the original properties and every generated unwinding assertion
+    // in one equation.  A SAFE result is accepted only when both sets pass.
+    // If bounds are incomplete, refine every loop whose unwinding property
+    // failed; original-property failures are ignored until all bounds pass.
+    round_options.set_option("unwinding-assertions", true);
+    guided_all_properties_verifiert<multi_path_symex_checkert> verifier(
+      round_options, ui_message_handler, goto_model);
+    const resultt result = verifier();
+    if(result == resultt::PASS)
+    {
+      std::cout
+        << "NATIVE_GUIDED_MULTILOOP_UNWIND applied=1"
+        << " result=SAFE rounds=" << round << '\n';
+      guided_multiloop_resultt answer;
+      answer.kind = guided_multiloop_result_kindt::SAFE;
+      return answer;
+    }
+    if(result != resultt::FAIL)
+    {
+      std::cout
+        << "NATIVE_GUIDED_MULTILOOP_UNWIND applied=0"
+        << " reason=combined_checker_incomplete round=" << round << '\n';
+      guided_multiloop_resultt answer;
+      answer.kind = guided_multiloop_result_kindt::INCOMPLETE;
+      return answer;
+    }
+
+    std::vector<irep_idt> failed_unwinding_properties;
+    std::vector<irep_idt> failed_program_properties;
+    for(const auto &property : verifier.get_properties())
+    {
+      if(property.second.status != property_statust::FAIL)
+        continue;
+      if(is_unwinding_property(property.first))
+        failed_unwinding_properties.push_back(property.first);
+      else
+        failed_program_properties.push_back(property.first);
+    }
+
+    if(failed_unwinding_properties.empty())
+    {
+      if(failed_program_properties.empty())
+      {
+        std::cout
+          << "NATIVE_GUIDED_MULTILOOP_UNWIND applied=0"
+          << " reason=no_failed_property round=" << round << '\n';
+        guided_multiloop_resultt answer;
+        answer.kind = guided_multiloop_result_kindt::INCOMPLETE;
+        return answer;
+      }
+
+      guided_multiloop_resultt answer;
+      answer.kind = guided_multiloop_result_kindt::UNSAFE;
+      answer.failure_trace = verifier.build_trace(
+        failed_program_properties.front());
+      if(answer.failure_trace.steps.empty())
+      {
+        answer.kind = guided_multiloop_result_kindt::INCOMPLETE;
+        return answer;
+      }
+      std::cout
+        << "NATIVE_GUIDED_MULTILOOP_UNWIND applied=1"
+        << " result=UNSAFE rounds=" << round
+        << " property=" << failed_program_properties.front() << '\n';
+      return answer;
+    }
+
+    std::set<irep_idt> loops_to_refine;
+    for(const auto &property_id : failed_unwinding_properties)
+    {
+      const irep_idt loop_id =
+        loop_id_from_unwinding_property(property_id);
+      if(loop_id.empty() || bounds.find(loop_id) == bounds.end())
+      {
+        std::cout
+          << "NATIVE_GUIDED_MULTILOOP_UNWIND applied=0"
+          << " reason=unmapped_bound_property property=" << property_id
+          << " round=" << round << '\n';
+        guided_multiloop_resultt answer;
+        answer.kind = guided_multiloop_result_kindt::INCOMPLETE;
+        return answer;
+      }
+      loops_to_refine.insert(loop_id);
+    }
+
+    for(const auto &loop_id : loops_to_refine)
+    {
+      auto bound = bounds.find(loop_id);
+      if(bound == bounds.end() || bound->second >= max_loop_bound)
+      {
+        std::cout
+          << "NATIVE_GUIDED_MULTILOOP_UNWIND applied=0"
+          << " reason=loop_bound_budget loop=" << loop_id
+          << " round=" << round << '\n';
+        guided_multiloop_resultt answer;
+        answer.kind = guided_multiloop_result_kindt::INCOMPLETE;
+        return answer;
+      }
+      ++bound->second;
+    }
+
+    std::cout
+      << "NATIVE_GUIDED_MULTILOOP_UNWIND refine_failed loops="
+      << loops_to_refine.size() << '\n';
   }
 
   std::cout
@@ -945,6 +1179,9 @@ void cbmc_parse_optionst::get_command_line_options(optionst &options)
 
   if(cmdline.isset("deagle-nondet-bulk-init"))
     options.set_option("deagle-nondet-bulk-init", true);
+
+  if(cmdline.isset("lower-finite-pointer-writes"))
+    options.set_option("lower-finite-pointer-writes", true);
 
   if(cmdline.isset("allow-pointer-unsoundness") || cmdline.isset("refined-pointer-analysis"))
     options.set_option("allow-pointer-unsoundness", true);
@@ -2530,18 +2767,50 @@ int cbmc_parse_optionst::doit()
     return CPROVER_EXIT_VERIFICATION_UNSAFE;
   }
 
+  bool finite_pointer_writes_lowered = false;
+  if(
+    options.get_bool_option("lower-finite-pointer-writes") &&
+    !cmdline.isset("unwind-suggest"))
+  {
+    const std::size_t lowered = lower_finite_pointer_writes(goto_model);
+    log.status() << "Lowered " << lowered
+                 << " finite pointer write assignment(s)"
+                 << messaget::eom;
+    if(lowered != 0)
+    {
+      finite_pointer_writes_lowered = true;
+      options.set_option("deagle-closure", false);
+      options.set_option("deagle-icd", false);
+      options.set_option("deagle-segment", true);
+      log.status() << "Selected Deagle's Segment Solver for finite pointer "
+                      "write transactions"
+                   << messaget::eom;
+    }
+  }
+
+  const bool explicit_unwind_requested =
+    !options.get_option("unwind").empty() ||
+    !options.get_list_option("unwindset").empty();
   if(
     cmdline.isset("native-guided-multiloop-unwind") &&
-    unreserved_scalar_read_transformed)
+    (unreserved_scalar_read_transformed || finite_pointer_writes_lowered) &&
+    !explicit_unwind_requested)
   {
     const guided_multiloop_resultt guided_result =
-      guided_multiloop_unwind(
-        goto_model, options, ui_message_handler);
+      finite_pointer_writes_lowered
+        ? guided_finite_pointer_unwind(
+            goto_model, options, ui_message_handler)
+        : guided_multiloop_unwind(
+            goto_model, options, ui_message_handler);
     if(guided_result.kind == guided_multiloop_result_kindt::SAFE)
     {
       if(
         !output_native_correctness_witness(
-          goto_model, options, native_witness_assertions))
+          goto_model,
+          options,
+          finite_pointer_writes_lowered && !native_witness_guards.empty()
+            ? native_witness_guards
+            : native_witness_assertions))
         return CPROVER_EXIT_INTERNAL_ERROR;
       std::cout << "VERIFICATION SUCCESSFUL\n";
       return CPROVER_EXIT_VERIFICATION_SAFE;
