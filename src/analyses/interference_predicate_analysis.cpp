@@ -31,15 +31,60 @@ Module: Interference-Closed Predicate Analysis
 #include <algorithm>
 #include <cstdlib>
 #include <deque>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <set>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 namespace
 {
+bool reachable_product_call_graph_acyclic(
+  const goto_functionst &functions,
+  const std::vector<irep_idt> &roots,
+  irep_idt &recursive_function)
+{
+  std::unordered_map<irep_idt, unsigned, irep_id_hash> visitation;
+  std::function<bool(const irep_idt &)> visit =
+    [&](const irep_idt &function_id) {
+      const auto known = visitation.find(function_id);
+      if(known != visitation.end())
+      {
+        if(known->second == 1)
+        {
+          recursive_function = function_id;
+          return false;
+        }
+        return true;
+      }
+      const auto function = functions.function_map.find(function_id);
+      if(
+        function == functions.function_map.end() ||
+        !function->second.body_available())
+        return true;
+      visitation.emplace(function_id, 1);
+      for(const auto &instruction : function->second.body.instructions)
+      {
+        if(!instruction.is_function_call())
+          continue;
+        const exprt &callee = skip_typecast(instruction.call_function());
+        if(callee.id() != ID_symbol)
+          continue;
+        if(!visit(to_symbol_expr(callee).get_identifier()))
+          return false;
+      }
+      visitation[function_id] = 2;
+      return true;
+    };
+  for(const auto &root : roots)
+    if(!visit(root))
+      return false;
+  return true;
+}
+
 bool direct_product_lvalue(const exprt &input)
 {
   const exprt &expression = skip_typecast(input);
@@ -63,6 +108,23 @@ bool exact_product_lvalue(const exprt &input)
     return
       skip_typecast(to_index_expr(expression).index()).id() == ID_constant &&
       exact_product_lvalue(to_index_expr(expression).array());
+  return false;
+}
+
+// Preserve only address shapes whose dynamic base can later be resolved from
+// one exact product-state pointer value. Ambiguous bases still fail closed.
+bool state_resolvable_product_lvalue_shape(const exprt &input)
+{
+  const exprt &expression = skip_typecast(input);
+  if(expression.id() == ID_symbol)
+    return true;
+  if(expression.id() == ID_member)
+    return state_resolvable_product_lvalue_shape(
+      to_member_expr(expression).struct_op());
+  if(expression.id() == ID_dereference)
+    return
+      skip_typecast(to_dereference_expr(expression).pointer()).id() ==
+      ID_symbol;
   return false;
 }
 
@@ -255,9 +317,30 @@ bool resolve_product_expression(
     expression = original;
     return true;
   }
+  if(
+    original_root.id() == ID_dereference &&
+    (has_subexpr(expression, ID_dereference) ||
+     has_subexpr(expression, ID_if)) &&
+    skip_typecast(to_dereference_expr(original_root).pointer()).id() ==
+      ID_symbol &&
+    ns.follow(original.type()).id() != ID_array &&
+    ns.follow(original.type()).id() != ID_struct &&
+    ns.follow(original.type()).id() != ID_union)
+  {
+    expression = original;
+    return true;
+  }
   const bool resolved =
     !has_subexpr(expression, ID_dereference) &&
     !has_subexpr(expression, ID_if);
+  if(
+    !resolved && original_root.id() == ID_address_of &&
+    state_resolvable_product_lvalue_shape(
+      to_address_of_expr(original_root).object()))
+  {
+    expression = original;
+    return true;
+  }
   if(
     !resolved &&
     std::getenv("DEAGLE_FINITE_PRODUCT_AUDIT") != nullptr)
@@ -521,6 +604,9 @@ bool eliminate_dead_product_locals(
         }
         std::set<irep_idt> in = out;
         irep_idt defined;
+        if(location->is_assign())
+          collect_product_thread_local_ids(
+            location->assign_lhs(), ns, in);
         if(
           location->is_assign() &&
           product_thread_local_symbol(
@@ -3541,7 +3627,9 @@ public:
                   << from_expr(ns, irep_idt(), object) << '}';
       std::cout << '\n';
     }
-    if(symbols.empty() || symbols.size() > max_symbols)
+    const std::size_t symbol_limit =
+      threads.size() == 4 ? max_three_worker_symbols : max_symbols;
+    if(symbols.empty() || symbols.size() > symbol_limit)
     {
       fail("symbol_count");
       return;
@@ -3807,6 +3895,9 @@ public:
 private:
   static constexpr std::size_t max_workers = 5;
   static constexpr std::size_t max_symbols = 256;
+  // Give exactly three materialized workers a narrow extra state budget while
+  // keeping larger products outside exhaustive search.
+  static constexpr std::size_t max_three_worker_symbols = 264;
   static constexpr std::size_t max_locations_per_worker = 2048;
   static constexpr std::size_t max_states = 5000000;
   static constexpr std::size_t max_transitions = 20000000;
@@ -3894,6 +3985,57 @@ private:
     std::vector<exprt> &elements) const
   {
     const exprt &expr = skip_typecast(input);
+    if(expr.id() == ID_member)
+    {
+      const typet &element_type = ns.follow(expr.type());
+      if(
+        element_type.id() == ID_array || element_type.id() == ID_struct ||
+        element_type.id() == ID_union || element_type.id() == ID_code)
+        return false;
+      std::vector<std::pair<irep_idt, typet>> member_path;
+      const exprt *base_cursor = &expr;
+      while(skip_typecast(*base_cursor).id() == ID_member)
+      {
+        const auto &member =
+          to_member_expr(skip_typecast(*base_cursor));
+        member_path.emplace_back(
+          member.get_component_name(), member.type());
+        base_cursor = &member.struct_op();
+      }
+      const exprt &base = skip_typecast(*base_cursor);
+      if(base.id() != ID_index)
+        return false;
+      const auto &index = to_index_expr(base);
+      const exprt &array = skip_typecast(index.array());
+      const typet &array_type = ns.follow(array.type());
+      if(
+        array_type.id() != ID_array || array.id() != ID_symbol ||
+        !direct_product_lvalue(array))
+        return false;
+      const auto size =
+        numeric_cast<std::size_t>(to_array_type(array_type).size());
+      constexpr std::size_t max_finite_member_elements = 8;
+      if(
+        !size.has_value() || *size == 0 ||
+        *size > max_finite_member_elements)
+        return false;
+      elements.clear();
+      elements.reserve(*size);
+      for(std::size_t element = 0; element < *size; ++element)
+      {
+        exprt candidate = index_exprt(
+          array, from_integer(element, index.index().type()), base.type());
+        for(auto member = member_path.rbegin();
+            member != member_path.rend(); ++member)
+          candidate = member_exprt(
+            std::move(candidate), member->first, member->second);
+        candidate = simplify_expr(std::move(candidate), ns);
+        if(!direct_product_lvalue(candidate))
+          return false;
+        elements.push_back(std::move(candidate));
+      }
+      return true;
+    }
     if(expr.id() != ID_index)
       return false;
     const auto &index = to_index_expr(expr);
@@ -3940,6 +4082,28 @@ private:
       });
   }
 
+  bool finite_address_index_supported(const exprt &input) const
+  {
+    const exprt &object = skip_typecast(input);
+    if(object.id() == ID_member)
+      return finite_address_index_supported(
+        to_member_expr(object).struct_op());
+    if(object.id() != ID_index)
+      return false;
+    const auto &index = to_index_expr(object);
+    const exprt &array = skip_typecast(index.array());
+    const typet &array_type = ns.follow(array.type());
+    if(array_type.id() != ID_array || !direct_product_lvalue(array))
+      return false;
+    const auto size =
+      numeric_cast<std::size_t>(to_array_type(array_type).size());
+    constexpr std::size_t max_finite_address_elements = 8;
+    return
+      size.has_value() && *size != 0 &&
+      *size <= max_finite_address_elements &&
+      expression_supported(index.index());
+  }
+
   bool finite_dereference_lvalue(const exprt &input) const
   {
     const exprt &lhs = skip_typecast(input);
@@ -3958,7 +4122,7 @@ private:
     if(pointer.id() == ID_address_of)
     {
       const exprt &candidate = to_address_of_expr(pointer).object();
-      if(!exact_product_lvalue(candidate))
+      if(!exact_in_bounds_product_lvalue(candidate))
         return false;
       object = candidate;
       return true;
@@ -4008,6 +4172,29 @@ private:
     return exact_product_lvalue(object);
   }
 
+  bool exact_in_bounds_product_lvalue(const exprt &input) const
+  {
+    const exprt &object = skip_typecast(input);
+    if(object.id() == ID_symbol)
+      return true;
+    if(object.id() == ID_member)
+      return exact_in_bounds_product_lvalue(
+        to_member_expr(object).struct_op());
+    if(object.id() != ID_index)
+      return false;
+    const auto &index = to_index_expr(object);
+    const auto exact_index =
+      numeric_cast<std::size_t>(skip_typecast(index.index()));
+    const typet &array_type = ns.follow(index.array().type());
+    if(array_type.id() != ID_array || !exact_index.has_value())
+      return false;
+    const auto size =
+      numeric_cast<std::size_t>(to_array_type(array_type).size());
+    return
+      size.has_value() && *exact_index < *size &&
+      exact_in_bounds_product_lvalue(index.array());
+  }
+
   void canonicalize_exact_pointer(exprt &value) const
   {
     if(value.type().id() != ID_pointer)
@@ -4017,6 +4204,83 @@ private:
       return;
     exprt address = address_of_exprt(std::move(object));
     value = typecast_exprt::conditional_cast(address, value.type());
+  }
+
+  void canonicalize_exact_pointers(exprt &value) const
+  {
+    for(auto &operand : value.operands())
+      canonicalize_exact_pointers(operand);
+    if(value.type().id() == ID_pointer)
+    {
+      canonicalize_exact_pointer(value);
+      return;
+    }
+    value = simplify_expr(std::move(value), ns);
+  }
+
+  static bool distinct_exact_array_elements(
+    const exprt &left_input,
+    const exprt &right_input)
+  {
+    const exprt &left = skip_typecast(left_input);
+    const exprt &right = skip_typecast(right_input);
+    if(left.id() != ID_index || right.id() != ID_index)
+      return false;
+    const auto &left_index = to_index_expr(left);
+    const auto &right_index = to_index_expr(right);
+    if(left_index.array() != right_index.array())
+      return false;
+    const auto left_value = numeric_cast<mp_integer>(
+      skip_typecast(left_index.index()));
+    const auto right_value = numeric_cast<mp_integer>(
+      skip_typecast(right_index.index()));
+    return
+      left_value.has_value() && right_value.has_value() &&
+      *left_value != *right_value;
+  }
+
+  void evaluate_exact_pointer_comparisons(exprt &value) const
+  {
+    for(auto &operand : value.operands())
+      evaluate_exact_pointer_comparisons(operand);
+    if(
+      (value.id() != ID_equal && value.id() != ID_notequal) ||
+      value.operands().size() != 2)
+      return;
+    exprt objects[2];
+    bool exact_objects[2] = {false, false};
+    bool null_operands[2] = {false, false};
+    for(std::size_t index = 0; index < 2; ++index)
+    {
+      const exprt &candidate = skip_typecast(value.operands()[index]);
+      null_operands[index] =
+        candidate.id() == ID_constant &&
+        candidate.type().id() == ID_pointer &&
+        is_null_pointer(to_constant_expr(candidate));
+      if(!null_operands[index])
+        exact_objects[index] =
+          exact_pointer_object(value.operands()[index], objects[index]);
+    }
+    bool equality;
+    if(
+      (null_operands[0] && exact_objects[1]) ||
+      (null_operands[1] && exact_objects[0]))
+      equality = false;
+    else if(exact_objects[0] && exact_objects[1])
+    {
+      if(objects[0] == objects[1])
+        equality = true;
+      else if(distinct_exact_array_elements(objects[0], objects[1]))
+        equality = false;
+      else
+        return;
+    }
+    else
+      return;
+    if((value.id() == ID_equal) == equality)
+      value = true_exprt();
+    else
+      value = false_exprt();
   }
 
   bool overwrites_tracked_member(const exprt &input) const
@@ -4148,6 +4412,52 @@ private:
     return false;
   }
 
+  bool address_computation_reads_shared_value(const exprt &input) const
+  {
+    const exprt &object = skip_typecast(input);
+    if(object.id() == ID_symbol)
+      return false;
+    if(object.id() == ID_member)
+      return address_computation_reads_shared_value(
+        to_member_expr(object).struct_op());
+    if(object.id() == ID_index)
+      return
+        address_computation_reads_shared_value(
+          to_index_expr(object).array()) ||
+        expression_reads_shared_value(to_index_expr(object).index());
+    if(object.id() == ID_dereference)
+      return expression_reads_shared_value(
+        to_dereference_expr(object).pointer());
+    for(const auto &operand : object.operands())
+    {
+      if(expression_reads_shared_value(operand))
+        return true;
+    }
+    return false;
+  }
+
+  bool expression_reads_shared_value(const exprt &input) const
+  {
+    const exprt &expr = skip_typecast(input);
+    if(expr.id() == ID_address_of)
+      return address_computation_reads_shared_value(
+        to_address_of_expr(expr).object());
+    if(expr.id() == ID_symbol)
+    {
+      const symbolt *symbol = nullptr;
+      return
+        !ns.lookup(to_symbol_expr(expr).get_identifier(), symbol) &&
+        !symbol->is_type && symbol->is_static_lifetime &&
+        !symbol->is_thread_local;
+    }
+    for(const auto &operand : expr.operands())
+    {
+      if(expression_reads_shared_value(operand))
+        return true;
+    }
+    return false;
+  }
+
   bool invisible_local_step(
     const finite_product_threadt &thread,
     const std::size_t pc) const
@@ -4162,9 +4472,13 @@ private:
       location->is_assert())
       return false;
     if(location->is_assign())
+    {
+      irep_idt local_identifier;
       return
-        !expression_mentions_shared_object(location->assign_lhs()) &&
-        !expression_mentions_shared_object(location->assign_rhs());
+        product_thread_local_symbol(
+          location->assign_lhs(), ns, local_identifier) &&
+        !expression_reads_shared_value(location->assign_rhs());
+    }
     if(location->is_assume() || location->is_goto())
       return !expression_mentions_shared_object(location->condition());
     return
@@ -4397,7 +4711,13 @@ private:
     if(finite_index_elements(expr, finite_elements))
     {
       result.insert(finite_elements.begin(), finite_elements.end());
-      collect_expr_symbols(to_index_expr(expr).index(), result);
+      const exprt *indexed = &expr;
+      while(skip_typecast(*indexed).id() == ID_member)
+        indexed = &to_member_expr(skip_typecast(*indexed)).struct_op();
+      const exprt &base_index = skip_typecast(*indexed);
+      if(base_index.id() != ID_index)
+        return;
+      collect_expr_symbols(to_index_expr(base_index).index(), result);
       return;
     }
     if(
@@ -4609,6 +4929,10 @@ private:
       const exprt &object = to_address_of_expr(expr).object();
       if(exact_product_lvalue(object))
         return true;
+      if(state_resolvable_address_object(object))
+        return true;
+      if(finite_address_index_supported(object))
+        return true;
       std::vector<exprt> elements;
       return
         finite_index_elements(object, elements) &&
@@ -4629,6 +4953,28 @@ private:
         return false;
       return expression_supported(to_index_expr(expr).index());
     }
+    if(expr.id() == ID_member)
+    {
+      std::vector<exprt> elements;
+      if(finite_index_elements(expr, elements))
+      {
+        if(
+          !std::all_of(
+            elements.begin(),
+            elements.end(),
+            [&](const exprt &element) {
+              return symbol_indices.find(element) != symbol_indices.end();
+            }))
+          return false;
+        const exprt *indexed = &expr;
+        while(skip_typecast(*indexed).id() == ID_member)
+          indexed = &to_member_expr(skip_typecast(*indexed)).struct_op();
+        const exprt &base_index = skip_typecast(*indexed);
+        if(base_index.id() != ID_index)
+          return false;
+        return expression_supported(to_index_expr(base_index).index());
+      }
+    }
     if(
       expr.id() == ID_side_effect)
     {
@@ -4643,6 +4989,19 @@ private:
         return false;
     }
     return true;
+  }
+
+  bool state_resolvable_address_object(const exprt &input) const
+  {
+    const exprt &object = skip_typecast(input);
+    if(object.id() == ID_symbol)
+      return true;
+    if(object.id() == ID_member)
+      return state_resolvable_address_object(
+        to_member_expr(object).struct_op());
+    if(object.id() == ID_dereference)
+      return expression_supported(to_dereference_expr(object).pointer());
+    return false;
   }
 
   void audit_instructions()
@@ -4675,7 +5034,17 @@ private:
             (tracked != symbol_indices.end() || finite_index ||
              finite_dereference) &&
             !expression_supported(location->assign_rhs()))
+          {
+            if(std::getenv("DEAGLE_FINITE_PRODUCT_AUDIT") != nullptr)
+              std::cout << "V225_FINITE_PRODUCT_RHS_REJECT entry="
+                        << thread.entry << " location="
+                        << location->location_number << " lhs={"
+                        << from_expr(ns, thread.entry, lhs) << "} rhs={"
+                        << from_expr(
+                             ns, thread.entry, location->assign_rhs())
+                        << "}" << std::endl;
             return fail("unsupported_shared_rhs");
+          }
           if(
             tracked == symbol_indices.end() && !finite_index &&
             !finite_dereference &&
@@ -4772,6 +5141,7 @@ private:
     }
     for(auto &operand : expression.operands())
       substitute_state_values(operand, state);
+    evaluate_exact_pointer_comparisons(expression);
     expression = simplify_expr(std::move(expression), ns);
     const auto simplified = symbol_indices.find(expression);
     if(
@@ -4793,6 +5163,16 @@ private:
     }
     else if(lvalue.id() == ID_member)
       substitute_lvalue_indices(to_member_expr(lvalue).struct_op(), state);
+    else if(lvalue.id() == ID_dereference)
+    {
+      auto &pointer = to_dereference_expr(lvalue).pointer();
+      substitute_state_values(pointer, state);
+      pointer = simplify_expr(std::move(pointer), ns);
+      canonicalize_exact_pointer(pointer);
+      exprt object;
+      if(exact_pointer_object(pointer, object))
+        lvalue = std::move(object);
+    }
     else if(lvalue.id() == ID_typecast)
       substitute_lvalue_indices(to_typecast_expr(lvalue).op(), state);
   }
@@ -4805,7 +5185,9 @@ private:
     result = input;
     substitute_state_values(result, state);
     result = simplify_expr(std::move(result), ns);
-    canonicalize_exact_pointer(result);
+    canonicalize_exact_pointers(result);
+    evaluate_exact_pointer_comparisons(result);
+    result = simplify_expr(std::move(result), ns);
     if(!is_exact_constant(result))
     {
       if(std::getenv("DEAGLE_FINITE_PRODUCT_AUDIT") != nullptr)
@@ -6359,6 +6741,21 @@ interference_predicate_resultt interference_predicate_fixedpoint(
   thread_ids.insert(thread_ids.end(), entries.begin(), entries.end());
   for(const auto &entry : entries)
     thread_multiple_instances.push_back(multiple_instances[entry]);
+  if(finite_product_mode)
+  {
+    irep_idt recursive_function;
+    if(!reachable_product_call_graph_acyclic(
+         analysis_model.goto_functions,
+         thread_ids,
+         recursive_function))
+    {
+      std::cout << "V225_FINITE_PRODUCT result=UNKNOWN "
+                   "reason=recursive_call_graph function="
+                << recursive_function
+                << " states_or_transitions=0\n";
+      return interference_predicate_resultt::UNKNOWN;
+    }
+  }
   for(const auto &thread_id : thread_ids)
   {
     if(
