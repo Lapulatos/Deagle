@@ -32,6 +32,14 @@ def check_result_normality(lines):
     last_line = lines[-1]
     return "VERIFICATION SUCCESSFUL" in last_line or "VERIFICATION FAILED" in last_line
 
+def is_unsupported_semantics_failure(line):
+    """Recognize library-model limitations, not source-property failures."""
+    return (
+        ".precondition." in line
+        and ": FAILURE" in line
+        and "not yet supported" in line
+    )
+
 def inspect_result(path):
     """Classify a tool result without printing a provisional verdict."""
     with open(path, "r") as output:
@@ -39,14 +47,21 @@ def inspect_result(path):
     if not check_result_normality(lines):
         return "ERROR"
     result = "SUCCESS"
+    unsupported = False
     for line in lines:
         obj = re.match(r"\[(.*)\](.*): (.*)", line)
         if obj and obj.group(3) == "FAILURE":
-            result = "FAILURE"
+            if is_unsupported_semantics_failure(line):
+                unsupported = True
+            else:
+                result = "FAILURE"
+    if result == "SUCCESS" and unsupported:
+        return "UNKNOWN"
     return result
 
 def get_result(remove = True):
     result = "SUCCESS"
+    unsupported = False
     with open("deagle_tmp_output", "r") as output:
         lines = output.readlines()
         if not check_result_normality(lines):
@@ -131,8 +146,13 @@ def get_result(remove = True):
                 continue
             new_result = obj.group(3)
             if new_result == "FAILURE" and result == "SUCCESS":
-                result = "FAILURE"
+                if is_unsupported_semantics_failure(line):
+                    unsupported = True
+                else:
+                    result = "FAILURE"
             print(line,end="")
+    if result == "SUCCESS" and unsupported:
+        result = "UNKNOWN"
     print("Property: %s" % result)
     if(remove):
         os.system("rm deagle_tmp_output")
@@ -1193,9 +1213,21 @@ elif is_onlystatic:
     os.system(cmd)
     result = get_result()
 elif force_experiment_direct:
-    if shallow_counterexample_prepass and not candidate_pure_spin_family:
-        for shallow_bound in (1, 3):
-            shallow_timeout = 2
+    if (
+        shallow_counterexample_prepass
+        and not candidate_pure_spin_family
+    ):
+        shallow_bounds = (
+            (3,)
+            if "valid-memsafety.prp" in property_path
+            else (1, 3)
+        )
+        for shallow_bound in shallow_bounds:
+            shallow_timeout = (
+                4
+                if "valid-memsafety.prp" in property_path
+                else 2
+            )
             print(
                 "Trying a counterexample-only shallow prepass "
                 "(bound %d, %d s)!"

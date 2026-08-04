@@ -7837,9 +7837,133 @@ interference_predicate_resultt interference_predicate_fixedpoint(
   return runner.run();
 }
 
+static bool direct_callee(
+  const goto_programt::instructiont &instruction,
+  irep_idt &callee)
+{
+  if(!instruction.is_function_call())
+    return false;
+  const exprt &function = skip_typecast(instruction.call_function());
+  if(function.id() != ID_symbol)
+    return false;
+  callee = to_symbol_expr(function).get_identifier();
+  return true;
+}
+
+static std::set<irep_idt> reachable_program_functions(const goto_modelt &model)
+{
+  std::deque<irep_idt> pending;
+  pending.push_back("main");
+  const auto entries = find_thread_entries(model);
+  pending.insert(pending.end(), entries.begin(), entries.end());
+  std::set<irep_idt> reachable;
+  while(!pending.empty())
+  {
+    const irep_idt current = pending.front();
+    pending.pop_front();
+    if(!reachable.insert(current).second)
+      continue;
+    const auto function = model.goto_functions.function_map.find(current);
+    if(
+      function == model.goto_functions.function_map.end() ||
+      !function->second.body_available())
+      continue;
+    for(const auto &instruction : function->second.body.instructions)
+    {
+      irep_idt callee;
+      if(direct_callee(instruction, callee))
+        pending.push_back(callee);
+    }
+  }
+  return reachable;
+}
+
+static bool raw_compare_exchange_boolean_result(const goto_modelt &model)
+{
+  const auto reachable = reachable_program_functions(model);
+  for(const auto &function_entry : model.goto_functions.function_map)
+  {
+    if(
+      reachable.find(function_entry.first) == reachable.end() ||
+      !function_entry.second.body_available())
+      continue;
+    std::set<irep_idt> raw_results;
+    for(const auto &instruction : function_entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(direct_callee(instruction, callee))
+      {
+        const std::string name = id2string(callee);
+        irep_idt result;
+        if(
+          name.find("cmpxchg") != std::string::npos &&
+          get_direct_symbol(instruction.call_lhs(), result))
+          raw_results.insert(result);
+      }
+      if(instruction.is_set_return_value())
+      {
+        irep_idt returned;
+        if(
+          (instruction.return_value().type().id() == ID_bool ||
+           instruction.return_value().type().id() == ID_c_bool) &&
+          get_direct_symbol(instruction.return_value(), returned) &&
+          raw_results.find(returned) != raw_results.end())
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
+static bool overlapping_multi_lock_token(const goto_modelt &model)
+{
+  const auto reachable = reachable_program_functions(model);
+  for(const auto &function_entry : model.goto_functions.function_map)
+  {
+    if(
+      reachable.find(function_entry.first) == reachable.end() ||
+      !function_entry.second.body_available())
+      continue;
+    std::vector<std::pair<exprt, exprt>> active;
+    for(const auto &instruction : function_entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(
+        !direct_callee(instruction, callee) ||
+        instruction.call_arguments().size() < 2)
+        continue;
+      const std::string name = id2string(callee);
+      const exprt &lock = instruction.call_arguments()[0];
+      const exprt &token = instruction.call_arguments()[1];
+      if(name.find("release") != std::string::npos)
+      {
+        active.erase(
+          std::remove_if(
+            active.begin(),
+            active.end(),
+            [&](const std::pair<exprt, exprt> &entry) {
+              return entry.first == lock && entry.second == token;
+            }),
+          active.end());
+      }
+      else if(name.find("acquire") != std::string::npos)
+      {
+        for(const auto &entry : active)
+        {
+          if(entry.second == token && entry.first != lock)
+            return true;
+        }
+        active.emplace_back(lock, token);
+      }
+    }
+  }
+  return false;
+}
+
 interference_predicate_resultt interference_predicate_finite_product_auto(
   const goto_modelt &goto_model,
-  message_handlert &message_handler)
+  message_handlert &message_handler,
+  const bool preserve_data_races)
 {
   const auto main = goto_model.goto_functions.function_map.find("main");
   if(
@@ -7882,6 +8006,18 @@ interference_predicate_resultt interference_predicate_finite_product_auto(
     creates == 1 && joins == 1 && repeated_create && repeated_join;
   if(!admitted_explicit_pair && !admitted_bounded_pair)
     return interference_predicate_resultt::UNKNOWN;
+
+  if(
+    preserve_data_races &&
+    (raw_compare_exchange_boolean_result(goto_model) ||
+     overlapping_multi_lock_token(goto_model)))
+  {
+    if(std::getenv("DEAGLE_FINITE_PRODUCT_AUDIT") != nullptr)
+      std::cout
+        << "V225_FINITE_PRODUCT_AUTO admitted=0 reason="
+        << "data_race_protocol_precondition\n";
+    return interference_predicate_resultt::UNKNOWN;
+  }
 
   if(admitted_bounded_pair)
   {

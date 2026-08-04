@@ -687,7 +687,10 @@ void postprocess_equation(
       memory_model_name == "tso" || memory_model_name == "pso";
     const bool apply_property_event_cone =
       supported_memory_model && !options.get_bool_option("datarace") &&
-      !options.get_bool_option("deadlock");
+      !options.get_bool_option("deadlock") &&
+      !options.get_bool_option("pointer-check") &&
+      !options.get_bool_option("alloc-check") &&
+      !options.get_bool_option("memory-leak-check");
     property_event_cone(equation, apply_property_event_cone);
 
     std::unique_ptr<memory_model_baset> memory_model =

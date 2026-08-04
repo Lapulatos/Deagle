@@ -33,6 +33,7 @@ interference_predicate_resultt interference_predicate_fixedpoint(
 /// without changing the input model.
 interference_predicate_resultt interference_predicate_finite_product_auto(
   const goto_modelt &goto_model,
-  message_handlert &message_handler);
+  message_handlert &message_handler,
+  bool preserve_data_races = false);
 
 #endif // CPROVER_ANALYSES_INTERFERENCE_PREDICATE_ANALYSIS_H

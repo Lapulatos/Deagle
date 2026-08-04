@@ -2128,8 +2128,13 @@ int cbmc_parse_optionst::doit()
   if(
     !cmdline.isset("native-jces") &&
     !cmdline.isset("unwind-suggest") &&
+    !options.get_bool_option("pointer-check") &&
+    !options.get_bool_option("alloc-check") &&
+    !options.get_bool_option("memory-leak-check") &&
     interference_predicate_finite_product_auto(
-      goto_model, ui_message_handler) ==
+      goto_model,
+      ui_message_handler,
+      options.get_bool_option("datarace")) ==
       interference_predicate_resultt::SAFE &&
     output_native_correctness_witness(
       goto_model, options, native_witness_guards))
@@ -2141,8 +2146,13 @@ int cbmc_parse_optionst::doit()
   if(
     cmdline.isset("native-jces") &&
     !cmdline.isset("unwind-suggest") &&
+    !options.get_bool_option("pointer-check") &&
+    !options.get_bool_option("alloc-check") &&
+    !options.get_bool_option("memory-leak-check") &&
     interference_predicate_finite_product_auto(
-      goto_model, ui_message_handler) ==
+      goto_model,
+      ui_message_handler,
+      options.get_bool_option("datarace")) ==
       interference_predicate_resultt::SAFE &&
     output_native_correctness_witness(
       goto_model, options, native_witness_guards))
@@ -2454,7 +2464,9 @@ int cbmc_parse_optionst::doit()
       joined_terminal_overwrite_transform(
         goto_model, ui_message_handler) ||
       predicate_stable_linearization_transform(
-        goto_model, ui_message_handler) ||
+        goto_model,
+        ui_message_handler,
+        options.get_bool_option("datarace")) ||
       cas_linearization_stability_transform(
         goto_model, ui_message_handler) ||
       lock_linearization_stability_transform(
@@ -2490,6 +2502,9 @@ int cbmc_parse_optionst::doit()
 
   if(
     options.get_bool_option("deagle-nondet-bulk-init") &&
+    !options.get_bool_option("pointer-check") &&
+    !options.get_bool_option("alloc-check") &&
+    !options.get_bool_option("memory-leak-check") &&
     (!native_model_transformed || symmetric_scan_model_transformed) &&
     !options.is_set("property") && !options.is_set("subproperty"))
   {
@@ -3025,7 +3040,11 @@ bool cbmc_parse_optionst::process_goto_program(
   link_to_library(
     goto_model, log.get_message_handler(), cprover_c_library_factory);
 
-  if(options.get_bool_option("deagle-nondet-bulk-init"))
+  if(
+    options.get_bool_option("deagle-nondet-bulk-init") &&
+    !options.get_bool_option("pointer-check") &&
+    !options.get_bool_option("alloc-check") &&
+    !options.get_bool_option("memory-leak-check"))
   {
     const auto stats = nondet_bulk_init(
       goto_model,

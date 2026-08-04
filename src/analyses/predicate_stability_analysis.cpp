@@ -10,6 +10,7 @@ Module: Predicate-Stable Linearization
 
 #include <util/arith_tools.h>
 #include <util/expr_util.h>
+#include <util/find_symbols.h>
 #include <util/message.h>
 #include <util/namespace.h>
 #include <util/pointer_expr.h>
@@ -1727,11 +1728,95 @@ bool global_coverage(
   }
   return true;
 }
+
+bool has_unprotected_value_read(
+  const irep_idt &object,
+  const goto_modelt &model)
+{
+  std::set<irep_idt> protected_callees;
+  std::set<irep_idt> unprotected_callees;
+  for(const auto &caller : model.goto_functions.function_map)
+  {
+    if(!caller.second.body_available())
+      continue;
+    const bool atomic_caller =
+      id2string(caller.first).find("__VERIFIER_atomic_") == 0;
+    for(const auto &instruction : caller.second.body.instructions)
+    {
+      irep_idt callee;
+      if(!call_id(instruction, callee))
+        continue;
+      if(atomic_caller)
+        protected_callees.insert(callee);
+      else
+        unprotected_callees.insert(callee);
+    }
+  }
+  for(const auto &function_entry : model.goto_functions.function_map)
+  {
+    if(!function_entry.second.body_available())
+      continue;
+    if(
+      id2string(function_entry.first).find("__VERIFIER_atomic_") == 0 ||
+      (protected_callees.find(function_entry.first) != protected_callees.end() &&
+       unprotected_callees.find(function_entry.first) ==
+         unprotected_callees.end()))
+      continue;
+    std::size_t atomic_depth = 0;
+    for(const auto &instruction : function_entry.second.body.instructions)
+    {
+      irep_idt callee;
+      if(call_id(instruction, callee) && callee == "__VERIFIER_atomic_begin")
+      {
+        ++atomic_depth;
+        continue;
+      }
+      if(call_id(instruction, callee) && callee == "__VERIFIER_atomic_end")
+      {
+        if(atomic_depth != 0)
+          --atomic_depth;
+        continue;
+      }
+      if(instruction.is_atomic_begin())
+      {
+        ++atomic_depth;
+        continue;
+      }
+      if(instruction.is_atomic_end())
+      {
+        if(atomic_depth != 0)
+          --atomic_depth;
+        continue;
+      }
+      if(atomic_depth != 0)
+        continue;
+
+      find_symbols_sett reads;
+      if(instruction.is_assign())
+        find_symbols(instruction.assign_rhs(), reads);
+      else if(instruction.is_goto() || instruction.is_assume() ||
+              instruction.is_assert())
+        find_symbols(instruction.condition(), reads);
+      else if(instruction.is_function_call())
+      {
+        for(const auto &argument : instruction.call_arguments())
+        {
+          if(argument.id() != ID_address_of)
+            find_symbols(argument, reads);
+        }
+      }
+      if(reads.find(object) != reads.end())
+        return true;
+    }
+  }
+  return false;
+}
 } // namespace
 
 bool predicate_stable_linearization_transform(
   goto_modelt &goto_model,
-  message_handlert &message_handler)
+  message_handlert &message_handler,
+  const bool preserve_data_races)
 {
   const namespacet ns(goto_model.symbol_table);
   irep_idt worker;
@@ -1798,6 +1883,15 @@ bool predicate_stable_linearization_transform(
   {
     std::cout << "NATIVE_PREDICATE_STABILITY applied=0 reason="
               << reason << '\n';
+    return false;
+  }
+  if(
+    preserve_data_races && update.cas &&
+    has_unprotected_value_read(property.object, goto_model))
+  {
+    std::cout
+      << "NATIVE_PREDICATE_STABILITY applied=0 reason="
+      << "predicate_unprotected_object_read\n";
     return false;
   }
   std::set<irep_idt> initializer_functions;

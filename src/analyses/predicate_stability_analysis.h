@@ -12,6 +12,7 @@ class message_handlert;
 
 bool predicate_stable_linearization_transform(
   goto_modelt &goto_model,
-  message_handlert &message_handler);
+  message_handlert &message_handler,
+  bool preserve_data_races = false);
 
 #endif
