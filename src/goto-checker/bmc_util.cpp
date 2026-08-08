@@ -43,6 +43,8 @@ Author: Daniel Kroening, Peter Schrammel
 
 namespace
 {
+bool equation_correctness_witness_write_succeeded = false;
+
 void add_expression_symbols(
   const exprt &expression,
   find_symbols_sett &symbols)
@@ -460,25 +462,41 @@ void output_graphml(
   if(graphml.empty())
     return;
 
-  // __SZH_ADD_BEGIN__
-  // TRUE proof only required in no-overflow
-  bool enable_overflow_check = options.get_bool_option("signed-overflow-check") || options.get_bool_option("unsigned-overflow-check");
-  if(!enable_overflow_check)
-    return;
-  // __SZH_ADD_END__
-
   graphml_witnesst graphml_witness(ns);
   graphml_witness(symex_target_equation);
 
   std::string filename = options.get_option("filename");
 
   if(graphml == "-")
-    write_graphml(graphml_witness.graph(), std::cout, filename, options);
+  {
+    const bool write_failed =
+      write_graphml(graphml_witness.graph(), std::cout, filename, options);
+    std::cout.flush();
+    equation_correctness_witness_write_succeeded =
+      !write_failed && std::cout.good();
+  }
   else
   {
     std::ofstream out(graphml);
-    write_graphml(graphml_witness.graph(), out, filename, options);
+    const bool open_succeeded = out.good();
+    const bool write_failed =
+      open_succeeded
+        ? write_graphml(graphml_witness.graph(), out, filename, options)
+        : true;
+    out.close();
+    equation_correctness_witness_write_succeeded =
+      open_succeeded && !write_failed && !out.fail();
   }
+}
+
+void reset_equation_correctness_witness_status()
+{
+  equation_correctness_witness_write_succeeded = false;
+}
+
+bool equation_correctness_witness_written()
+{
+  return equation_correctness_witness_write_succeeded;
 }
 
 void convert_symex_target_equation(

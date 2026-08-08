@@ -65,6 +65,8 @@ void output_graphml(
   const symex_target_equationt &,
   const namespacet &,
   const optionst &);
+void reset_equation_correctness_witness_status();
+bool equation_correctness_witness_written();
 
 std::unique_ptr<memory_model_baset>
 get_memory_model(const optionst &options, const namespacet &);

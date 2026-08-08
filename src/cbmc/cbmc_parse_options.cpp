@@ -2911,15 +2911,22 @@ int cbmc_parse_optionst::doit()
     UNREACHABLE;
   }
 
+  if(!options.get_option("graphml-witness").empty())
+    reset_equation_correctness_witness_status();
+
   const resultt result = (*verifier)();
   verifier->report();
 
   if(
     result == resultt::PASS &&
     !options.get_option("graphml-witness").empty() &&
-    !output_native_correctness_witness(
-      goto_model, options, native_witness_assertions))
+    !equation_correctness_witness_written())
+  {
+    std::cout
+      << "NATIVE_EQUATION_CORRECTNESS_WITNESS applied=0"
+      << " reason=write_failed\n";
     return CPROVER_EXIT_INTERNAL_ERROR;
+  }
 
   return result_to_exit_code(result);
 }

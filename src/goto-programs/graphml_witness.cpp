@@ -589,6 +589,7 @@ void graphml_witnesst::operator()(const goto_tracet &goto_trace)
 /// proof witness
 void graphml_witnesst::operator()(const symex_target_equationt &equation)
 {
+  graphml.key_values["witness-type"]="correctness_witness";
   graphml.key_values["sourcecodelang"]="C";
 
   const graphmlt::node_indext sink=graphml.add_node();
